@@ -874,7 +874,26 @@ body.film-open { overflow: hidden; }
   cursor: pointer; position: relative;
 }
 .film__track:hover { background-color: color-mix(in oklab, var(--c-data) 25%, var(--surface-3)); }
-.film__fill { height: 100%; width: 0; background: linear-gradient(90deg, var(--c-data), var(--c-ok)); border-radius: 99px; }
+.film__fill { height: 100%; width: 0; background: linear-gradient(90deg, var(--c-data), var(--c-ok)); border-radius: 99px; position: relative; }
+
+/* How much of the track has arrived. The host ignores Range and sends the
+   whole file, so for the first minute this trails the playhead and a seek
+   past it has to wait for the download. Better to show that than to let the
+   control look broken. */
+.film__buffer {
+  position: absolute; left: 0; top: 8px; height: 6px; width: 0;
+  border-radius: 99px; background: color-mix(in oklab, var(--c-data) 26%, transparent);
+  transition: width .3s linear;
+}
+
+/* Waiting for the download to reach a seek target. */
+.film.is-waiting .film__fill {
+  background: repeating-linear-gradient(
+    115deg, var(--c-data) 0 10px, color-mix(in oklab, var(--c-data) 55%, transparent) 10px 20px);
+  animation: film-wait 1s linear infinite;
+}
+@keyframes film-wait { to { background-position: 23px 0; } }
+@media (prefers-reduced-motion: reduce) { .film.is-waiting .film__fill { animation: none; } }
 
 /* the transcript on the page */
 .transcript {

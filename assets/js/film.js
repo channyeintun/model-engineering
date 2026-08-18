@@ -159,7 +159,7 @@
 
   /* ---- build the overlay ---------------------------------------------- */
 
-  var root, stage, capEl, playBtn, bar, barFill, timeEl, idxEl, audio;
+  var root, stage, capEl, playBtn, bar, barFill, barBuf, timeEl, idxEl, audio;
   var placeholder = document.createComment('film-slot');
   var moved = null;          // the figure currently on stage
   var cur = -1;              // current segment index
@@ -189,7 +189,9 @@
         '<button class="film__btn film__btn--main" id="filmPlay" aria-label="Play">' + ICON.play + '</button>' +
         '<button class="film__btn" id="filmNext" aria-label="Next section">' + ICON.next + '</button>' +
         '<span class="film__time" id="filmTime">0:00</span>' +
-        '<div class="film__track" id="filmBar"><div class="film__fill"></div></div>' +
+        '<div class="film__track" id="filmBar">' +
+          '<div class="film__buffer"></div><div class="film__fill"></div>' +
+        '</div>' +
         '<span class="film__time" id="filmIdx">1/' + segs.length + '</span>' +
         '<button class="film__btn film__btn--cc is-on" id="filmCC" aria-label="Hide captions" title="Captions">' + ICON.cc + '</button>' +
       '</div>';
@@ -200,6 +202,7 @@
     playBtn = root.querySelector('#filmPlay');
     bar = root.querySelector('#filmBar');
     barFill = bar.querySelector('.film__fill');
+    barBuf = bar.querySelector('.film__buffer');
     timeEl = root.querySelector('#filmTime');
     idxEl = root.querySelector('#filmIdx');
 
@@ -276,117 +279,30 @@
      back and the captions would then describe a different moment from the one
      you can hear. So we remember what was asked for, re-apply it as data
      arrives, and report the requested position until the audio gets there. */
-  var wantSeek = null;
-  var wantUntil = 0;       // a pending seek stops speaking for the clock after this
-  var seekToken = 0;
-  var TOL = 0.35;          // a seek lands on a frame boundary, not exactly
-  var WANT_GRACE = 2.5;    // seconds the requested position may stand in for the real one
+  /* Seeking lives in assets/js/seek.js, with a fake element driving it in
+     tools/test-seek.mjs. Three of this player's bugs were in there, all in
+     states a browser will not reproduce on demand. */
+  var seeker = window.Seek && window.Seek.create({
+    audio: function () { return audio; },
+    isPlaying: function () { return playing; },
+    onWait: function (waiting) { if (root) root.classList.toggle('is-waiting', waiting); }
+  });
+  var TOL = (window.Seek && window.Seek.TOL) || 0.35;
 
-  function seekAudio(t) {
-    if (!isFinite(t)) return;                 // never hand the element a NaN
-    var token = ++seekToken;
-    wantSeek = t;
-    wantUntil = performance.now() + WANT_GRACE * 1000;
-
-    /* Seeking is ASYNCHRONOUS. Reading currentTime straight after assigning it
-       still returns the old position, so "did it take?" cannot be answered by
-       reading it back — that produced false failures, and the retries they
-       triggered dragged playback back to a stale target again and again, which
-       sounds exactly like the audio dying. The browser tells us via 'seeked'.  */
-    function done() {
-      if (token !== seekToken) return;        // a newer seek already supersedes this
-      wantSeek = null;
-      audio.removeEventListener('seeked', onSeeked);
-      audio.removeEventListener('error', done);
-      clearTimeout(timer);
-    }
-
-    function seekableCovers(x) {
-      if (!audio.seekable || audio.seekable.length === 0) return true;  /* unknown: let it try */
-      for (var i = 0; i < audio.seekable.length; i++) {
-        if (x >= audio.seekable.start(i) - 0.01 && x <= audio.seekable.end(i) + 0.01) return true;
-      }
-      return false;
-    }
-
-    /* Some hosts do not answer HTTP range requests — Cloudflare Pages is one —
-       so the whole file must arrive before an arbitrary position is reachable.
-       Rather than give up, wait until the target is genuinely seekable and then
-       apply it once. Guarded by the token, so a newer seek always wins and a
-       stale target can never drag playback backwards. */
-    function waitForData() {
-      var evs = ['progress', 'canplay', 'canplaythrough', 'loadeddata', 'durationchange'];
-      function stop() { evs.forEach(function (e) { audio.removeEventListener(e, look); }); }
-      function look() {
-        if (token !== seekToken) { stop(); return; }
-        if (Math.abs(audio.currentTime - t) < TOL) { stop(); done(); return; }
-        if (!seekableCovers(t)) return;
-        stop();
-        try { audio.currentTime = t; } catch (e) { done(); }
-      }
-      evs.forEach(function (e) { audio.addEventListener(e, look); });
-      setTimeout(stop, 60000);
-      look();
-    }
-
-    function onSeeked() {
-      if (token !== seekToken) return;
-      if (Math.abs(audio.currentTime - t) > TOL && retries > 0) { retries--; waitForData(); return; }
-      done();
-    }
-
-    /* Already there? Setting currentTime to its current value is a no-op and
-       fires no 'seeked', so waiting for one would leave the seek pending and
-       freeze the reported clock. open() hits this every time: it seeks to 0
-       while the track is still at 0. */
-    if (audio.readyState >= 1 && Math.abs(audio.currentTime - t) < TOL) {
-      wantSeek = null;
-      return;
-    }
-
-    var retries = 3;
-    audio.addEventListener('seeked', onSeeked);
-    audio.addEventListener('error', done);
-    /* If no 'seeked' ever arrives, stop reporting the requested position;
-       a pending seek must never outlive its attempt or the captions freeze. */
-    var timer = setTimeout(done, 60000);
-
-    function apply() {
-      if (token !== seekToken) return;
-      /* Already there. Assigning currentTime the value it already holds is a
-         no-op that fires no 'seeked', so settle now rather than wait for an
-         event that is never coming. This is the cold-open case: readyState is
-         0 when the film opens, so the check further up was skipped, and by the
-         time metadata arrives the track is sitting at 0 — exactly where the
-         seek wanted it. Waiting left wantSeek pinned, and a pinned wantSeek
-         means now() keeps reporting 0 while the audio plays on: the voice
-         talks, the captions never move and no figure ever reaches the stage. */
-      if (Math.abs(audio.currentTime - t) < TOL) { done(); return; }
-      if (!seekableCovers(t)) { waitForData(); return; }
-      try { audio.currentTime = t; } catch (e) { done(); }
-    }
-
-    /* Before metadata exists the element has no timeline, so assigning
-       currentTime is quietly discarded and no 'seeked' follows — the track
-       just keeps playing from the top. Wait for the timeline to exist. */
-    if (audio.readyState < 1 /* HAVE_METADATA */) {
-      audio.addEventListener('loadedmetadata', function once() {
-        audio.removeEventListener('loadedmetadata', once);
-        apply();
-      });
-    } else {
-      apply();
-    }
-  }
+  function seekAudio(t) { if (seeker) seeker.seek(t); }
+  function pendingTarget() { return seeker ? seeker.target() : null; }
 
   function now() {
     if (HAS_AUDIO && audio) {
       /* While a seek is in flight, report where it is going rather than where
-         the element still is, so the captions do not flick back. Only briefly,
-         though: a seek that never lands must not be allowed to freeze the
-         clock behind playing audio. */
-      if (wantSeek != null && performance.now() < wantUntil &&
-          Math.abs(audio.currentTime - wantSeek) > TOL) return wantSeek;
+         the element still is. Cloudflare Pages ignores Range and answers every
+         request with the whole file, so a seek past the downloaded part cannot
+         land until the download gets there — longer than any timeout worth
+         having. Reporting the element instead drags the scrub bar, the
+         captions and the figures back to the old position, which reads as the
+         seek having been refused. */
+      var want = pendingTarget();
+      if (want != null && Math.abs(audio.currentTime - want) > TOL) return want;
       return audio.currentTime;
     }
     if (playing) return silentT + (performance.now() - t0) / 1000;
@@ -522,6 +438,13 @@
     updateCaption(t);
     barFill.style.width = (TOTAL ? (t / TOTAL) * 100 : 0) + '%';
     timeEl.textContent = fmt(t);
+    /* How far you can actually seek to. Worth drawing, because on a host that
+       ignores Range this trails the playhead for the first minute or so and
+       a seek beyond it has to wait. */
+    if (barBuf && HAS_AUDIO && audio && audio.buffered && audio.buffered.length) {
+      var end = audio.buffered.end(audio.buffered.length - 1);
+      barBuf.style.width = (TOTAL ? Math.min(1, end / TOTAL) * 100 : 0) + '%';
+    }
   }
 
   function tick() {

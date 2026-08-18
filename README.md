@@ -156,6 +156,25 @@ wav cache and the ~189 MB ONNX bundle). Neither is needed to serve the site.
 
 ## Checking it
 
+Seeking, which is the part that keeps breaking:
+
+```bash
+node tools/test-seek.mjs
+```
+
+Every case in there is a bug that shipped, staged against a fake `<audio>`
+element because a browser will not reproduce them on demand — you cannot ask
+one for an element with no metadata yet, or a download that has only reached
+40 seconds. The logic itself lives in `assets/js/seek.js` for exactly that
+reason.
+
+Worth knowing about the host: **Cloudflare Pages ignores `Range`** and answers
+every request with the whole file. So until the download passes it, a forward
+seek cannot land — the player holds the requested position, pauses rather than
+narrating the old one, and draws how far the download has reached on the scrub
+bar. Do not "fix" that hold with a timeout: reporting the element instead drags
+the bar back to where it was, which reads as the seek being refused.
+
 Static pass — run it after editing any lesson:
 
 ```bash
