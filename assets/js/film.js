@@ -209,12 +209,12 @@
     if (HAS_AUDIO) {
       audio = document.createElement('audio');
       audio.preload = 'auto';
-      audio.src = '../assets/audio/' + lesson + '.m4a';
+      loadAudio();
       var track = document.createElement('track');
       track.kind = 'captions';
       track.srclang = 'en';
       track.label = 'English';
-      track.src = '../assets/audio/' + lesson + '.vtt';
+      track.src = '../assets/audio/' + lesson + '.vtt';   // captions are our own, but the browser may want them
       track.default = true;
       audio.appendChild(track);
       root.appendChild(audio);
@@ -279,6 +279,81 @@
      back and the captions would then describe a different moment from the one
      you can hear. So we remember what was asked for, re-apply it as data
      arrives, and report the requested position until the audio gets there. */
+  /* ---- getting the track ----------------------------------------------
+     A browser will not seek in a resource the server will not range-request,
+     and Cloudflare Pages answers every request with the whole file and no
+     Accept-Ranges. Chrome then reports `seekable` as [0, 0] even with the
+     whole track buffered and readyState 4, and assigning currentTime clamps
+     to zero — measured: a seek to 300 s lands at 0.76. Nothing the player
+     does on top of that can help.
+
+     The same bytes handed over as a Blob report seekable [0, duration] and
+     seek exactly. So fetch the track once and play it from memory. That is
+     also why the audio is Opus: at 64 kbit/s it is a quarter smaller than
+     the AAC, which is a quarter less to wait for before the first note. */
+
+  var fetchFrac = 0;         // how much of the track has arrived, 0..1
+  var audioReady = null;
+
+  function audioUrl() {
+    /* Safari has never played Ogg, so it gets the AAC. Everything else, which
+       is to say everything with an Opus decoder, gets the smaller file. */
+    var probe = document.createElement('audio');
+    var ext = probe.canPlayType('audio/ogg; codecs=opus') ? '.opus' : '.m4a';
+    return '../assets/audio/' + lesson + ext;
+  }
+
+  function loadAudio() {
+    var url = audioUrl();
+
+    /* Play from the network straight away, so there is no wait before the
+       first word. Seeking will not work yet — the browser will not seek in a
+       resource it cannot range-request — but the blob below fixes that as
+       soon as it arrives, and a seek asked for in the meantime is held by
+       seek.js and applied on the swap. */
+    audio.src = url;
+
+    audioReady = fetch(url).then(function (res) {
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      var total = +res.headers.get('content-length') || 0;
+      if (!res.body || !total) return res.blob();
+      var reader = res.body.getReader(), chunks = [], got = 0;
+      return (function pump() {
+        return reader.read().then(function (r) {
+          if (r.done) return new Blob(chunks, { type: res.headers.get('content-type') || '' });
+          chunks.push(r.value);
+          got += r.value.length;
+          fetchFrac = got / total;
+          return pump();
+        });
+      })();
+    }).then(function (blob) {
+      /* Hand the element the same audio from memory. Identical bytes, but a
+         Blob reports seekable [0, duration] where the network resource
+         reported [0, 0], so from here on a seek actually lands. Measured on
+         this very file: over the network a seek to 300 s came back 0.76. */
+      var held = pendingTarget();
+      var at = held != null ? held : audio.currentTime;
+      /* `playing` is the player's own state, not the element's. The element
+         may well be paused right now — seek.js stops it rather than narrate
+         the old position while a seek is outstanding — and reading its
+         paused flag across a src change is a race we lost twice. */
+      var shouldPlay = playing;
+      audio.src = URL.createObjectURL(blob);
+      audio.load();
+      audio.addEventListener('canplay', function once() {
+        audio.removeEventListener('canplay', once);
+        try { audio.currentTime = at; } catch (e) { /* it will play from 0 */ }
+        if (shouldPlay) audio.play().catch(function () {});
+      });
+    }).catch(function () {
+      /* Keep the network source. Sound without seeking beats neither. */
+    }).then(function () {
+      fetchFrac = 1;
+    });
+    return audioReady;
+  }
+
   /* Seeking lives in assets/js/seek.js, with a fake element driving it in
      tools/test-seek.mjs. Three of this player's bugs were in there, all in
      states a browser will not reproduce on demand. */
@@ -441,10 +516,7 @@
     /* How far you can actually seek to. Worth drawing, because on a host that
        ignores Range this trails the playhead for the first minute or so and
        a seek beyond it has to wait. */
-    if (barBuf && HAS_AUDIO && audio && audio.buffered && audio.buffered.length) {
-      var end = audio.buffered.end(audio.buffered.length - 1);
-      barBuf.style.width = (TOTAL ? Math.min(1, end / TOTAL) * 100 : 0) + '%';
-    }
+    if (barBuf && HAS_AUDIO) barBuf.style.width = (fetchFrac * 100).toFixed(1) + '%';
   }
 
   function tick() {
@@ -461,7 +533,7 @@
     playBtn.innerHTML = ICON.pause;
     playBtn.setAttribute('aria-label', 'Pause');
     if (HAS_AUDIO && audio) {
-      audio.play().catch(function () { /* autoplay blocked: user will press again */ });
+      audio.play().catch(function () { /* autoplay blocked: the reader will press again */ });
     } else {
       t0 = performance.now();
     }

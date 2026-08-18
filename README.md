@@ -45,7 +45,8 @@ assets/js/film.js       the narrated-walkthrough player
 assets/js/vendor/       GSAP 3.15.0, vendored so the site works offline
 data/narration/NN.js    the walkthrough script for lesson NN (authored)
 data/narration/*.timing.js  cue times (generated with the audio)
-assets/audio/NN.m4a     the narration track (generated)
+assets/audio/NN.opus    the narration track (generated)
+assets/audio/NN.m4a     the same, for Safari, which has never played Ogg
 assets/audio/NN.vtt     WebVTT captions (generated)
 tools/narrate.py        generates the audio, captions and timings
 tools/check.mjs         static consistency checker
@@ -81,6 +82,25 @@ M-series Mac, and the engine loads once per lesson rather than once per line.
 
 Built-in voices: `alba`, `cosette`, `marius`, `javert`, `jean`, `fantine`,
 `eponine`, `azelma` and more.
+
+### Why Opus at 64 kbit/s
+
+At that rate Opus leaves SILK for CELT, and that is where it stops being a
+speech codec and starts matching AAC. Log-mel distance from the stitched
+source, which is a fair cross-codec measure where signal-to-noise ratio is not
+— Opus does not preserve waveforms and SNR punishes it for that regardless of
+how it sounds:
+
+| codec | kbit/s | below 6 kHz | above 6 kHz |
+|---|---|---|---|
+| AAC 96k | 91 | 0.41 dB | 0.51 dB |
+| Opus 32k | 31 | 1.76 dB | 2.94 dB |
+| Opus 48k | 46 | 1.46 dB | 2.90 dB |
+| **Opus 64k** | **66** | **0.53 dB** | **0.76 dB** |
+
+Below 64k the distance trebles, and it does so in the speech band and not only
+in the treble, so there is nothing to be won by going lower. AAC is kept beside
+it at the same mastering for Safari; `film.js` picks with `canPlayType`.
 
 ### Cloning your own voice
 
@@ -156,24 +176,52 @@ wav cache and the ~189 MB ONNX bundle). Neither is needed to serve the site.
 
 ## Checking it
 
-Seeking, which is the part that keeps breaking:
+The player, end to end, in a real Chrome:
+
+```bash
+node tools/test-player.mjs
+```
+
+It opens every walkthrough, plays it, seeks while the track is still
+downloading, and checks the audio, the scrub bar, the figures and the captions
+all end up where they should. It drives headless Chrome over the DevTools
+protocol with no dependencies, and serves the site from a deliberately hostile
+static server: no `Range` support, and throttled, because both are true of the
+real host and neither is true of a local disk.
+
+Use it before deploying. Three seeking bugs shipped because the browser tooling
+available to an agent runs pages in a throttled tab where `requestAnimationFrame`
+never fires and media never loads — everything looked fine by inspection and
+was broken in fact.
+
+The seek state machine alone, against a fake element:
 
 ```bash
 node tools/test-seek.mjs
 ```
 
-Every case in there is a bug that shipped, staged against a fake `<audio>`
-element because a browser will not reproduce them on demand — you cannot ask
-one for an element with no metadata yet, or a download that has only reached
-40 seconds. The logic itself lives in `assets/js/seek.js` for exactly that
-reason.
+### Why the audio is fetched before it is played
 
-Worth knowing about the host: **Cloudflare Pages ignores `Range`** and answers
-every request with the whole file. So until the download passes it, a forward
-seek cannot land — the player holds the requested position, pauses rather than
-narrating the old one, and draws how far the download has reached on the scrub
-bar. Do not "fix" that hold with a timeout: reporting the element instead drags
-the bar back to where it was, which reads as the seek being refused.
+**Cloudflare Pages ignores `Range`** and answers every request with the whole
+file, and a browser will not seek in a resource it cannot range-request. Chrome
+reports `seekable` as `[0, 0]` for it — even with the file buffered and
+`readyState` 4 — and assigning `currentTime` clamps to zero. Measured on
+`04.m4a`: a seek to 300 s came back **0.76**.
+
+The same bytes as a `Blob` report `seekable [0, 545.4]` and seek exactly. So the
+player starts on the network URL, so there is no wait before the first word,
+fetches the track in parallel, and swaps to the blob when it lands. A seek asked
+for in between is held by `seek.js` and applied on the swap. On a 5 Mbit/s link
+that is sound at 0.6 s and seeking from about 8 s.
+
+Two traps worth keeping in mind if you touch this:
+
+- **Ogg carries no duration in its header.** Over a host without `Range`,
+  `audio.duration` is `NaN` until the whole file has arrived. The player takes
+  its total from the narration timings and never reads `audio.duration`.
+- **Do not bound the held position with a timeout.** A seek genuinely cannot
+  land until the download reaches it. Reporting the element instead drags the
+  bar back to where playback still is, which reads as the seek being refused.
 
 Static pass — run it after editing any lesson:
 
