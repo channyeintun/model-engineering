@@ -60,9 +60,16 @@
   /* --------------------------------------------------------------- topbar */
 
   function topbar() {
-    if (document.querySelector('.topbar')) return;
-    var el = document.createElement('header');
-    el.className = 'topbar';
+    /* The pages ship an empty <header class="topbar"> so its 56px is reserved
+       at first paint. Fill that one if it is there; build one if it is not,
+       because a page that forgot it should still get a top bar. */
+    var el = document.querySelector('.topbar');
+    if (el && el.firstChild) return;
+    if (!el) {
+      el = document.createElement('header');
+      el.className = 'topbar';
+      document.body.insertBefore(el, document.body.firstChild);
+    }
     el.innerHTML =
       '<button class="tb-btn menu-toggle" id="menuToggle" aria-label="Open the lesson list">' + I.menu + '</button>' +
       '<a class="brand" href="' + UP + 'index.html">' +
@@ -75,7 +82,6 @@
         '<span id="tbCount">0/' + C.lessons.length + '</span>' +
       '</div>' +
       '<button class="tb-btn" id="themeToggle" aria-label="Switch between dark and light"></button>';
-    document.body.insertBefore(el, document.body.firstChild);
 
     var tt = el.querySelector('#themeToggle');
     function paintTheme() {

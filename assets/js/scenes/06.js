@@ -159,7 +159,9 @@
     host.appendChild(hide);
 
     /* ---- the ratio sentence ---- */
-    var ratio = txt(RX, 62, '0.060 against 0.0005 — about 120 times more likely',
+    /* Sits above the tallest bar's caption, which on the log axis climbs to
+       y = 73. Keep this line short enough and high enough to clear it. */
+    var ratio = txt(RX, 54, '0.060 against 0.0005 — 120 times more likely',
                     { small: true, fill: DATA, opacity: 0 });
     host.appendChild(ratio);
 

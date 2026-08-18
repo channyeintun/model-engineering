@@ -131,6 +131,8 @@ for (const id of ids) {
   const text = html
     .replace(/<pre>[\s\S]*?<\/pre>/g, ' ')
     .replace(/<svg[\s\S]*?<\/svg>/g, ' ')
+    .replace(/<script[\s\S]*?<\/script>/g, ' ')   // inline script bodies are not prose
+    .replace(/<!--[\s\S]*?-->/g, ' ')              // nor are comments to the next editor
     .replace(/<[^>]+>/g, ' ')
     .replace(/&[a-z]+;/g, ' ');
   const words = text.split(/\s+/).filter(Boolean).length;

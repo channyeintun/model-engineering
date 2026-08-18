@@ -470,10 +470,14 @@
     var wait = bar(CLOSE1, 150, DELAY_END - CLOSE1, 24, {
       fill: 'var(--c-param)', fillOpacity: 0.9
     });
-    var waitLbl = txt(505, 167, 'incomplete: stall 600 ms before spending compute',
+    /* Only 505..619 is free here — the 'complete' pill starts at CLOSE2 = 627 —
+       so the duration goes above the stall bar it belongs to instead. */
+    var waitLbl = txt(505, 167, 'incomplete',
       { mono: true, size: 11.5, fill: 'var(--c-param)', opacity: 0 });
+    var waitMs = txt((CLOSE1 + DELAY_END) / 2, 144, '600 ms',
+      { anchor: 'middle', mono: true, size: 11.5, fill: 'var(--c-param)', opacity: 0 });
     var done = S.pill(CLOSE2, 150, 92, 24, 'complete', { role: 'ok' });
-    add(host, wait, waitLbl, done);
+    add(host, wait, waitLbl, waitMs, done);
 
     var resume = vline(RESUME, 100, 200, 'var(--c-ok)', { sw: 1.6 });
     var resumeLbl = txt(476, 104, 'speech resumes, inside the window',
@@ -509,7 +513,7 @@
 
     tl.step('The <b>classifier</b> reads the waveform of that segment and says: not finished. So the system deliberately stalls 600 milliseconds before spending any compute on it.');
     tl.to(wait, { opacity: 1, duration: 0.35 });
-    tl.to(waitLbl, { opacity: 1, duration: 0.3 }, '<');
+    tl.to([waitLbl, waitMs], { opacity: 1, duration: 0.3 }, '<');
 
     tl.step('Speech resumes inside that window. The turn <b>reopens as a new revision</b>: the work already in flight is thrown away, and the accumulated audio is re-emitted as one turn.');
     tl.to([resume, resumeLbl], { opacity: 1, duration: 0.3 });
@@ -589,7 +593,9 @@
       x1: 560, y1: 213, x2: 880, y2: 213,
       stroke: 'var(--c-loss)', 'stroke-width': 1.6, 'stroke-dasharray': '6 5', opacity: 0
     });
-    var rtLbl = txt(880, 209, 'slower than real time below this line',
+    /* Below the line rather than above it, and short enough to stay right of
+       where the two slowest rows end at x = 707. */
+    var rtLbl = txt(880, 228, 'slower than real time',
       { anchor: 'end', mono: true, size: 11.5, fill: 'var(--c-loss)', opacity: 0 });
     add(host, rtLine, rtLbl);
 

@@ -5,9 +5,19 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>03 · Inside a Transformer — Model Engineering</title>
 <meta name="description" content="Attention, one matrix at a time: tokens, embeddings, heads, masks, and the block that repeats.">
+<script>/* The theme has to be on the element before the first paint. Set it from
+   a script tag at the bottom of the body, as the rest of the JS is, and a
+   light-theme reader sees the page painted dark and then flip. */
+try { if (localStorage.getItem('me.theme') === 'light')
+  document.documentElement.setAttribute('data-theme', 'light'); } catch (e) {}</script>
 <link rel="stylesheet" href="../assets/css/course.css">
 </head>
 <body data-lesson="03">
+
+<!-- Filled in by course.js. It is here rather than created there so that the
+     56px it occupies is reserved at first paint; inserting it later shoved
+     the whole page down just as it became readable. -->
+<header class="topbar"></header>
 
 <div class="shell shell--wide">
   <nav class="rail" aria-label="Lessons"></nav>

@@ -108,10 +108,13 @@
     tl.step('The target at position <i>t</i> is the token at position <i>t</i>+1. You build the labels by copying the input and sliding the copy one place to the left.');
     tl.to(ghost, { opacity: 1, duration: 0.35 });
     tl.to(ghost, { x: -STEP, y: TGT_Y - IN_Y, duration: 0.9, ease: 'power2.inOut' });
+    /* The row slides a whole cell to the left, which walks the first token
+       straight through the right-anchored labels. Fade it out on the way:
+       it is nobody's target, so sliding off the front is what it should do. */
+    tl.to(ghost.cells[0].g, { opacity: 0, duration: 0.45 }, '-=0.62');
 
     tl.step('The slide leaves two gaps. The first token is nobody\'s target, and the last position has no target at all. Both are dropped.');
-    tl.to(ghost.cells[0].g, { opacity: 0.12, duration: 0.4 });
-    tl.to(empty, { opacity: 1, duration: 0.4 }, '<');
+    tl.to(empty, { opacity: 1, duration: 0.4 });
 
     tl.step('Now every position has a prediction and a target, so every position gets its own cross-entropy — the same loss as Lesson 01, computed T times.');
     tl.to(lossT, { opacity: 1, duration: 0.35, stagger: 0.07 });
@@ -397,7 +400,10 @@
 
     /* ---- left, second act: the gradient vector and the clip ball ---- */
 
-    var OX = 120, OY = 240, R = 64;
+    /* The accumulation picture above is hidden for this act rather than dimmed,
+       so this can use the same column without drawing on top of it. Sized to
+       stop well short of the readout panel at x = 500. */
+    var OX = 140, OY = 210, R = 72;
     var clipG = e('g', { opacity: 0 });
     host.appendChild(clipG);
 
@@ -410,13 +416,15 @@
       'font-size': 12, fill: 'var(--c-ok)'
     }, 'clip = 1.0'));
 
-    var longVec = S.arrow(OX, OY, OX + 224, OY - 124, { role: 'grad', sw: 2.4, opacity: 0 });
-    var shortVec = S.arrow(OX, OY, OX + 56, OY - 31, { role: 'ok', sw: 2.8, opacity: 0 });
+    /* Same direction, lengths in the ratio the caption claims: the short one
+       ends exactly on the clip circle, the long one well outside it. */
+    var longVec = S.arrow(OX, OY, OX + 134, OY - 84, { role: 'grad', sw: 2.4, opacity: 0 });
+    var shortVec = S.arrow(OX, OY, OX + 61, OY - 38, { role: 'ok', sw: 2.8, opacity: 0 });
     clipG.appendChild(longVec);
     clipG.appendChild(shortVec);
 
     var vecLbl = e('text', {
-      x: OX + 234, y: OY - 133, class: 'dg-mono', 'font-size': 12,
+      x: OX + 144, y: OY - 92, class: 'dg-mono', 'font-size': 12,
       fill: 'var(--c-grad)', opacity: 0
     }, 'length 4.0 — too long');
     clipG.appendChild(vecLbl);
@@ -464,7 +472,7 @@
     k.pulse(tl, vT[4], { scale: 1.15 });
 
     tl.step('One guard comes before that step. Treat every gradient in the model as a single long vector and measure its length. Today it is 4.0.');
-    tl.to(accG, { opacity: 0.12, duration: 0.4 });
+    tl.to(accG, { opacity: 0, duration: 0.4 });
     tl.to(clipG, { opacity: 1, duration: 0.3 }, '-=0.2');
     tl.to([longVec, vecLbl], { opacity: 1, duration: 0.4 });
     tl.call(function () {

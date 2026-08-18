@@ -626,7 +626,9 @@
       { name: 'Q3_K_S', ppl: '8.96', gsm: 9.3,  hel: 0.6  }
     ];
 
-    add(host, txt(60, 34, 'the same model, five formats', { small: true }));
+    /* The name column is only 60..250 wide, and 'perplexity' right-aligns at
+       its far end. Anything longer than this reaches under it. */
+    add(host, txt(60, 34, 'five formats', { small: true }));
     add(host, txt(250, 34, 'perplexity', { anchor: 'end', small: true }));
     add(host, txt(300, 34, 'how each score moved — right is worse', { small: true }));
 

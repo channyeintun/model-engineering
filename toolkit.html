@@ -5,9 +5,19 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Setup & toolkit — Model Engineering</title>
 <meta name="description" content="Install once, run every project in the course. Pinned versions, Apple Silicon notes, and the traps that waste an afternoon.">
+<script>/* The theme has to be on the element before the first paint. Set it from
+   a script tag at the bottom of the body, as the rest of the JS is, and a
+   light-theme reader sees the page painted dark and then flip. */
+try { if (localStorage.getItem('me.theme') === 'light')
+  document.documentElement.setAttribute('data-theme', 'light'); } catch (e) {}</script>
 <link rel="stylesheet" href="assets/css/course.css">
 </head>
 <body data-page="toolkit">
+
+<!-- Filled in by course.js. It is here rather than created there so that the
+     56px it occupies is reserved at first paint; inserting it later shoved
+     the whole page down just as it became readable. -->
+<header class="topbar"></header>
 
 <div class="shell shell--wide">
   <nav class="rail" aria-label="Lessons"></nav>

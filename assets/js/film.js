@@ -277,13 +277,16 @@
      you can hear. So we remember what was asked for, re-apply it as data
      arrives, and report the requested position until the audio gets there. */
   var wantSeek = null;
+  var wantUntil = 0;       // a pending seek stops speaking for the clock after this
   var seekToken = 0;
-  var TOL = 0.35;          // an mp3 seek lands on a frame boundary, not exactly
+  var TOL = 0.35;          // a seek lands on a frame boundary, not exactly
+  var WANT_GRACE = 2.5;    // seconds the requested position may stand in for the real one
 
   function seekAudio(t) {
     if (!isFinite(t)) return;                 // never hand the element a NaN
     var token = ++seekToken;
     wantSeek = t;
+    wantUntil = performance.now() + WANT_GRACE * 1000;
 
     /* Seeking is ASYNCHRONOUS. Reading currentTime straight after assigning it
        still returns the old position, so "did it take?" cannot be answered by
@@ -316,6 +319,7 @@
       function stop() { evs.forEach(function (e) { audio.removeEventListener(e, look); }); }
       function look() {
         if (token !== seekToken) { stop(); return; }
+        if (Math.abs(audio.currentTime - t) < TOL) { stop(); done(); return; }
         if (!seekableCovers(t)) return;
         stop();
         try { audio.currentTime = t; } catch (e) { done(); }
@@ -349,6 +353,15 @@
 
     function apply() {
       if (token !== seekToken) return;
+      /* Already there. Assigning currentTime the value it already holds is a
+         no-op that fires no 'seeked', so settle now rather than wait for an
+         event that is never coming. This is the cold-open case: readyState is
+         0 when the film opens, so the check further up was skipped, and by the
+         time metadata arrives the track is sitting at 0 — exactly where the
+         seek wanted it. Waiting left wantSeek pinned, and a pinned wantSeek
+         means now() keeps reporting 0 while the audio plays on: the voice
+         talks, the captions never move and no figure ever reaches the stage. */
+      if (Math.abs(audio.currentTime - t) < TOL) { done(); return; }
       if (!seekableCovers(t)) { waitForData(); return; }
       try { audio.currentTime = t; } catch (e) { done(); }
     }
@@ -368,7 +381,12 @@
 
   function now() {
     if (HAS_AUDIO && audio) {
-      if (wantSeek != null && Math.abs(audio.currentTime - wantSeek) > TOL) return wantSeek;
+      /* While a seek is in flight, report where it is going rather than where
+         the element still is, so the captions do not flick back. Only briefly,
+         though: a seek that never lands must not be allowed to freeze the
+         clock behind playing audio. */
+      if (wantSeek != null && performance.now() < wantUntil &&
+          Math.abs(audio.currentTime - wantSeek) > TOL) return wantSeek;
       return audio.currentTime;
     }
     if (playing) return silentT + (performance.now() - t0) / 1000;

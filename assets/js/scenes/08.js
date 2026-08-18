@@ -320,8 +320,14 @@
       stroke: 'var(--c-param)', 'stroke-width': 1.4, 'stroke-dasharray': '5 5', opacity: 0
     });
     host.appendChild(wLine);
+    /* At the left end this label sits at the same height as the 512-token
+       column's '67 MB', because that cache is tiny and its label rides just
+       above the weights line. The right end of the line is free: every column
+       that reaches over there has a bar tall enough to carry its label well
+       above this. */
     var wLbl = e('text', {
-      x: 104, y: BASE - wh - 7, class: 'dg-mono', 'font-size': 12, fill: 'var(--c-param)', opacity: 0
+      x: 826, y: BASE - wh - 7, 'text-anchor': 'end',
+      class: 'dg-mono', 'font-size': 12, fill: 'var(--c-param)', opacity: 0
     }, 'weights, 1 830 MB');
     host.appendChild(wLbl);
 

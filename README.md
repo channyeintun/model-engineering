@@ -179,6 +179,24 @@ rendered, transforms included. It found two real bugs the static checker could
 not: a bar scaled past its stage in Lesson 01, and a dial needle in Lesson 06
 pivoting around the wrong point.
 
+Bounds are only half of it. Two shapes can both sit inside the stage and still
+land on top of each other, so there is a second pass:
+
+```javascript
+(await import('/tools/audit.js')).collisions()
+```
+
+It reports two things: text overlapping text, which is essentially never
+intentional, and text buried under a shape painted after it with a solid fill.
+A translucent wash over a token is a highlight and is not reported. This one
+found seven: a label row sliding under its own headings, a second act drawn on
+top of a first act that had only been dimmed, and five captions overrunning the
+column next to them.
+
+To sweep the whole course rather than one page, load each lesson in an iframe
+and call `collisions()` inside it — but fetch the scene files with
+`cache: 'reload'` first, or you will audit the copies the browser already had.
+
 ## Notes
 
 - Progress ("mark lesson as done") is stored in `localStorage`, on your machine only.
