@@ -47,7 +47,7 @@
   var cursor = 0;
   segs.forEach(function (s) {
     var t = byId[s.id];
-    if (t) { s.start = t.start; s.end = t.end; }
+    if (t) { s.start = t.start; s.end = t.end; s.wordAt = t.w || null; }
     else {
       var words = (s.text || '').trim().split(/\s+/).length;
       var d = Math.max(2.2, (words / WPM) * 60) + (s.hold || 0);
@@ -60,10 +60,14 @@
   var HAS_AUDIO = !!timing;
 
   /* ---- captions: lines, and a time for every word ---------------------
-     A whole paragraph on screen at once is not a subtitle. Each segment is
-     split into short lines, and each line's words are given a share of that
-     line's time proportional to their length, so the highlight tracks the
-     voice closely enough to read along. */
+     A whole paragraph on screen at once is not a subtitle, so each segment is
+     split into short lines and every word gets its own moment.
+
+     When the audio exists, those moments were measured against it by
+     tools/narrate.py: the pauses are real, so the highlight arrives on the
+     word the voice is on. Without audio there is nothing to measure, and the
+     fallback below shares a line's time out by word length — good enough to
+     read along with a reading-speed estimate, which is all silent mode is. */
 
   var MAX_CHARS = 76;      // a comfortable subtitle line
   var MAX_WORDS = 12;
@@ -109,10 +113,26 @@
     return lines.length ? lines : [words];
   }
 
-  segs.forEach(function (s) {
-    var lines = splitLines(wordsOf(s.text));
-    var dur = Math.max(0.4, s.end - s.start);
-    var total = 0;
+  /* Measured times. A word stays lit until the next one starts, so a pause
+     leaves the word before it highlighted rather than blanking the line. */
+  function timeFromAudio(s, lines, offsets) {
+    var flat = [], i;
+    lines.forEach(function (ln) { flat = flat.concat(ln); });
+    if (flat.length !== offsets.length) return false;
+    for (i = 0; i < flat.length; i++) {
+      flat[i].start = s.start + offsets[i];
+      flat[i].end = (i + 1 < flat.length) ? s.start + offsets[i + 1] : s.end;
+    }
+    lines.forEach(function (ln) {
+      ln.start = ln[0].start;
+      ln.end = ln[ln.length - 1].end;
+    });
+    return true;
+  }
+
+  /* No audio to measure: share each line's time out by word length. */
+  function timeByLength(s, lines) {
+    var dur = Math.max(0.4, s.end - s.start), total = 0;
     lines.forEach(function (ln) {
       ln.weight = ln.reduce(function (a, w) { return a + w.w.length + 1; }, 0);
       total += ln.weight;
@@ -129,6 +149,11 @@
       });
       t = ln.end;
     });
+  }
+
+  segs.forEach(function (s) {
+    var lines = splitLines(wordsOf(s.text));
+    if (!s.wordAt || !timeFromAudio(s, lines, s.wordAt)) timeByLength(s, lines);
     s.lines = lines;
   });
 
