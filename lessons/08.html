@@ -1,0 +1,851 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>08 · Latency and memory — Model Engineering</title>
+<meta name="description" content="Where the milliseconds actually go: prefill against decode, the memory bandwidth ceiling, the KV cache, and a timing recipe that does not lie to you.">
+<link rel="stylesheet" href="../assets/css/course.css">
+</head>
+<body data-lesson="08">
+
+<div class="shell shell--wide">
+  <nav class="rail" aria-label="Lessons"></nav>
+
+  <main class="main">
+    <article class="prose">
+
+      <header class="lesson-head">
+        <span class="lesson-head__num">08</span>
+        <h1>Latency and memory</h1>
+        <p class="lead">A model that generates text is not one machine. It is two, and they have
+        opposite bottlenecks. Once you can tell them apart you can predict the speed of a model
+        before you run it, and you can measure the real speed afterwards without fooling yourself.</p>
+        <div class="lesson-head__meta">
+          <span class="chip"><b>Part III</b> · Make it small</span>
+          <span class="chip">≈ <b>105 min</b> reading</span>
+          <span class="chip">Project · <b>Profile it, then make it twice as fast</b></span>
+          <span class="chip">Needs · <b>Lessons 04, 05, 07</b></span>
+        </div>
+      </header>
+
+      <section class="outcomes">
+        <h2>By the end you can</h2>
+        <ul>
+          <li>Say which phase of generation is <strong>compute-bound</strong> and which is
+              <strong>memory-bound</strong>, and why.</li>
+          <li>Predict a model's <strong>tokens per second ceiling</strong> from two numbers, before writing any code.</li>
+          <li>Compute the size of a <strong>key-value (KV) cache</strong> and see when it overtakes
+              the weights.</li>
+          <li>Write a timing loop with <strong>warm-up, synchronisation and a median</strong> — and explain what each one prevents.</li>
+          <li>Report <strong>time to first token</strong>, sustained tokens per second and peak memory as three separate numbers.</li>
+          <li>Name the four device constraints a laptop hides from you: <strong>cold start,
+              thermal throttling, memory eviction and download size</strong>.</li>
+        </ul>
+      </section>
+
+      <h2 id="two-machines"><span class="h-num">08 · 1</span>Two machines wearing one model</h2>
+
+      <p>Generating an answer has two phases, and almost every wrong intuition about speed comes
+      from mixing them up. Take one concrete prompt and carry it through the whole lesson: 512
+      tokens, about a page of text. The same weights are about to do two very different jobs with
+      it.</p>
+
+      <p><strong>Prefill</strong> is the first phase. The model reads all 512 prompt tokens at once.
+      Every one of them goes through every layer in one wide pass, in parallel. It is exactly like
+      the <span class="term" data-term="batch">batch</span> dimension you met in Lesson 01. Here the
+      parallel dimension is <em>positions in the sequence</em>, not independent examples.</p>
+
+      <p><strong>Decode</strong> is the second phase. It produces one token, appends it to the
+      sequence, and produces the next. It cannot be parallelised, because token 41 depends on token
+      40 having been chosen. This is a sequential loop, and it is where nearly all of the wall-clock
+      time of a long answer goes.</p>
+
+      <figure class="scene" data-scene="lm-prefill">
+        <div class="scene__head">
+          <span class="scene__badge">animation</span>
+          <span class="scene__title">The whole prompt in one pass, then one token at a time</span>
+        </div>
+        <div class="scene__stage">
+          <svg viewBox="0 0 900 320" role="img" aria-label="All prompt tokens entering the model together in a single wide pass, then single tokens entering one after another with the weights re-read each time">
+            <g id="pf-plot"></g>
+          </svg>
+        </div>
+      </figure>
+
+      <p>The key fact is the counter on the right. During prefill the model reads every weight
+      <em>once</em> and uses each one 512 times, one use per prompt position. During decode it reads
+      every weight once and uses each one <em>once</em>. Same weights, completely different
+      economics.</p>
+
+      <div class="callout callout--key">
+        <span class="callout__label">Remember this</span>
+        <p class="mt-0">Prefill is <strong>compute-bound</strong>: the chip is busy doing arithmetic.
+        Decode is <strong><span class="term" data-term="memory bound">memory-bound</span></strong>:
+        the chip is waiting for numbers to arrive. You must
+        benchmark them separately, tune them separately, and on some devices you should even run
+        them on different hardware units.</p>
+      </div>
+
+      <h2 id="bandwidth"><span class="h-num">08 · 2</span>The bandwidth wall</h2>
+
+      <p>The word that makes this precise is <strong>arithmetic intensity</strong>: how much
+      arithmetic you do for each byte you move from memory. It is a ratio, and it decides which
+      resource runs out first.</p>
+
+      <div class="callout callout--math">
+        <span class="callout__label">The maths, once</span>
+        <p class="mt-0"><strong>FLOP</strong> stands for <em>floating-point operation</em>: one
+        multiply, or one add. FLOPs with an s is the plural — a count. FLOP/s is the rate, a count
+        per second. Those two get confused constantly, and everything below depends on keeping them
+        apart.</p>
+        <div class="eq">intensity  =  FLOPs performed  ÷  bytes moved
+
+   decode, 1 token  :  2<b>N</b> FLOPs   ÷   <b>N</b>·b bytes   =   2 / b
+   prefill, T tokens:  2<b>N</b>T FLOPs  ÷   <b>N</b>·b bytes   =   2T / b
+
+     <b>N</b>  number of weights in the model
+     <b>b</b>  bytes per weight
+     <b>T</b>  prompt length, in tokens</div>
+        <p>A matrix multiply does one multiply and one add per weight, so 2 FLOPs per weight. Every
+        weight must be read from memory once per pass, whatever the pass contains. That is the whole
+        derivation.</p>
+        <p>Why can the chip not just keep the weights nearby and stop re-reading them? Because its
+        own fast memory holds a few megabytes. The weights are hundreds of megabytes, often several
+        gigabytes. There is nowhere on the chip to put them. Every pass pays for the trip from main
+        memory again.</p>
+      </div>
+
+      <p>Put numbers in. A model quantized to <code>Q4_K_M</code> stores 4.89 bits per weight
+      averaged over the whole file, so <code>b = 0.61</code> bytes. (Lesson 07 works out 4.50 bits
+      for a plain <code>Q4_K</code> block. The <code>_M</code> variant keeps a few tensors at higher
+      precision, which lifts the file average to about 4.89.) Decode intensity is
+      <code>2 / 0.61 ≈ 3.3</code> FLOP per byte. Prefill over our 512-token prompt is
+      <code>2 × 512 / 0.61 ≈ 1 700</code> FLOP per byte.</p>
+
+      <p>Those two numbers mean nothing on their own. They mean something next to a third: the point
+      where the chip itself is <strong>balanced</strong>. A chip is balanced when its arithmetic and
+      its memory run out at the same moment. That happens at <strong>peak FLOP/s ÷ peak
+      bytes/s</strong>, and you can compute it for your own device from two datasheet lines. A phone
+      GPU doing about 4 TFLOP/s over 75.8 GB/s balances at
+      <code>4e12 ÷ 75.8e9 ≈ 53</code> FLOP per byte. Below that number you are waiting for memory.
+      Above it you are waiting for arithmetic. Mobile parts land between roughly 50 and 200.</p>
+
+      <p>Now the comparison is arithmetic rather than opinion. Prefill at 1 700 sits far above 53, so
+      it saturates the arithmetic units. Decode at 3.3 sits far below. The share of the arithmetic
+      units it can keep busy is <code>3.3 ÷ 53 ≈ 6 %</code>. During decode, about ninety-four percent
+      of your expensive chip is idle, waiting for bytes.</p>
+
+      <figure class="scene" data-scene="lm-wall">
+        <div class="scene__head">
+          <span class="scene__badge">animation</span>
+          <span class="scene__title">One token costs one full read of the model</span>
+        </div>
+        <div class="scene__stage">
+          <svg viewBox="0 0 900 300" role="img" aria-label="Weights flowing from memory through a bandwidth-limited pipe into idle compute units, with the time per token falling as the model is quantized">
+            <g id="bw-plot"></g>
+          </svg>
+        </div>
+      </figure>
+
+      <p>That gives the single most useful estimate in on-device work. If decode reads every weight
+      once per token, and memory can deliver a fixed number of bytes per second, then:</p>
+
+      <div class="eq">tokens / second  ≈  memory bandwidth (bytes/s)  ÷  <b>bytes of weights</b>
+
+   a ceiling, not a prediction — real throughput is 40 % to 70 % of it
+   weights only for now; section 3 adds the KV cache to the bytes per token</div>
+
+      <p>Compute it before you write any inference code. If the ceiling is 6 tokens per second, no
+      amount of tuning will save the product.</p>
+
+      <div class="code">
+        <div class="code__head"><span>ceiling.py</span><span class="lang">python</span></div>
+        <pre><code>BANDWIDTH_GB_S = 75.8            # your device's memory bandwidth
+PARAMS         = 3_000_000_000   # 3 B weights
+BITS_PER_W     = 4.89            # Q4_K_M, measured bits per weight
+
+bytes_per_token = PARAMS * BITS_PER_W / 8
+ms_per_token    = bytes_per_token / (BANDWIDTH_GB_S * 1e9) * 1000
+
+print(f"{bytes_per_token/1e9:.2f} GB read per generated token")   # 1.83 GB
+print(f"{ms_per_token:.1f} ms  ->  {1000/ms_per_token:.0f} tok/s ceiling")</code></pre>
+      </div>
+
+      <p>Two published figures to anchor the arithmetic. An A19 Pro pairs 12 GB of LPDDR5X — a
+      low-power memory type used in phones — running at 9600 MT/s. <strong>MT/s</strong> means
+      megatransfers per second: how many times a second the memory hands over one bus-width of data.
+      Bandwidth is <code>transfer rate × bus width ÷ 8</code>, so a 9600 MT/s memory on a 64-bit bus
+      gives <code>9600e6 × 64 ÷ 8 ≈ 76.8 GB/s</code>, and the measured figure is about
+      <strong>75.8 GB/s</strong>. A Snapdragon 8 Elite Gen 5 sits at about <strong>84.8 GB/s</strong>.
+      Do that conversion once and you can read the bandwidth off any datasheet yourself. Here is the
+      same calculation across four model sizes at 75.8 GB/s, all at <code>Q4_K_M</code>:</p>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>Model</th><th>Weight bytes read per token</th><th>ms / token</th><th>Ceiling</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>0.5 B</td><td class="num">0.31 GB</td><td class="num">4.0</td><td class="num">~250 tok/s</td></tr>
+            <tr><td>1 B</td><td class="num">0.61 GB</td><td class="num">8.1</td><td class="num">~124 tok/s</td></tr>
+            <tr><td>3 B</td><td class="num">1.83 GB</td><td class="num">24.2</td><td class="num">~41 tok/s</td></tr>
+            <tr><td>8 B</td><td class="num">4.89 GB</td><td class="num">64.5</td><td class="num">~15 tok/s</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>This is the honest reason Part III exists. In Lesson 07 you learned that
+      <span class="term" data-term="quantization">quantization</span> makes the file smaller. The
+      table shows that on a device it also makes the model <em>faster</em>, because the file size
+      <em>is</em> the per-token cost. Going from BF16 to <code>Q4_K_M</code> shrinks the per-token
+      read by 3.3×. torchao measures a Llama-3-8B int4 conversion running 1.89× faster — well short
+      of 3.3×, and that shortfall is the 40 % to 70 % band again. It is a bandwidth win, not an
+      arithmetic win.</p>
+
+      <div class="callout callout--pitfall">
+        <span class="callout__label">The ceiling is not a promise</span>
+        <p class="mt-0">Real throughput lands at roughly 40% to 70% of this number. Part of the gap
+        is attention over the cache; section 3 puts a number on that one. The rest is the sampling
+        step, the tokenizer, Python, and every small operation that is not a big matrix
+        multiply. Measure 60% of your ceiling and you are doing well. If you
+        measure 8%, something is broken — and now you know it, because you had a number to compare
+        against.</p>
+      </div>
+
+      <h2 id="kv-cache"><span class="h-num">08 · 3</span>The KV cache is the other half of your memory</h2>
+
+      <p>In Lesson 04 you added a <span class="term" data-term="kv cache">KV cache</span> so that
+      generating token 500 did not recompute tokens 1 to 499. That cache is what makes decode cheap
+      in compute. It is also what makes it expensive in memory, and on a phone it is usually the
+      thing that kills the app.</p>
+
+      <p>The size is exact arithmetic, not an estimate. For every token you keep in context, every
+      layer stores one key vector and one value vector for every key/value head:</p>
+
+      <div class="eq">KV bytes  =  2 × layers × kv_heads × head_dim × tokens × bytes_per_element
+
+   2         one key vector and one value vector
+   layers    depth of the model
+   kv_heads  key/value heads — 8 here, shared by 32 query heads
+   head_dim  head dimension, written d_h in Lesson 03
+   tokens    how many tokens are being kept in context</div>
+
+      <p>Take a plausible 3-billion-parameter shape: 32 layers, 8 key/value heads, head dimension
+      128, cache stored in FP16. That is <code>2 × 32 × 8 × 128 × 2 = 131 072</code> bytes — about
+      <strong>131 kB for every single token in the context</strong>. Now watch what happens as the
+      conversation grows.</p>
+
+      <figure class="scene" data-scene="lm-kv">
+        <div class="scene__head">
+          <span class="scene__badge">animation</span>
+          <span class="scene__title">The weights are fixed. The cache is not.</span>
+        </div>
+        <div class="scene__stage">
+          <svg viewBox="0 0 900 300" role="img" aria-label="Stacked bars showing constant weight memory and a KV cache that grows with context length until it exceeds the weights">
+            <g id="kv-plot"></g>
+          </svg>
+        </div>
+      </figure>
+
+      <div class="code">
+        <div class="code__head"><span>kv_size.py</span><span class="lang">python</span></div>
+        <pre><code>def kv_bytes(layers, kv_heads, head_dim, tokens, bytes_per_element=2, batch=1):
+    """Keys and values, for every layer, for every token kept in context."""
+    return 2 * layers * kv_heads * head_dim * tokens * bytes_per_element * batch
+
+WEIGHTS_MB = 1830        # the same 3 B model at Q4_K_M
+
+print(f"{kv_bytes(32, 8, 128, 1)/1e3:.1f} kB per token")      # 131.1 kB per token
+
+for ctx in (512, 2048, 8192, 32768):
+    mb = kv_bytes(32, 8, 128, ctx) / 1e6
+    print(f"{ctx:6d} tokens -> {mb:8.1f} MB  ({mb/WEIGHTS_MB:5.0%} of the weights)")</code></pre>
+      </div>
+
+      <p>At 512 tokens the cache is 67 MB and nobody notices. At 8 192 tokens it is 1.07 GB, about
+      six tenths of the weights. At 32 768 tokens it is 4.29 GB — more than twice the weights, and
+      far past what a phone will let one app hold.</p>
+
+      <p>Now go back and repair the ceiling from section 2. Attention re-reads the whole cache on
+      every decode step. So the bytes the chip must move to produce one token are not just the
+      weights:</p>
+
+      <div class="eq">bytes per token  =  weight bytes  +  cache bytes
+
+   at    512 tokens:  1.83 + 0.07  =  1.90 GB   ->   75.8 / 1.90  ≈  40 tok/s
+   at  8 192 tokens:  1.83 + 1.07  =  2.90 GB   ->   75.8 / 2.90  ≈  26 tok/s</div>
+
+      <p>Read that as a promise about how the app will feel. Generation gets slower as the
+      conversation gets longer, and now you can say by how much. Predict with the weights alone for a
+      short prompt. Add the cache whenever you quote a number at your maximum context, which is the
+      only number worth quoting.</p>
+
+      <p>Two more consequences follow immediately. First,
+      <span class="term" data-term="gqa">grouped-query attention (GQA)</span> from Lesson 03 is not a
+      quality trick, it is a memory trick: with 32 query heads and no sharing, this cache would be
+      four times larger. Second, quantizing the weights to 4 bits and leaving the cache at FP16
+      solves half of your problem at long context. The cache is a separate decision, with its own
+      precision setting.</p>
+
+      <div class="callout callout--pitfall">
+        <span class="callout__label">The limit that arrives late</span>
+        <p class="mt-0">A memory bug caused by the KV cache does not appear at launch. It appears
+        after a long conversation, on the user's device, with your app in the background. Always test
+        at your <em>maximum</em> advertised context length, and set a hard cap you enforce in
+        code.</p>
+      </div>
+
+      <h2 id="batching"><span class="h-num">08 · 4</span>Batch size, and why the server trick does not travel</h2>
+
+      <p>On a server, the standard answer to "decode is memory-bound" is batching. Collect several
+      users' requests and run one decode step for all of them together. Every weight you read is now
+      used <code>B</code> times instead of once, so intensity becomes <code>2B / b</code>. At
+      <code>B = 32</code> a memory-bound workload turns into a compute-bound one, and the machine
+      serves several times more people at no cost to any one of them.</p>
+
+      <p>On a device there is one user. <code>B</code> is 1 and cannot be anything else. There is no
+      second request to share the weight read with. So the whole family of server techniques built on
+      batching is solving a problem you do not have. <em>Continuous batching</em> slots a new request
+      into the running batch as soon as another one finishes. <em>Paged attention</em> stores each
+      user's KV cache in fixed-size blocks, so memory does not fragment when users come and go. Both
+      are about fitting many people onto one machine. You have one person.</p>
+
+      <div class="compare">
+        <div class="compare__col compare__col--a">
+          <h4>Server, many users</h4>
+          <ul>
+            <li>Batch size 16 to 256. Weights read once, used many times.</li>
+            <li>Decode becomes compute-bound. The GPU is the scarce resource.</li>
+            <li>KV cache memory grows with batch size — that is what limits how many users fit.</li>
+            <li>The metric that matters is <strong>tokens per second per dollar</strong>.</li>
+          </ul>
+        </div>
+        <div class="compare__col compare__col--b">
+          <h4>Device, one user</h4>
+          <ul>
+            <li>Batch size is always 1. Every weight read serves one token.</li>
+            <li>Decode is memory-bound, permanently. Bandwidth is the scarce resource.</li>
+            <li>KV cache memory grows with context length only.</li>
+            <li>The metrics that matter are <strong>time to first token</strong> and <strong>sustained tokens per second</strong>.</li>
+          </ul>
+        </div>
+      </div>
+
+      <p>There is one batch you do still have, and you already met it: prefill. Processing 512 prompt
+      positions at once is a batch over positions. It is exactly why prefill saturates the compute
+      units while decode does not. It is also why the fix for a slow first response differs from the
+      fix for slow generation.</p>
+
+      <p>There is one honest way to get a batch out of a single user, and you should know its name.
+      In <strong>speculative decoding</strong> a small, fast draft model guesses the next few tokens.
+      The big model then checks all of those guesses in one pass — a batch over positions, exactly
+      like prefill. Verify 4 drafted tokens in a single read of the weights and the intensity rises
+      from <code>2 / b</code> to <code>8 / b</code>. When the draft agrees often you get roughly 1.5
+      to 2 times the decode rate. When it does not you get nothing, and it costs a second model in
+      memory either way. We do not use it again here. Keep it as the exception:
+      <em>bandwidth ÷ weights</em> is a law about producing one token at a time, not about
+      generation itself.</p>
+
+      <h2 id="compile"><span class="h-num">08 · 5</span>What <code>torch.compile</code> actually buys</h2>
+
+      <p>A single decode step launches a few thousand tiny programs on the chip. Each one costs a
+      launch and a round trip to memory that has nothing to do with your model. On a server, with a
+      batch of 64 sharing every launch, that overhead vanishes into the noise. On a phone, one token
+      at a time, it is a real slice of your budget. This section gets that slice back.</p>
+
+      <p>First the two words. A <strong>kernel</strong> here is one small program the chip runs: one
+      for the matrix multiply, one for the normalisation, one for the activation function. This is
+      not the convolution kernel of Lesson 02 — same word, different thing. <strong>Eager</strong>
+      mode is how PyTorch has behaved in every lesson so far: it launches each kernel the moment
+      Python reaches that line, one operation at a time.</p>
+
+      <p>Each kernel reads its input from memory, does its work, and writes its output back. For a
+      big matrix multiply that round trip is irrelevant — the arithmetic dominates. For the small
+      operations around it the round trip <em>is</em> the cost. Put numbers on one. An RMSNorm over a
+      single activation of 3 072 values in FP16 reads 6 kB and writes 6 kB. It does roughly 3
+      operations per value, so about 9 000 operations against 12 kB of traffic. That is an intensity
+      below 1 FLOP per byte, on a chip balanced at 53. The arithmetic is free; the traffic is
+      everything.</p>
+
+      <p><strong>Kernel fusion</strong> writes one kernel that performs the whole chain while the
+      values are still in registers. The middle tensors are never written to memory and never read
+      back. That is the main thing <code>torch.compile</code> does for you, and it also removes the
+      per-operation Python overhead.</p>
+
+      <figure class="scene" data-scene="lm-fuse">
+        <div class="scene__head">
+          <span class="scene__badge">animation</span>
+          <span class="scene__title">Six trips to memory, or two</span>
+        </div>
+        <div class="scene__stage">
+          <svg viewBox="0 0 900 300" role="img" aria-label="Three separate kernels each reading from and writing to memory, then collapsing into one fused kernel with a single read and a single write">
+            <g id="fz-plot"></g>
+          </svg>
+        </div>
+      </figure>
+
+      <p>So the arithmetic of the section is this. A normalisation, a scale and an activation, run
+      eagerly, cost six trips to memory and 36 kB of traffic. Fused into one kernel they cost two
+      trips and 12 kB, and the two intermediate tensors are never born. On a laptop GPU the usual
+      result of compiling a decode loop is 10 % to 30 % off the latency. If your model is dominated
+      by one big matrix multiply it can be close to zero. Measure it; do not assume it.</p>
+
+      <div class="callout callout--note">
+        <span class="callout__label">What it cannot do</span>
+        <p class="mt-0">Fusion cannot make the weight read smaller. If you are bandwidth-limited on
+        the weights themselves — which is exactly what decode is — compilation gives you back the
+        elementwise traffic and the launch overhead, not the matrix-multiply traffic. The lever for
+        that is fewer bits per weight, which is Lesson 07. Compilation and quantization attack
+        different lines of the same budget.</p>
+      </div>
+
+      <p>Two practical warnings. First, <code>torch.compile</code> compiles on the first call, and
+      that can take far longer than the inference you are trying to measure. It belongs inside your
+      warm-up, never inside the timed region. Second, decode changes the sequence length on every
+      step. If the compiled graph is specialised on a shape, a changing shape forces a recompile, and
+      you can spend more time compiling than generating. Check the recompile count before you
+      conclude that compilation did not help.</p>
+
+      <h2 id="measure"><span class="h-num">08 · 6</span>Measuring without lying to yourself</h2>
+
+      <p>Here is the single most common mistake in this whole subject. It reports 0.4 ms for a step
+      that really took 24.2 ms — wrong by a factor of sixty, and still completely reasonable-looking
+      on the screen.</p>
+
+      <p>When you call a model on a GPU — CUDA or Apple's MPS — Python does not wait for the result.
+      It puts the work on a queue and returns immediately. If your clock starts before the call and
+      stops after it, you have measured how fast Python can fill a queue. You have not measured the
+      model at all.</p>
+
+      <figure class="scene" data-scene="lm-timing">
+        <div class="scene__head">
+          <span class="scene__badge">animation</span>
+          <span class="scene__title">The clock that stops before the work does</span>
+        </div>
+        <div class="scene__stage">
+          <svg viewBox="0 0 900 320" role="img" aria-label="Python queueing work quickly while the device lane continues running long after, with the naive stopwatch stopping far too early">
+            <g id="tm-plot"></g>
+          </svg>
+        </div>
+      </figure>
+
+      <p>The fix is a synchronisation call, which blocks until the device queue is empty. Put one
+      before you start the clock and one before you stop it. And throw away the first few runs: the
+      first pass allocates buffers, compiles kernels, and fills caches, so it can be many times
+      slower than the steady state.</p>
+
+      <div class="code">
+        <div class="code__head"><span>time_it.py</span><span class="lang">python</span></div>
+        <pre><code>import time, torch
+torch.set_grad_enabled(False)
+
+def sync():
+    if torch.cuda.is_available():            torch.cuda.synchronize()
+    elif torch.backends.mps.is_available():  torch.mps.synchronize()
+
+t0 = time.perf_counter()                     # WRONG: times the queue, not the model
+model(x)
+wrong = time.perf_counter() - t0
+
+for _ in range(5):                           # warm up: allocator, kernels, caches
+    model(x)
+sync()
+
+times = []
+for _ in range(20):                          # RIGHT: sync on both sides, repeat
+    sync()
+    t0 = time.perf_counter()
+    model(x)
+    sync()
+    times.append(time.perf_counter() - t0)
+
+times.sort()
+print(f"wrong  {wrong*1e3:7.2f} ms")
+print(f"median {times[len(times)//2]*1e3:7.2f} ms")</code></pre>
+      </div>
+
+      <p>Take the <strong>median</strong>, not the mean. One background app waking up will pull a
+      mean a long way; the median ignores it. To report spread, give the median and the 90th
+      percentile — a user feels the slow requests, not the average one.</p>
+
+      <p>Next, split the measurement in two. A single "tokens per second" number hides the thing
+      users complain about. <strong>Time to first token</strong> is prefill plus one decode step, and
+      it is what the interface feels like. <strong>Decode rate</strong> is everything after that.</p>
+
+      <div class="code">
+        <div class="code__head"><span>ttft_and_rate.py</span><span class="lang">python</span></div>
+        <pre><code>NEW  = 128                                   # tokens generated after the first
+WARM, REPS = 3, 5
+
+def median_time(fn):
+    for _ in range(WARM):                    # same recipe as time_it.py
+        fn()
+    ts = []
+    for _ in range(REPS):
+        sync()
+        t0 = time.perf_counter()
+        fn()
+        sync()
+        ts.append(time.perf_counter() - t0)
+    return sorted(ts)[len(ts) // 2]          # median, never the mean
+
+def gen(n):
+    model.generate(**inputs, max_new_tokens=n, do_sample=False)
+
+ttft  = median_time(lambda: gen(1))          # prefill + one decode step
+total = median_time(lambda: gen(NEW + 1))
+# assumes prefill costs the same in both calls — true only after warm-up
+
+print(f"prompt tokens        {inputs['input_ids'].shape[1]:7d}")
+print(f"time to first token  {ttft*1e3:7.1f} ms")
+print(f"decode rate          {NEW/(total-ttft):7.1f} tok/s")</code></pre>
+      </div>
+
+      <p>Use greedy decoding (<code>do_sample=False</code>) while benchmarking. Sampling adds
+      randomness to the output length and to the work done. The only thing that changes between two
+      runs should be the thing you changed.</p>
+
+      <p>For memory, ask the device rather than the operating system. On CUDA,
+      <code>torch.cuda.reset_peak_memory_stats()</code> and
+      <code>torch.cuda.max_memory_allocated()</code> give a true peak across the run. On Apple
+      Silicon, <code>torch.mps.current_allocated_memory()</code> reports the current allocation, so
+      sample it at the end of generation, when the cache is largest. Report peak memory at your
+      longest supported context, never at your demo prompt.</p>
+
+      <p>Finally, when a number is bad and you do not know why, open the profiler instead of
+      guessing. It tells you which operators consumed the time, which is usually a surprise.</p>
+
+      <div class="code">
+        <div class="code__head"><span>profile_it.py</span><span class="lang">python</span></div>
+        <pre><code>from torch.profiler import profile, ProfilerActivity
+
+acts = [ProfilerActivity.CPU]
+if torch.cuda.is_available():
+    acts.append(ProfilerActivity.CUDA)
+
+for _ in range(3):                           # warm up before profiling, always
+    model.generate(**inputs, max_new_tokens=8, do_sample=False)
+
+with profile(activities=acts, record_shapes=True) as prof:
+    model.generate(**inputs, max_new_tokens=16, do_sample=False)
+
+print(prof.key_averages().table(sort_by="self_cpu_time_total", row_limit=12))</code></pre>
+      </div>
+
+      <div class="callout callout--key">
+        <span class="callout__label">The recipe, in six lines</span>
+        <p class="mt-0">Fix the prompt and use greedy decoding. Warm up and discard. Synchronise
+        before and after the timed region. Repeat and take the median. Report time to first token,
+        decode rate and peak memory as three separate numbers. Compare the decode rate with the
+        bandwidth ceiling you computed in section 2.</p>
+      </div>
+
+      <h2 id="device"><span class="h-num">08 · 7</span>Heat, eviction, cold start, and the app store</h2>
+
+      <p>Everything above is true on a laptop with mains power. A phone adds four constraints no
+      laptop benchmark will show you.</p>
+
+      <p><strong>Cold start.</strong> The first run of your app is not the run you measured. It has
+      three parts, and they have wildly different sizes. Opening the file and mapping it into memory
+      is nearly free. Then the runtime turns the model into code for this particular device and
+      caches the result. On Apple that artifact is a <code>.mlmodelc</code> built by
+      <span class="term" data-term="core ml">Core ML</span>; in a browser it is compiled
+      <span class="term" data-term="webgpu">WebGPU</span> shaders. You meet both properly in Lesson
+      10. This step is usually the largest single cost. Prefill of the first prompt comes last.
+      Measure all three separately: only one of them has an easy fix.</p>
+
+      <figure class="scene" data-scene="lm-waterfall">
+        <div class="scene__head">
+          <span class="scene__badge">animation</span>
+          <span class="scene__title">One request, broken into the phases you can actually fix</span>
+        </div>
+        <div class="scene__stage">
+          <svg viewBox="0 0 900 300" role="img" aria-label="A latency waterfall of file mapping, backend compilation, prefill and decode, with the compilation bar collapsing when the compiled artifact is cached">
+            <g id="wf-plot"></g>
+          </svg>
+        </div>
+      </figure>
+
+      <p>The numbers from the animation, written out so you can check the addition:</p>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>Phase</th><th>First launch</th><th>Compiled artifact cached</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>Open the file, map the weights</td><td class="num">12 ms</td><td class="num">12 ms</td></tr>
+            <tr><td>Compile the model for the backend</td><td class="num">2 400 ms</td><td class="num">40 ms</td></tr>
+            <tr><td>Prefill, 512-token prompt</td><td class="num">380 ms</td><td class="num">380 ms</td></tr>
+            <tr><td><strong>Time to first token</strong></td><td class="num"><strong>2 792 ms</strong></td><td class="num"><strong>432 ms</strong></td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>One row moved and the wait fell by a factor of six. So the fix for a slow cold start is
+      caching the compiled artifact, not buying faster storage. And measure cold start cold: the
+      second launch reads a warm page cache and tells you a comfortable lie.</p>
+
+      <p><strong>Thermal throttling.</strong> A phone has no fan. Under sustained load it heats up,
+      and the system lowers the clock speed to protect the battery and your hand. This begins after
+      roughly 30 to 120 seconds. The run below opens at 25 tokens per second. That is about 60 % of
+      the 41 tok/s ceiling from section 2, so it is a healthy measurement, not a record. It steps
+      down to 17 after about 45 seconds, and settles at 13 after two minutes. Averaged over three
+      minutes that is about 18 tokens per second. A ten-second benchmark would have published 25 —
+      a state your users are almost never in.</p>
+
+      <figure class="scene" data-scene="lm-thermal">
+        <div class="scene__head">
+          <span class="scene__badge">animation</span>
+          <span class="scene__title">Two minutes of generation, and the number you should publish</span>
+        </div>
+        <div class="scene__stage">
+          <svg viewBox="0 0 900 280" role="img" aria-label="A tokens per second trace that steps downward twice during three minutes of continuous generation, next to a flat line showing the misleading ten-second result">
+            <g id="th-plot"></g>
+          </svg>
+        </div>
+      </figure>
+
+      <p><strong>Memory eviction.</strong> iOS shuts down apps that go over a memory budget. On a
+      6 GB phone a foreground app may only safely hold about 2 to 3 GB. Reading the weights straight
+      from the file helps. The system already has a copy of them on disk. If memory runs short it can
+      throw them out and read them back later. The KV cache is memory you allocated and wrote into
+      yourself. It has no copy on disk, so it cannot be thrown out. That is why the cache is the
+      dangerous half.</p>
+
+      <p><strong>Download size.</strong> Apple restricts App Store downloads over cellular above
+      200 MB, and Google Play caps the base module of an Android App Bundle at about the same. Your
+      weights will not fit, so do not ship them inside the binary. Download them on first run, check
+      a hash, and keep them in a cache directory the system is allowed to empty. Lesson 10 works
+      through the real budgets and the shipping side.</p>
+
+      <div class="callout callout--pitfall">
+        <span class="callout__label">The benchmark that fooled everybody</span>
+        <p class="mt-0">A ten-second run, on a plugged-in laptop, with a warm page cache, a 20-token
+        prompt, and no synchronisation. Every one of those five choices makes the number better than
+        reality. Change all five and you often find the honest figure is a small fraction of the one
+        in the announcement.</p>
+      </div>
+
+      <div class="project">
+        <span class="project__label">Project 08</span>
+        <h3>Profile it, then make it twice as fast</h3>
+        <p>Take the model you fine-tuned in Lesson 05, predict its speed on paper, measure it
+        honestly, and then double the decode rate using the levers from this lesson and Lesson 07.
+        The deliverable is a short table of numbers with a line for every change you made.</p>
+        <ol class="steps">
+          <li>Load the merged model you saved in Lesson 05 —
+              <code>smol-360m-mytask-merged</code>, a <code>SmolLM2-360M-Instruct</code> fine-tune —
+              in BF16 with <code>transformers</code>. This is the unquantized baseline, the same one
+              Lesson 07 started from. Fix one prompt of about 512 tokens and use
+              <code>do_sample=False</code> everywhere.</li>
+          <li><strong>Predict first.</strong> Compute the bandwidth ceiling for that BF16 model with
+              <code>ceiling.py</code>, so <code>BITS_PER_W = 16</code>. Look up your device's
+              bandwidth, or measure it with a large tensor copy. A copy reads N bytes and writes
+              N bytes, so divide <code>2 × N</code> by the seconds.
+              Repeat it, take the median, and expect roughly 60 % to 80 % of the datasheet figure.
+              Write the prediction down before you measure anything.</li>
+          <li>Measure time to first token and decode rate with the warm-up, synchronise and median
+              recipe. Record what fraction of your predicted ceiling you actually reached.</li>
+          <li>Record peak memory at 512, 2 048 and 8 192 tokens of context. Plot the three points
+              and compare the slope with what <code>kv_size.py</code> predicts for this model's
+              layer count and head shape. At 8 192 tokens, compare your decode rate against the
+              cache-inclusive ceiling from section 3, not the weights-only one.</li>
+          <li>Now go faster. Quantize the weights to int4 with <code>torchao</code> as in Lesson 07,
+              apply <code>torch.compile</code>, and re-measure after each change separately. One
+              change, one measurement, one row in the table. Recompute the ceiling after quantizing:
+              the target moved when the bytes per weight did.</li>
+        </ol>
+        <p><strong>Then break the measurement on purpose</strong>, so that you recognise each failure
+        when it happens to you for real:</p>
+        <ul>
+          <li>Delete both <code>sync()</code> calls. How many times too fast is the answer?</li>
+          <li>Delete the warm-up loop. How much slower is the first iteration than the median?</li>
+          <li>Run for 10 seconds, then for 5 minutes. Plot tokens per second against time and see
+              whether your machine throttles.</li>
+          <li>Report the mean instead of the median while another application starts up. How far does
+              the number move?</li>
+          <li>Time a 20-token prompt and a 2 000-token prompt. Which number changed, and which
+              phase does that tell you it belongs to?</li>
+        </ul>
+        <dl class="project__grid">
+          <div class="project__stat"><dt>Data</dt><dd>None — one fixed prompt</dd></div>
+          <div class="project__stat"><dt>Model</dt><dd>Your merged Lesson 05 SmolLM2-360M</dd></div>
+          <div class="project__stat"><dt>Time</dt><dd>≈ 15 min, no training</dd></div>
+          <div class="project__stat"><dt>Target</dt><dd>2× decode rate, and a number per phase</dd></div>
+        </dl>
+      </div>
+
+      <h2 id="check">Check yourself</h2>
+
+      <div class="check">
+        <p class="check__q">Your model is 1.0 GB of weights and your device delivers 50 GB/s of
+        memory bandwidth. What is the ceiling for single-user decode?</p>
+        <div class="check__opts">
+          <button class="check__opt">About 25 tokens per second</button>
+          <button class="check__opt" data-right>About 50 tokens per second</button>
+          <button class="check__opt">About 100 tokens per second</button>
+          <button class="check__opt">It depends on how many FLOPs the model does</button>
+        </div>
+        <p class="check__why">Decode reads every weight exactly once per token, so the rate is
+        bandwidth divided by model bytes: 50 ÷ 1.0 = 50. The FLOP count does not enter, because the
+        arithmetic units are idle while they wait for the bytes.</p>
+      </div>
+
+      <div class="check">
+        <p class="check__q">On an Apple Silicon Mac you time a decode step with
+        <code>time.perf_counter()</code> and get 0.4 ms, which would be 2 500 tokens per second for
+        a 1 B model. What has gone wrong?</p>
+        <div class="check__opts">
+          <button class="check__opt">The model is too small to measure accurately</button>
+          <button class="check__opt">Python's clock has a resolution of about 1 ms</button>
+          <button class="check__opt" data-right>You measured how long it took to queue the work, not to run it</button>
+          <button class="check__opt">The KV cache made the step almost free</button>
+        </div>
+        <p class="check__why">GPU calls are asynchronous: Python returns as soon as the work is
+        submitted. Without <code>torch.mps.synchronize()</code> on both sides of the timed region you
+        are timing the queue. The bandwidth ceiling is the giveaway — 2 500 tok/s on a 1 B model is
+        physically impossible.</p>
+      </div>
+
+      <div class="check">
+        <p class="check__q">Time to first token on a 4 000-token prompt is 1.9 seconds, but
+        generation afterwards feels fine. Which change helps that first number most?</p>
+        <div class="check__opts">
+          <button class="check__opt">Quantize the weights from int8 to int4</button>
+          <button class="check__opt" data-right>Shorten the prompt, or reuse a cached prefix</button>
+          <button class="check__opt">Increase the batch size</button>
+          <button class="check__opt">Store the KV cache in int8 instead of FP16</button>
+        </div>
+        <p class="check__why">Time to first token is dominated by prefill, which is compute-bound and
+        grows with prompt length. Halving the bytes per weight speeds up decode, which was already
+        fine. Batch size is fixed at 1 on a device, and cache precision affects memory, not prefill
+        compute.</p>
+      </div>
+
+      <div class="check">
+        <p class="check__q">A model has 28 layers, 4 key/value heads and a head dimension of 128, and
+        keeps its KV cache in FP16. At roughly what context length does the cache pass 1 GB?</p>
+        <div class="check__opts">
+          <button class="check__opt">About 4 400 tokens</button>
+          <button class="check__opt" data-right>About 17 400 tokens</button>
+          <button class="check__opt">About 70 000 tokens</button>
+          <button class="check__opt">Never — the cache does not grow with context</button>
+        </div>
+        <p class="check__why">Per token the cache costs
+        <code>2 × 28 × 4 × 128 × 2 = 57 344</code> bytes, so 1 GB buys
+        <code>1e9 ÷ 57 344 ≈ 17 400</code> tokens. Halve the key/value heads to 2 and the per-token
+        cost halves too, so the same 1 GB now stretches to about 34 800 tokens. That doubling is the
+        whole reason grouped-query attention exists.</p>
+      </div>
+
+      <div class="terms">
+        <span class="terms__label">Key words from this lesson</span>
+        <dl>
+          <dt>Prefill <span class="en">also: prompt processing</span></dt>
+          <dd>The first pass, where the whole prompt goes through the model at once. Compute-bound.</dd>
+
+          <dt>Decode <span class="en">also: generation</span></dt>
+          <dd>The loop that produces one token at a time after the prompt. Memory-bound.</dd>
+
+          <dt>FLOP <span class="en">floating-point operation</span></dt>
+          <dd>One multiply, or one add. FLOPs is a count of them. FLOP/s is a rate, a count per second.</dd>
+
+          <dt>Arithmetic intensity</dt>
+          <dd>How many arithmetic operations you perform for each byte you read from memory. A ratio that tells you which resource runs out first.</dd>
+
+          <dt>Balance point <span class="en">of a chip</span></dt>
+          <dd>Peak FLOP/s divided by peak bytes per second. Work below it waits for memory; work above it waits for arithmetic.</dd>
+
+          <dt>Kernel <span class="en">in the GPU sense</span></dt>
+          <dd>One small program the chip runs, such as a matrix multiply or a normalisation. Not the convolution kernel of Lesson 02.</dd>
+
+          <dt>Kernel fusion</dt>
+          <dd>Writing one kernel that does a chain of small operations while the values stay in registers, so the middle results never reach memory.</dd>
+
+          <dt>Memory bandwidth <span class="en">measured in GB/s</span></dt>
+          <dd>How many bytes per second the memory can deliver to the chip. The hard limit on generation speed.</dd>
+
+          <dt>Time to first token <span class="en">often written TTFT</span></dt>
+          <dd>How long the user waits before anything appears. Prefill plus one decode step.</dd>
+
+          <dt>Warm-up</dt>
+          <dd>Runs at the start of a benchmark that you throw away, because the first pass also pays for allocation and compilation.</dd>
+
+          <dt>Synchronisation <span class="en">/ˌsɪŋkrənaɪˈzeɪʃn/</span></dt>
+          <dd>Waiting until the device has finished the work you submitted. Without it, a clock measures the queue.</dd>
+
+          <dt>Thermal throttling</dt>
+          <dd>The system lowering clock speeds because the chip is too hot. It turns a fast short benchmark into a slower long one.</dd>
+
+          <dt>Cold start</dt>
+          <dd>The first run after launch: mapping the file, compiling for the backend, and prefilling the first prompt.</dd>
+        </dl>
+      </div>
+
+      <h2 id="resources">Go deeper</h2>
+
+      <div class="resources">
+        <a class="res" href="https://efficientml.ai/" target="_blank" rel="noopener">
+          <span class="res__kind" data-kind="course">course</span>
+          <span class="res__body">
+            <span class="res__title">MIT 6.5940 — EfficientML.ai</span>
+            <span class="res__why">Song Han's course on making models small and fast. The roofline and on-device sections are the formal version of this lesson. Note that it was not offered in Fall 2025; the Fall 2024 material is still online.</span>
+          </span>
+        </a>
+        <a class="res" href="https://docs.pytorch.org/ao/stable/" target="_blank" rel="noopener">
+          <span class="res__kind" data-kind="docs">docs</span>
+          <span class="res__body">
+            <span class="res__title">torchao documentation</span>
+            <span class="res__why">Where the int4 speed and memory figures above come from, and the tool you will use in step 5 of the project.</span>
+          </span>
+        </a>
+        <a class="res" href="https://github.com/ggml-org/llama.cpp/blob/master/tools/quantize/README.md" target="_blank" rel="noopener">
+          <span class="res__kind" data-kind="code">code</span>
+          <span class="res__body">
+            <span class="res__title">llama.cpp — measured bits per weight</span>
+            <span class="res__why">Open it whenever you need the real bits-per-weight of a quantization format. Without that number your bandwidth ceiling is wrong.</span>
+          </span>
+        </a>
+        <a class="res" href="https://docs.pytorch.org/executorch/stable/" target="_blank" rel="noopener">
+          <span class="res__kind" data-kind="docs">docs</span>
+          <span class="res__body">
+            <span class="res__title">ExecuTorch documentation</span>
+            <span class="res__why">The runtime where you will repeat all of these measurements on an actual phone. Read it before Lesson 09, not after.</span>
+          </span>
+        </a>
+      </div>
+
+      <div class="callout callout--try">
+        <span class="callout__label">Next</span>
+        <p class="mt-0">You can now predict a model's speed, measure it honestly, and say which phase
+        a millisecond belongs to. The decode rate you just measured is the "language model" line in
+        the latency budget of Lesson 13's offline voice assistant. It is most of the answer to "does
+        the product feel fast?". All of it was still measured inside Python. In
+        <strong>Lesson 09</strong> we leave it. <code>torch.export</code> turns your model into a
+        graph. That graph becomes an <span class="term" data-term="onnx">ONNX (Open Neural Network Exchange)</span> file, an
+        <span class="term" data-term="executorch">ExecuTorch</span> <code>.pte</code>, a Core ML
+        package or a <span class="term" data-term="gguf">GGUF (GPT-Generated Unified Format)</span>.
+        Four formats, one model, very
+        different numbers on the same device.</p>
+      </div>
+
+    </article>
+  </main>
+
+  <aside class="toc-rail"></aside>
+</div>
+
+<script src="../assets/js/vendor/gsap.min.js"></script>
+<script src="../assets/js/scene.js"></script>
+<script src="../assets/js/svgkit.js"></script>
+<script src="../data/lessons.js"></script>
+<script src="../data/glossary.js"></script>
+<script src="../assets/js/course.js"></script>
+<script src="../data/narration/08.js"></script>
+<script src="../data/narration/08.timing.js" onerror="void 0"></script>
+<script src="../assets/js/scenes/08.js"></script>
+<script src="../assets/js/film.js"></script>
+</body>
+</html>

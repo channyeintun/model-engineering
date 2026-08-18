@@ -1,0 +1,138 @@
+WEBVTT
+
+a01
+00:00:00.000 --> 00:00:13.130
+So. Two questions run through this whole lesson. How fast will this model generate text — and is the number you just measured actually real? By the end, you can answer the first one on paper, before you write any code.
+
+a02
+00:00:14.080 --> 00:00:26.330
+Here is what nobody tells you at the start. A model generating text is not one machine. It is two. Both begin with a prompt — eight tokens drawn here, but picture 512.
+
+a03
+00:00:26.680 --> 00:00:43.730
+Prefill is the first machine. All 512 tokens go through in one wide pass. Every weight read once, and used 512 times. That is roughly 1 700 operations per byte — far above the chip's balance point of 53. Compute-bound.
+
+a04
+00:00:44.080 --> 00:00:57.370
+Now decode. The second machine. One token goes in. And to get the next one, the model reads every weight again — the whole 1.83 GB — and uses each number exactly once. Once.
+
+a05
+00:00:57.720 --> 00:01:12.290
+3.3 against 1 700. Same file, same weights, two completely different bottlenecks. Decode is memory-bound: the chip is not computing, it is waiting. Benchmark them separately, or you have measured nothing.
+
+a06
+00:01:12.940 --> 00:01:26.790
+Let us make that physical. To produce one token, the chip has to read every weight once. In BF16 this three-billion-parameter model is 6.0 GB. Six gigabytes. Per token.
+
+a07
+00:01:27.140 --> 00:01:44.990
+And between memory and compute there is exactly one pipe: memory bandwidth. On a recent phone, about 75.8 GB a second. So one token costs 79.2 ms. That is 12.6 tokens per second, and nothing goes faster than the pipe.
+
+a08
+00:01:45.340 --> 00:02:01.590
+So what is the arithmetic doing all this time? Almost nothing. At BF16 that is 1 FLOP per byte, on a chip balanced at 53. About 2 % busy. Ninety-eight per cent of your expensive chip, idle, waiting for bytes.
+
+a09
+00:02:01.940 --> 00:02:21.150
+So shrink the file. Quantize to Q4_K_M — 4.89 bits per weight — and 6.0 GB becomes 1.83 GB. Three times less water, through exactly the same pipe. And fewer bytes per weight lifts the intensity to 3.3, so the arithmetic reaches 6 %.
+
+a10
+00:02:21.500 --> 00:02:39.680
+24.2 ms per token instead of 79.2. The ceiling climbs from 13 to 41 tokens per second. And that is the whole formula — bandwidth divided by weight bytes. It is a ceiling though, not a promise: real throughput lands at 40 to 70 per cent of it.
+
+a11
+00:02:40.330 --> 00:02:52.420
+Right. That was half the memory. At Q4_K_M the weights are 1 830 MB, and they never move — the same size whatever you ask, however long the conversation runs.
+
+a12
+00:02:52.770 --> 00:03:06.620
+The other half does move. Every token you keep in context stores one key and one value, in every layer, for every key/value head. Multiply it out: 131 kB. Per token.
+
+a13
+00:03:06.970 --> 00:03:16.820
+At 512 tokens that is 67 MB. About four per cent of the weights. Nobody notices — and that is exactly why this bug never shows up on your laptop.
+
+a14
+00:03:17.170 --> 00:03:31.990
+At 2 048 tokens, 268 MB. At 8 192, it is 1 074 MB — nearly two thirds of the weights. And look at the shape of it. Straight line. It just keeps going.
+
+a15
+00:03:32.340 --> 00:03:47.870
+At 32 768 tokens the cache is 4 295 MB. More than twice the weights. This is the number that gets your app killed — and it arrives after the user has been talking for a long while. Never at launch.
+
+a16
+00:03:48.220 --> 00:04:06.640
+Grouped-query attention is the only reason this is survivable at all. Without shared keys and values, every cyan bar would be four times taller. And one repair to the formula: attention re-reads the cache every step, so at 8 192 tokens the ceiling drops from 40 to 26.
+
+a17
+00:04:07.590 --> 00:04:28.160
+Now — on a server you fix memory-bound decode with batching. One weight read, shared by many users. On a device? One user. Batch size is 1, forever. The one honest exception is speculative decoding, where a small draft model guesses ahead and the big model checks four guesses in a single read.
+
+a18
+00:04:29.110 --> 00:04:40.320
+One decode step launches a few thousand tiny programs on the chip. Kernels. Here are three of them, in the order the model runs them: a normalisation, a scale, and an activation.
+
+a19
+00:04:40.670 --> 00:04:52.360
+And here is the cost nobody counts. Each kernel reads its input from memory, does its work, and writes its output back. Three operations. Six trips. 36 kB of traffic.
+
+a20
+00:04:52.710 --> 00:05:02.960
+Kernel fusion writes one kernel that does the whole chain while the values are still in registers. The two middle tensors? Never written. Never read. Never born at all.
+
+a21
+00:05:03.310 --> 00:05:17.730
+Two trips instead of six. 12 kB instead of 36. On a laptop GPU, compiling a decode loop usually takes 10 to 30 per cent off the latency. But it cannot shrink the weight read. Only fewer bits per weight does that.
+
+a22
+00:05:18.380 --> 00:05:29.750
+Now the part where people lie to themselves without meaning to. Python does not run the model. It puts the work on the device queue and returns immediately — long before anything has actually been computed.
+
+a23
+00:05:30.100 --> 00:05:41.630
+So start a clock here, stop it when Python returns, and the stopwatch says 0.4 ms. Beautiful. Plausible. And completely wrong — you measured how fast Python can fill a queue.
+
+a24
+00:05:41.980 --> 00:05:53.750
+The device is still working. The real end of the step is here: 24.2 ms. The wrong number was smaller by a factor of sixty — and it looked entirely reasonable on the screen.
+
+a25
+00:05:54.100 --> 00:06:04.670
+The fix is a synchronisation call. It blocks until the device queue is empty. One before you start the clock, one before you stop it. Two lines. That is the whole cure.
+
+a26
+00:06:05.020 --> 00:06:17.670
+Then the other half of the recipe. The first run also allocates buffers and compiles kernels, so it is not the model you want to time. Warm up. Throw those runs away. And take the median — never the mean.
+
+a27
+00:06:18.320 --> 00:06:29.610
+On a phone, one request is not one number. Split a cold start into phases. Opening the file and mapping the weights into memory is nearly free — 12 ms.
+
+a28
+00:06:29.960 --> 00:06:43.010
+Then the backend compiles the model for this particular device. 2 400 ms. And that is not inference at all — it is not your model being slow. On a cold start it is usually the biggest bar by far.
+
+a29
+00:06:43.360 --> 00:06:58.490
+Prefill runs the prompt through — 380 ms — and only now can the first token appear. Add the three bars up. Time to first token: 2 792 ms. Nearly three seconds of nothing.
+
+a30
+00:06:58.840 --> 00:07:14.940
+Now cache the compiled artifact. One row moves, and the second launch is a different application: 432 ms instead of 2 792. So the fix for a slow cold start is caching compilation. Not faster storage.
+
+a31
+00:07:15.590 --> 00:07:27.360
+One last trap, and it is the one that fools whole companies. The first ten seconds look excellent. 25 tokens per second — about 60 % of the 41 you predicted, which is a healthy result.
+
+a32
+00:07:27.710 --> 00:07:39.320
+But a phone has no fan. It heats up. The system lowers the clock speed to protect the battery and your hand. And after about 45 seconds, the rate steps down to 17.
+
+a33
+00:07:39.670 --> 00:07:54.640
+Then again, at two minutes. Down to 13. That flat dashed line is what a ten-second benchmark publishes. The honest figure is the average over a realistic run: about 18 tokens per second. Publish the curve, not the peak.
+
+a34
+00:07:55.590 --> 00:08:18.650
+Two more limits, and neither shows on a laptop. iOS kills apps that go over a memory budget, and the cache is the half that cannot be evicted. App stores cap a cellular download near 200 MB, so weights ship separately. Then: predict the ceiling, measure honestly, report three numbers. Lesson 09 leaves Python for four export formats.
+

@@ -1,0 +1,150 @@
+WEBVTT
+
+a01
+00:00:00.000 --> 00:00:11.370
+So. The whole job of pretraining, in a few minutes. Where the labels come from. What the loss should read at step zero. How many hours the run costs. And how to spot a broken run early.
+
+a02
+00:00:12.320 --> 00:00:23.690
+This is one training example. Not one word. Not one sentence. A whole block of token ids — six here, so it fits on screen. Two hundred and fifty-six in your project.
+
+a03
+00:00:24.040 --> 00:00:34.290
+Watch what one forward pass does. Every position produces a prediction, all at the same time, not only the last one. And they're all nonsense, because the weights are still random.
+
+a04
+00:00:34.640 --> 00:00:45.210
+So where do the labels come from? Copy the input row, and slide the copy one place left. That's the whole labelling step. No annotator. No label file. The text labels itself.
+
+a05
+00:00:45.560 --> 00:00:57.170
+The slide leaves two gaps. The first token is nobody's target, and the last position has no target. Which is why a block of two hundred and fifty-six tokens trains on two hundred and fifty-five positions.
+
+a06
+00:00:57.520 --> 00:01:10.490
+And here's the number you can predict before you run anything. Average those losses, and a fresh model sits at the natural log of the vocabulary size. Ours is 4,096. So the loss starts at 8.32.
+
+a07
+00:01:10.840 --> 00:01:20.840
+None of this is legal without the causal mask from Lesson Three. Position two cannot see token three. So its prediction is real, not a copy of the answer next to it.
+
+a08
+00:01:21.490 --> 00:01:37.260
+Documents come in random lengths, and a batch has to be a rectangle. So the naive fix is padding. Look at the grey cells. Each costs a full matrix multiply and gives back nothing. Thirty-eight per cent of the batch, burned.
+
+a09
+00:01:37.610 --> 00:01:49.860
+Packing throws that away. Pour every document into one long stream, with an end-of-text token between them so the model knows where a story stops. Watch the counter. Wasted tokens, zero.
+
+a10
+00:01:50.210 --> 00:02:03.660
+Then cut the stream every T tokens. Six here, two hundred and fifty-six in the project. Yes, document C gets cut across the boundary. The model just learns from both halves — and for pretraining, that's a price worth paying.
+
+a11
+00:02:04.310 --> 00:02:19.840
+Your device holds thirty-two blocks at a time, and one honest step wants far more. So run eight micro-batches and call backward on each. PyTorch adds into the gradient buffer instead of replacing it — Lesson One called that a trap. Here, it's the feature.
+
+a12
+00:02:20.190 --> 00:02:34.920
+Then one optimizer step, on the average of all eight. That's 65,536 tokens in a single update. Memory paid for thirty-two rows. The step behaves as if you'd trained on two hundred and fifty-six.
+
+a13
+00:02:35.270 --> 00:02:47.430
+One guard comes before that step. Take every gradient in the model, treat the whole lot as a single long vector, and measure its length. Today, it's 4.0. Too long.
+
+a14
+00:02:47.780 --> 00:03:04.110
+The limit is 1.0, so scale everything by one over four — a factor of 0.25. A gradient of −3.2 becomes −0.8. One of +0.4 becomes +0.1. The ratio never moves. Same direction, shorter. That's clipping.
+
+a14b
+00:03:05.060 --> 00:03:16.030
+And the learning rate is not a constant. At step zero the weights are random, so a full-size step throws them somewhere useless. Warmup raises the rate from near zero over the first two hundred steps.
+
+a14c
+00:03:16.980 --> 00:03:26.180
+Then cosine decay takes it down, from a peak of 1e-3 to a floor a tenth of that. Big steps early, small ones to settle.
+
+a15
+00:03:27.130 --> 00:03:41.220
+Now, the curve you'll stare at for hours. Step zero is not a mystery. Draw a line at the natural log of your vocabulary. Your first logged loss should land on it. If it doesn't, stop. Something is already wrong.
+
+a16
+00:03:41.570 --> 00:03:52.460
+The first few hundred steps fall almost vertically, and it feels wonderful. Then read the sample beside them. All the model has learned is which tokens are common. That part is free.
+
+a17
+00:03:52.810 --> 00:04:04.580
+And this is the part that matters. By the end the loss is barely moving — and that is exactly where real sentences turn up. The flattest stretch of the curve is the stretch a reader notices.
+
+a17b
+00:04:04.930 --> 00:04:15.740
+But one shape means stop the run. A spike a few steps after warmup ends means the peak was always too high. Lower it, or lengthen the warmup. Leave the floor alone.
+
+a18
+00:04:16.090 --> 00:04:27.220
+One honesty check before we move on. On a linear axis the run looks dead after the first fifth. Plot the same numbers against log(tokens) and they straighten right out. That line is the scaling law.
+
+a19
+00:04:27.870 --> 00:04:40.040
+So how long does this cost you? Start with N, the parameter count. Only non-embedding parameters go in, because an embedding is a lookup, not a matrix multiply. Here, 14.2 million.
+
+a20
+00:04:40.390 --> 00:04:57.600
+Now D, the number of training tokens. Chinchilla says the compute-optimal choice is about twenty tokens per parameter. Twenty times 14.2 million is 284 million. Divide by tokens per step: 4,300 steps.
+
+a21
+00:04:57.950 --> 00:05:17.800
+Compute is six times N times D. Two operations per parameter per token going forward, four coming back. That's 2.4e16 FLOPs. A free T4 sustains about 3.3 trillion per second on a model this small. So — two hours.
+
+a22
+00:05:18.150 --> 00:05:36.400
+But Chinchilla answers the wrong question for a phone. You pay training once and inference millions of times, so you overtrain on purpose. SmolLM3 sits at about 3,700 tokens per parameter — a hundred and eighty-five times past optimal. Not a mistake. Economics.
+
+a23
+00:05:37.050 --> 00:05:47.220
+Training is finished. Now the model hands you a probability for every token in the vocabulary, and something has to choose one. After this prompt, these are the eight largest.
+
+a24
+00:05:47.570 --> 00:05:57.890
+Greedy takes the tallest bar. Every single time. It never surprises you, and that is precisely its problem. It falls into loops and repeats whole phrases.
+
+a25
+00:05:58.240 --> 00:06:13.450
+Temperature divides the logits before the softmax. We write it tau, because T is already the block length. Watch the bars. Below one the distribution sharpens towards greedy. Above one it flattens, and unlikely tokens get a real chance.
+
+a26
+00:06:13.800 --> 00:06:25.010
+Top-k keeps a fixed number of bars, deletes the rest, and shares their probability among the survivors. Here k is three, so five tokens simply vanish. In practice people use twenty.
+
+a27
+00:06:25.360 --> 00:06:36.810
+Top-p keeps the shortest list whose probabilities reach p. Here that takes five tokens, because the model isn't sure. So the length of the list follows the model, instead of being fixed by you.
+
+a28
+00:06:37.160 --> 00:06:54.450
+Now change the prompt to "Once upon a", where the model is certain. "time" gets 0.94. Top-p keeps one token. Top-k still keeps three, and two are wrong. That is why top-p is your default.
+
+a29
+00:06:55.100 --> 00:07:05.180
+One last idea, and it decides how your model feels to use. Generation is two jobs, not one. The first is prefill: it reads the prompt.
+
+a30
+00:07:05.530 --> 00:07:16.500
+All five positions go through the model in a single pass. Big matrix multiplies, many rows at once, so the chip is genuinely busy. This is what sets your time to first token.
+
+a31
+00:07:16.850 --> 00:07:28.380
+Every layer keeps the keys and values it just computed. No position can depend on a later one, so those numbers are final. Compute them once, store them, never again. That store is the KV cache.
+
+a32
+00:07:28.730 --> 00:07:44.580
+Now decode. One token per pass, forever. Each pass adds one column, in every layer. The arithmetic is tiny — but every weight in the model must travel from memory to the chip to make that one token. Decode waits for memory, not maths.
+
+a33
+00:07:44.930 --> 00:07:59.910
+And the cache is not free. For this model, 12 KiB per token, so a full 256-token context costs 3 MiB. Watch the meter climb. On a phone it's usually the cache, not the weights, that runs out first.
+
+a34
+00:08:00.860 --> 00:08:20.320
+So — go and train it. 15.7 million parameters, 4,300 steps, then break it four ways on purpose, because recognising the failures is worth more than the model. Then Lesson Five: a model somebody else paid to pretrain, taught to follow instructions by changing under one per cent of its weights.
+

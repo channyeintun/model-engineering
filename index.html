@@ -1,0 +1,148 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Model Engineering — build small AI models that run on your own device</title>
+<meta name="description" content="A 13-lesson course: PyTorch, Transformers, distillation, quantization, export, and a fully offline voice assistant that runs on a phone.">
+<link rel="stylesheet" href="assets/css/course.css">
+</head>
+<body data-page="home">
+
+<div class="shell">
+  <nav class="rail" aria-label="Lessons"></nav>
+
+  <main class="main">
+
+    <section class="hero">
+      <span class="eyebrow">13 lessons · 5 parts · no cloud GPU required</span>
+      <h1>Build AI models small enough to <span class="grad">run on your own device.</span></h1>
+      <p class="hero__sub">Most AI courses teach you to call somebody else's model over the network.
+      This one goes the other way. You will train models from scratch, shrink them until they fit
+      in a phone's memory, and finish with a voice assistant that works with the network switched
+      off entirely.</p>
+      <div class="hero__cta">
+        <a class="btn btn--primary" href="lessons/01.html">Start Lesson 01 →</a>
+        <a class="btn" href="#map">See the whole map</a>
+        <a class="btn" href="toolkit.html">Set up your machine</a>
+      </div>
+      <p class="small muted" style="margin-top:18px" id="homeProgress"></p>
+    </section>
+
+    <figure class="scene" data-scene="pipeline" style="max-width:1020px;margin-inline:auto">
+      <div class="scene__head">
+        <span class="scene__badge">the whole course</span>
+        <span class="scene__title">3.4 GB → 180 MB → in your pocket</span>
+      </div>
+      <div class="scene__stage">
+        <svg viewBox="0 0 900 300" role="img" aria-label="A model shrinking through distillation and quantization, then loading onto a phone">
+          <g id="pl-plot"></g>
+        </svg>
+      </div>
+    </figure>
+
+    <div class="facts">
+      <div class="fact"><div class="fact__n">13</div><div class="fact__l">lessons, each with a project you actually run</div></div>
+      <div class="fact"><div class="fact__n">~20 h</div><div class="fact__l">reading, plus your own training time</div></div>
+      <div class="fact"><div class="fact__n">0</div><div class="fact__l">cloud GPUs required — a laptop is enough for every project</div></div>
+      <div class="fact"><div class="fact__n">1</div><div class="fact__l">offline voice assistant at the end</div></div>
+    </div>
+
+    <section class="prose" style="margin-top:60px">
+      <h2 id="who">Who this is for</h2>
+      <p>You already write software. You may already have built things with AI APIs and agents.
+      What you have not done is open the model itself. This course assumes exactly that:
+      <strong>strong engineering, zero machine learning</strong>.</p>
+
+      <div class="compare">
+        <div class="compare__col compare__col--a">
+          <h4>You should be comfortable with</h4>
+          <ul>
+            <li>Python: functions, classes, virtual environments.</li>
+            <li>The command line, and reading an error message calmly.</li>
+            <li>School-level maths. Multiplication and a little algebra.</li>
+          </ul>
+        </div>
+        <div class="compare__col compare__col--b">
+          <h4>You do <em>not</em> need</h4>
+          <ul>
+            <li>Any previous machine learning.</li>
+            <li>University mathematics. No proofs appear in this course.</li>
+            <li>An expensive GPU. Everything runs on an ordinary laptop.</li>
+          </ul>
+        </div>
+      </div>
+
+      <h2 id="how">How to read the diagrams</h2>
+      <p>Almost every idea in this course is explained twice: once in words, once in an animation
+      you can step through at your own speed. The animations follow one strict rule —
+      <strong>colour always means the same thing</strong>, in all thirteen lessons. Learn these six colours now and every later diagram will read faster.</p>
+
+      <div class="legend" style="margin:1.8em auto 2.4em">
+        <span class="legend__item"><span class="legend__swatch" style="background:var(--c-data)"></span> data moving forward</span>
+        <span class="legend__item"><span class="legend__swatch" style="background:var(--c-param)"></span> weights, the things we learn</span>
+        <span class="legend__item"><span class="legend__swatch" style="background:var(--c-grad)"></span> gradients moving backward</span>
+        <span class="legend__item"><span class="legend__swatch" style="background:var(--c-loss)"></span> loss, error, the thing we shrink</span>
+        <span class="legend__item"><span class="legend__swatch" style="background:var(--c-ok)"></span> output, correct, finished</span>
+        <span class="legend__item"><span class="legend__swatch" style="background:var(--c-frozen)"></span> frozen or discarded</span>
+      </div>
+
+      <div class="callout callout--note">
+        <span class="callout__label">Using the animations</span>
+        <p class="mt-0">Each figure has <b>Play</b>, <b>Next</b> and <b>Previous</b> controls, and a
+        caption that changes with the picture. Nothing moves faster than you allow. If your system
+        asks for reduced motion, figures start at their final state instead of playing.</p>
+      </div>
+    </section>
+
+    <h2 id="map" style="max-width:1020px;margin:80px auto 0;font-size:27px">The map</h2>
+    <p class="small muted" style="max-width:1020px;margin:8px auto 0">
+      Each part answers one question. Read them in order — later lessons depend on earlier ones.</p>
+
+    <div id="partsHost"></div>
+
+    <section class="prose" style="margin-top:80px">
+      <div class="project">
+        <span class="project__label">Final project · Lesson 13</span>
+        <h3>A voice assistant with the network switched off</h3>
+        <p>Everything in this course points at one object: a small speech recogniser, a small
+        language model and a small speech synthesiser, running together on one device, fast enough
+        to feel like a conversation. No API key. No server. Aeroplane mode.</p>
+        <p>It is a genuinely hard engineering problem, and it is a much more interesting one than
+        wiring three cloud APIs together.</p>
+        <dl class="project__grid">
+          <div class="project__stat"><dt>Ears</dt><dd>streaming ASR</dd></div>
+          <div class="project__stat"><dt>Brain</dt><dd>quantized small LM</dd></div>
+          <div class="project__stat"><dt>Voice</dt><dd>streaming TTS</dd></div>
+          <div class="project__stat"><dt>Budget</dt><dd>&lt; 1.5 s voice-to-voice</dd></div>
+        </dl>
+      </div>
+
+      <h2 id="honest">One honest warning</h2>
+      <p>This field moves quickly and it is not tidy. There is no single agreed course for
+      on-device model engineering, which is exactly why this one exists. Some of what you will
+      read here — especially full-duplex speech in Lesson 13 — sits close to current research
+      rather than settled practice.</p>
+      <p>Where something is uncertain, this course says so instead of pretending. Where a number
+      is measured, it names the source. And where a technique sounds impressive but rarely helps
+      in practice, it says that too.</p>
+
+      <div class="callout callout--try">
+        <span class="callout__label">Start here</span>
+        <p class="mt-0">Lesson 01 needs nothing installed. Read it first, then set up your machine
+        with the <a href="toolkit.html">toolkit page</a> when you reach the project.</p>
+      </div>
+    </section>
+
+  </main>
+</div>
+
+<script src="assets/js/vendor/gsap.min.js"></script>
+<script src="assets/js/scene.js"></script>
+<script src="assets/js/svgkit.js"></script>
+<script src="data/lessons.js"></script>
+<script src="data/glossary.js"></script>
+<script src="assets/js/course.js"></script>
+<script src="assets/js/scenes/home.js"></script>
+</body>
+</html>

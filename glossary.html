@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Glossary — Model Engineering</title>
+<meta name="description" content="Every term in the course, defined in plain English.">
+<link rel="stylesheet" href="assets/css/course.css">
+<style>
+  .gsearch {
+    width: 100%; max-width: var(--measure);
+    padding: 12px 15px; margin: 0 0 8px;
+    background: var(--surface); color: var(--text);
+    border: 1px solid var(--line); border-radius: var(--r);
+    font: inherit; font-size: 16px;
+  }
+  .gsearch::placeholder { color: var(--text-dim); }
+  .gitem {
+    padding: 16px 0; border-bottom: 1px solid var(--line-soft);
+    max-width: var(--measure);
+  }
+  .gitem[hidden] { display: none; }
+  .gitem h3 { margin: 0 0 6px; font-size: 17px; display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+  .gitem .part {
+    font: 600 9.5px/1 var(--mono); letter-spacing: .09em; text-transform: uppercase;
+    color: var(--c-data); background: var(--c-data-dim); padding: 4px 6px; border-radius: 4px;
+  }
+  .gitem .short { color: var(--text); margin: 0 0 6px; font-size: 15.5px; }
+  .gitem .long { color: var(--text-soft); margin: 0; font-size: 14.5px; line-height: 1.6; }
+  .gcount { font-size: 13.5px; color: var(--text-dim); margin: 0 0 24px; }
+  .gempty { color: var(--text-dim); padding: 30px 0; }
+</style>
+</head>
+<body data-page="glossary">
+
+<div class="shell">
+  <nav class="rail" aria-label="Lessons"></nav>
+
+  <main class="main">
+    <article class="prose">
+      <header class="lesson-head">
+        <span class="eyebrow">reference</span>
+        <h1>Glossary</h1>
+        <p class="lead">Every term this course uses, defined without using other undefined terms.
+        If a definition here still needs a second definition to make sense, it is a bad definition
+        and should be fixed.</p>
+      </header>
+
+      <label class="sr-only" for="gq">Search the glossary</label>
+      <input id="gq" class="gsearch" type="search" placeholder="Search — try &quot;cache&quot;, &quot;bits&quot;, &quot;speech&quot;…" autocomplete="off">
+      <p class="gcount" id="gcount"></p>
+
+      <div id="glist"></div>
+      <p class="gempty" id="gempty" hidden>Nothing matches that. Try a shorter word.</p>
+    </article>
+  </main>
+</div>
+
+<script src="assets/js/vendor/gsap.min.js"></script>
+<script src="assets/js/scene.js"></script>
+<script src="assets/js/svgkit.js"></script>
+<script src="data/lessons.js"></script>
+<script src="data/glossary.js"></script>
+<script src="assets/js/course.js"></script>
+<script>
+(function () {
+  var G = window.GLOSSARY || {}, C = window.COURSE;
+  var partName = {};
+  (C.parts || []).forEach(function (p) { partName[p.id] = p.n + ' · ' + p.name; });
+
+  var keys = Object.keys(G).sort(function (a, b) {
+    return (G[a].term || a).localeCompare(G[b].term || b);
+  });
+
+  var list = document.getElementById('glist');
+  var html = '';
+  keys.forEach(function (k) {
+    var g = G[k];
+    html += '<div class="gitem" data-hay="' + (k + ' ' + (g.term || '') + ' ' + g.short + ' ' + (g.long || '')).toLowerCase().replace(/"/g, '') + '">' +
+              '<h3>' + (g.term || k) +
+                (g.part ? '<span class="part">' + (partName[g.part] || g.part) + '</span>' : '') +
+              '</h3>' +
+              '<p class="short">' + g.short + '</p>' +
+              (g.long ? '<p class="long">' + g.long + '</p>' : '') +
+            '</div>';
+  });
+  list.innerHTML = html;
+
+  var items = Array.prototype.slice.call(list.children);
+  var count = document.getElementById('gcount');
+  var empty = document.getElementById('gempty');
+
+  function paint(n) { count.textContent = n + ' of ' + items.length + ' terms'; }
+  paint(items.length);
+
+  document.getElementById('gq').addEventListener('input', function (e) {
+    var v = e.target.value.trim().toLowerCase();
+    var n = 0;
+    items.forEach(function (el) {
+      var hit = !v || el.getAttribute('data-hay').indexOf(v) !== -1;
+      el.hidden = !hit;
+      if (hit) n++;
+    });
+    paint(n);
+    empty.hidden = n > 0;
+  });
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,841 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>02 · Networks from scratch — Model Engineering</title>
+<meta name="description" content="Backpropagation on real numbers you can check by hand, then an MLP and a CNN built without nn.Linear.">
+<link rel="stylesheet" href="../assets/css/course.css">
+</head>
+<body data-lesson="02">
+
+<div class="shell shell--wide">
+  <nav class="rail" aria-label="Lessons"></nav>
+
+  <main class="main">
+    <article class="prose">
+
+      <header class="lesson-head">
+        <span class="lesson-head__num">02</span>
+        <h1>Networks from scratch</h1>
+        <p class="lead">In Lesson 01 <code>loss.backward()</code> was a black box that filled in
+        <code>.grad</code>. This lesson opens the box. Seven numbers, one calculator, and every
+        gradient in a small network worked out by hand. Then the two shapes every model in this
+        course is built from. The first is the <span class="term" data-term="mlp">multi-layer
+        perceptron (MLP)</span>: a stack of linear layers with a bend between them. The second
+        is the <span class="term" data-term="cnn">convolutional neural network (CNN)</span>,
+        which slides one small detector over the whole input.</p>
+        <div class="lesson-head__meta">
+          <span class="chip"><b>Part I</b> · Foundations</span>
+          <span class="chip">≈ <b>105 min</b> reading</span>
+          <span class="chip">Project · <b>An MLP and a CNN, no nn.Linear</b></span>
+          <span class="chip">Needs · <b>Lesson 01</b></span>
+        </div>
+      </header>
+
+      <section class="outcomes">
+        <h2>By the end you can</h2>
+        <ul>
+          <li>Compute <strong>every gradient</strong> in a two-layer network with a calculator, and check PyTorch's answer against yours.</li>
+          <li>Prove that two stacked linear layers are <strong>one</strong> linear layer, and say what the activation actually buys.</li>
+          <li>Choose between <strong>ReLU, GELU and SwiGLU</strong> and explain why modern models left ReLU behind.</li>
+          <li>Explain what bad <strong>initialisation</strong> does to a signal after eight layers, with numbers.</li>
+          <li>Write a layer yourself with <code>nn.Module</code> and <code>nn.Parameter</code>, no <code>nn.Linear</code>.</li>
+          <li>Count the <strong>parameters</strong> of a convolution and say why a CNN beats an MLP on images.</li>
+        </ul>
+      </section>
+
+      <h2 id="one-neuron"><span class="h-num">02 · 1</span>One neuron, three moves</h2>
+
+      <p>A neural network is made of one part, repeated. That part does three things, in a fixed
+      order: multiply, add, bend.</p>
+
+      <ol>
+        <li><strong>Multiply.</strong> Each incoming number is multiplied by its own weight.</li>
+        <li><strong>Add.</strong> The products are summed, and one extra number called the
+            <strong>bias</strong> is added on top.</li>
+        <li><strong>Bend.</strong> The result passes through a <strong>non-linear</strong>
+            function — anything whose graph is not a straight line, so that doubling the input
+            does not simply double the output.</li>
+      </ol>
+
+      <p>The usual bend is <strong><span class="term" data-term="relu">ReLU</span></strong>, short
+      for <em>rectified linear unit</em>. It is
+      just <code>max(0, x)</code>: keep a positive number, replace anything else with zero. Its
+      slope is 1 on the right of zero and 0 on the left. That flat left half looks harmless. Two
+      sections from now it kills a unit, so hold on to it.</p>
+
+      <figure class="scene" data-scene="nn-neuron">
+        <div class="scene__head">
+          <span class="scene__badge">animation</span>
+          <span class="scene__title">Multiply, add, bend — the whole of a neuron</span>
+        </div>
+        <div class="scene__stage">
+          <svg viewBox="0 0 900 260" role="img" aria-label="Three inputs multiplied by weights, summed with a bias, then passed through a ReLU curve">
+            <g id="nu-plot"></g>
+          </svg>
+        </div>
+      </figure>
+
+      <p>Steps 1 and 2 together are a <strong>dot product</strong> plus a constant. A layer of 128
+      neurons does 128 of these at once, which is why a layer is a matrix multiply and not a loop.
+      The bias matters more than it looks: without it, every neuron is forced to make its decision
+      around zero, and the layer can only rotate and stretch the input, never shift it.</p>
+
+      <p>Said another way: a layer's weights decide <em>which combinations of the inputs are
+      interesting</em>, and the bias decides <em>how much evidence is needed before the neuron
+      speaks</em>. Both are learned. Nothing else in the layer is.</p>
+
+      <h2 id="backprop"><span class="h-num">02 · 2</span>Backpropagation, with real numbers</h2>
+
+      <p>Autograd is fine until it hands you a gradient that looks wrong. Then you need to work
+      out the right answer yourself. To do that, you have to have done it once by hand, slowly, on
+      numbers small enough to hold in your head.</p>
+
+      <p>Take the smallest network that still has everything: one input, one hidden unit with a
+      ReLU, one output, and a squared error against a target. Four parameters. Here are their
+      starting values, and they are the only numbers you need.</p>
+
+      <div class="eq"><i>x</i> = 2.0     <b>w₁</b> = 0.5   <b>b₁</b> = 0.1   <b>w₂</b> = −1.5   <b>b₂</b> = 0.4     target <i>y</i> = 1.0
+
+   z₁ = <b>w₁</b>·<i>x</i> + <b>b₁</b>     a₁ = ReLU(z₁)     z₂ = <b>w₂</b>·a₁ + <b>b₂</b>     L = (z₂ − <i>y</i>)²</div>
+
+      <p>The forward pass is four multiplications. The backward pass is the interesting half. It
+      answers one question: how much did each of those four parameters contribute to the loss? It
+      answers it by walking the same path in reverse, multiplying one small derivative at each
+      stop.</p>
+
+      <figure class="scene" data-scene="nn-backprop">
+        <div class="scene__head">
+          <span class="scene__badge">animation</span>
+          <span class="scene__title">Forward left to right, gradients back right to left — every value checkable</span>
+        </div>
+        <div class="scene__stage">
+          <svg viewBox="0 0 900 340" role="img" aria-label="A two-layer network computing forward values left to right, then gradients flowing right to left with each local derivative shown">
+            <g id="bp-plot"></g>
+          </svg>
+        </div>
+      </figure>
+
+      <p>Read the backward pass as a single sentence: <em>the gradient at any point is the gradient
+      one step later, multiplied by the local derivative of the step between them.</em> That is the
+      <span class="term" data-term="chain rule">chain rule</span>, and it is the only mathematics in
+      this lesson.</p>
+
+      <div class="callout callout--math">
+        <span class="callout__label">The maths, once</span>
+        <div class="eq"><u>∂L/∂z₂</u>  =  2(z₂ − <i>y</i>)        =  2 × (−2.25)   =  −4.50
+   <u>∂L/∂w₂</u>  =  <u>∂L/∂z₂</u> × a₁       =  −4.50 × 1.1   =  −4.95
+   <u>∂L/∂b₂</u>  =  <u>∂L/∂z₂</u> × 1        =  −4.50 × 1     =  −4.50
+
+   <u>∂L/∂a₁</u>  =  <u>∂L/∂z₂</u> × <b>w₂</b>       =  −4.50 × −1.5  =   6.75
+   <u>∂L/∂z₁</u>  =  <u>∂L/∂a₁</u> × ReLU′(z₁) =   6.75 × 1     =   6.75
+   <u>∂L/∂w₁</u>  =  <u>∂L/∂z₁</u> × <i>x</i>        =   6.75 × 2.0   =  13.50
+   <u>∂L/∂b₁</u>  =  <u>∂L/∂z₁</u> × 1        =   6.75 × 1     =   6.75</div>
+        <p><code>ReLU′</code> means "the derivative of ReLU". Here <code>z₁ = 1.1</code> is
+        positive, so ReLU is on its sloping half and that derivative is 1.</p>
+        <p>Every line is one multiplication, and the thing multiplied is always the local
+        derivative: <i>x</i> for <b>w₁</b>, <code>a₁</code> for <b>w₂</b>, and 1 for both biases.
+        A bias is added rather than multiplied, so its <em>local</em> derivative is always 1. Its
+        gradient is therefore whatever gradient arrives at that sum, unscaled by the input. That
+        arriving gradient still depends on the whole forward pass. No step in the chain knows
+        anything about the whole network.</p>
+      </div>
+
+      <p>Now run the same thing in PyTorch and compare. If your hand numbers and these numbers
+      agree, you understand autograd — there is nothing else inside it.</p>
+
+      <div class="code">
+        <div class="code__head"><span>by_hand.py</span><span class="lang">python</span></div>
+        <pre><code>import torch
+
+x  = torch.tensor(2.0)
+w1 = torch.tensor(0.5,  requires_grad=True)
+b1 = torch.tensor(0.1,  requires_grad=True)
+w2 = torch.tensor(-1.5, requires_grad=True)
+b2 = torch.tensor(0.4,  requires_grad=True)
+y  = torch.tensor(1.0)
+
+z1 = w1 * x + b1        # 1.1
+a1 = torch.relu(z1)     # 1.1
+z2 = w2 * a1 + b2       # -1.25
+loss = (z2 - y) ** 2    # 5.0625
+loss.backward()
+
+print(w1.grad, b1.grad)   # tensor(13.5000) tensor(6.7500)
+print(w2.grad, b2.grad)   # tensor(-4.9500) tensor(-4.5000)</code></pre>
+      </div>
+
+      <p>Notice the sizes. <code>w₁</code> is deep in the network and its gradient is 13.50;
+      <code>w₂</code> is next to the loss and its gradient is −4.95. Gradients are not naturally the
+      same scale in different layers, and that difference is exactly what Adam corrects for, as you
+      saw in Lesson 01.</p>
+
+      <div class="callout callout--pitfall">
+        <span class="callout__label">Common trap</span>
+        <p class="mt-0">Take one plain gradient-descent step — SGD, stochastic gradient descent,
+        the update rule from Lesson 01 with no momentum — using <code>lr = 0.1</code>. Subtract
+        <code>0.1 × gradient</code> from each of the four parameters. You get
+        <code>w₁ = −0.85</code>, <code>b₁ = −0.575</code>, <code>w₂ = −1.005</code> and
+        <code>b₂ = 0.85</code>.</p>
+        <p>The loss falls from 5.0625 to 0.0225, which looks excellent. Check that number. The
+        new <code>z₁</code> is <code>−0.85 × 2 − 0.575 = −2.275</code>, so ReLU outputs 0. The
+        output is therefore simply <code>b₂ = 0.85</code>, and the loss is
+        <code>(0.85 − 1)² = 0.0225</code>. The network hit that loss by ignoring its input.</p>
+        <p>And it is now stuck. ReLU's derivative at −2.275 is 0, so <code>w₁</code> and
+        <code>b₁</code> receive a gradient of exactly zero from here on. The unit is
+        <strong>dead</strong>, permanently, after a single step. A learning rate that is too large
+        does not always produce <code>nan</code>. Sometimes it quietly kills part of your
+        network.</p>
+      </div>
+
+      <div class="callout callout--math">
+        <span class="callout__label">One more gradient, for the project</span>
+        <p class="mt-0">This example uses squared error. The project uses cross-entropy, so it
+        needs one result the example above does not produce. Write <b>p</b> for the softmax
+        probabilities and <b>t</b> for the <strong>one-hot</strong> target — a vector of zeros
+        with a single 1 at the correct class. It is <b>t</b> here and not <i>y</i>, because
+        <i>y</i> above is one number, and this is a vector. Then the gradient at the
+        <span class="term" data-term="logits">logits</span> collapses to a subtraction:</p>
+        <div class="eq">∂L/∂logits  =  <b>p</b> − <b>t</b>
+
+   p = (0.10, 0.70, 0.20),  correct class is 0
+   gradient = (0.10 − 1, 0.70 − 0, 0.20 − 0) = (−0.90, 0.70, 0.20)</div>
+        <p><span class="term" data-term="softmax">Softmax</span> and cross-entropy are built from
+        the same exponentials, and they cancel. Take that on trust for now, or derive it — it is
+        two lines. One warning for the project: if your loss used <code>reduction='mean'</code>,
+        divide this gradient by the batch size. Otherwise every number you compute by hand will be
+        too large by exactly that factor.</p>
+      </div>
+
+      <h2 id="why-nonlinear"><span class="h-num">02 · 3</span>Why the non-linearity is not optional</h2>
+
+      <p>In the Lesson 01 project you were asked to delete the <code>ReLU</code> and watch the
+      accuracy ceiling appear. Here is why that ceiling exists, in two small matrices you can
+      multiply on paper.</p>
+
+      <figure class="scene" data-scene="nn-collapse">
+        <div class="scene__head">
+          <span class="scene__badge">animation</span>
+          <span class="scene__title">Two linear layers merge into one — until ReLU stops them</span>
+        </div>
+        <div class="scene__stage">
+          <svg viewBox="0 0 900 330" role="img" aria-label="Two weight matrices multiplied together into a single matrix giving the same output, then a ReLU inserted which changes the result">
+            <g id="cl-plot"></g>
+          </svg>
+        </div>
+      </figure>
+
+      <p>Matrix multiplication is associative: <code>(x @ W1) @ W2</code> equals
+      <code>x @ (W1 @ W2)</code>. The right side has one weight matrix. So a network of stacked
+      linear layers, no matter how deep, computes the same family of functions as a single matrix.
+      Depth costs you memory and time and returns nothing.</p>
+
+      <p>Biases do not rescue it either. <code>W₁x + b₁</code> followed by <code>W₂</code> gives
+      <code>W₂W₁x + (W₂b₁ + b₂)</code>. That is still one matrix and one bias vector, which is
+      still one layer.</p>
+
+      <div class="code">
+        <div class="code__head"><span>collapse.py</span><span class="lang">python</span></div>
+        <pre><code>import torch
+
+x  = torch.tensor([[1.0, -1.0]])
+W1 = torch.tensor([[2.0, -1.0], [0.0, 3.0]])
+W2 = torch.tensor([[1.0,  4.0], [2.0, 0.0]])
+
+print(x @ W1 @ W2)                # tensor([[-6.,  8.]])
+print(x @ (W1 @ W2))              # tensor([[-6.,  8.]])   identical
+print(W1 @ W2)                    # tensor([[0., 8.], [6., 0.]])
+
+print(torch.relu(x @ W1) @ W2)    # tensor([[2., 8.]])
+# no fixed 2x2 matrix reproduces that for every input</code></pre>
+      </div>
+
+      <p>The ReLU clips one intermediate value to zero. That decision depends on the data, so it
+      cannot be folded into a constant matrix. The moment a layer's behaviour depends on <em>which</em>
+      input arrived, depth becomes real capacity.</p>
+
+      <div class="callout callout--key">
+        <span class="callout__label">Remember this</span>
+        <p class="mt-0">Linear layers give a network its <em>size</em>. Non-linearities give it its
+        <em>depth</em>. Remove the second and the first stops mattering.</p>
+      </div>
+
+      <h2 id="activations"><span class="h-num">02 · 4</span>ReLU, GELU, SwiGLU</h2>
+
+      <p>Section 3 proved that a bend is required. It did not say <em>which</em> bend, and the
+      choice is not cosmetic. Pick the wrong one and units go silent and stay silent, as the dead
+      unit in section 2 did. An <span class="term" data-term="activation">activation</span>
+      function has one job: bend the straight line. Almost any bend does that job. The differences
+      all live in the slope.</p>
+
+      <figure class="scene" data-scene="nn-acts">
+        <div class="scene__head">
+          <span class="scene__badge">animation</span>
+          <span class="scene__title">The flat half of ReLU, and what replaced it</span>
+        </div>
+        <div class="scene__stage">
+          <svg viewBox="0 0 900 300" role="img" aria-label="ReLU, GELU and SiLU drawn as curves, with the flat negative region of ReLU highlighted as a zero-gradient zone">
+            <g id="ac-plot"></g>
+          </svg>
+        </div>
+      </figure>
+
+      <p><strong>ReLU</strong> is <code>max(0, x)</code>. It is one comparison, and it never
+      <strong>saturates</strong> on the positive side — the output keeps growing with the input
+      instead of flattening off and killing the gradient. For years it was the default. Its
+      weakness is the flat half you saw in the pitfall above: a unit pushed to the left receives a
+      gradient of exactly zero and has no route back.</p>
+
+      <p><strong>GELU</strong> is <code>x · Φ(x)</code>, where <code>Φ</code> is the cumulative
+      normal distribution — the probability that a standard normal draw lands below
+      <code>x</code>. Instead of a hard switch at zero it fades the input in.
+      <strong>SiLU</strong> is <code>x · σ(x)</code>, where <code>σ</code> is the logistic sigmoid,
+      <code>σ(x) = 1 / (1 + e⁻ˣ)</code>, which squashes any number into the range 0 to 1. SiLU has
+      the same character as GELU and is cheaper to evaluate.</p>
+
+      <p>"Small but never zero" is the whole argument, so here it is on real values. The slope row
+      is the one that matters:</p>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>Input <i>x</i></th><th>ReLU</th><th>GELU</th><th>SiLU</th></tr>
+          </thead>
+          <tbody>
+            <tr><td class="num">−2.0</td><td class="num">0.0000</td><td class="num">−0.0455</td><td class="num">−0.2384</td></tr>
+            <tr><td class="num"><strong>slope at −2.0</strong></td><td class="num"><strong>0</strong></td><td class="num"><strong>−0.085</strong></td><td class="num"><strong>−0.091</strong></td></tr>
+            <tr><td class="num">1.0</td><td class="num">1.0000</td><td class="num">0.8413</td><td class="num">0.7311</td></tr>
+            <tr><td class="num">3.0</td><td class="num">3.0000</td><td class="num">2.9960</td><td class="num">2.8577</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>At <code>x = −2</code> a ReLU unit gets a gradient of exactly 0 and is finished. GELU and
+      SiLU hand back about −0.09 instead. That is small, but a few hundred steps of it can still
+      drag the unit back into the useful range. On the right the curves converge: at
+      <code>x = 3</code> GELU is within 0.004 of ReLU, while SiLU is still 0.14 short. So the
+      choice only really bites between roughly −3 and +3 — which is exactly the range a normalised
+      network keeps its activations in.</p>
+
+      <p><strong>SwiGLU</strong> is different in kind. It is not a curve applied to one number; it
+      is a <strong>gate</strong>. The layer makes two <strong>projections</strong> of the same
+      input. A projection is just a matrix multiply, so this is two of them, giving two different
+      vectors. One goes through SiLU, and the two are then multiplied element by element:</p>
+
+      <div class="eq">SwiGLU(<i>x</i>)  =  SiLU(<i>x</i><b>W</b>)  ⊙  (<i>x</i><b>V</b>)      ⊙ = element by element</div>
+
+      <p>One half decides how much of the other half is allowed through. That gives the layer a
+      multiplicative interaction, which a pointwise curve cannot express. It is not free. An
+      ordinary feed-forward block has two matrices, one projecting up and one projecting back down.
+      SwiGLU needs three: <b>W</b>, <b>V</b>, and the down projection. So implementations shrink
+      the <strong>hidden width</strong>, meaning the size of the middle layer. Two-thirds of the
+      usual one keeps the parameter count level: 2 048 in place of 3 072.</p>
+
+      <div class="callout callout--key">
+        <span class="callout__label">Which one to use</span>
+        <p class="mt-0">Default to GELU or SiLU for anything you write in this course. Use SwiGLU
+        inside a transformer feed-forward block, where the extra matrix earns its keep — you build
+        one in Lesson 03. Reach for ReLU only when you need the cheapest possible operation on a
+        device that is counting every cycle.</p>
+      </div>
+
+      <h2 id="init"><span class="h-num">02 · 5</span>Initialisation: the signal must survive the depth</h2>
+
+      <p>A badly initialised network does not crash. It trains for an hour, the loss barely moves,
+      and nothing in the output tells you why. This section is the why.</p>
+
+      <p>Before training starts, every weight is a random number, and the scale of those numbers
+      is not a detail. Two words first. <strong>Standard deviation</strong> is the typical distance
+      of a number from the average, and <strong>variance</strong> is that number squared. The
+      standard deviation is written <code>σ</code> — the same letter that meant "sigmoid" in
+      section 4, and a completely different thing here. In this section, read <code>σ</code> as
+      "typical size".</p>
+
+      <p>Consider a layer with <code>n</code> inputs whose weights have standard deviation
+      <code>σ</code>. Each output is a sum of <code>n</code> independent products, so the output's
+      variance is <code>n · σ² ·</code> (input variance). ReLU then discards the negative half,
+      which halves the variance again.</p>
+
+      <p>Both of those facts are about variance, and what we want to know is the typical size.
+      Typical size is the square root of variance, so take the root:
+      <code>√(n · σ² / 2) = σ · √(n / 2)</code>. The signal is multiplied by that factor at every
+      layer. In an eight-layer network it is applied eight times, so small differences
+      compound.</p>
+
+      <p>Measured over a whole tensor rather than one number, that typical size has a name: the
+      tensor's <strong>RMS</strong>, its <em>root mean square</em>. Square every entry, take the
+      mean, take the square root. That is the quantity the code below prints, and the one the
+      project asks you to print layer by layer.</p>
+
+      <figure class="scene" data-scene="nn-init">
+        <div class="scene__head">
+          <span class="scene__badge">animation</span>
+          <span class="scene__title">The same network, three initial scales, eight layers deep</span>
+        </div>
+        <div class="scene__stage">
+          <svg viewBox="0 0 900 300" role="img" aria-label="Three lines showing activation size across eight layers: collapsing, exploding, and staying constant">
+            <g id="in-plot"></g>
+          </svg>
+        </div>
+      </figure>
+
+      <p>With <code>n = 256</code>, the arithmetic is short and worth doing once:</p>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>Weight std σ</th><th>Gain per layer</th><th>Signal after 8 layers</th><th>What you see</th></tr>
+          </thead>
+          <tbody>
+            <tr><td class="num">0.02</td><td class="num">0.23</td><td class="num">÷ 150 000</td><td>Loss barely moves; early layers frozen</td></tr>
+            <tr><td class="num">0.20</td><td class="num">2.26</td><td class="num">× 690</td><td>Loss spikes, then <code>nan</code></td></tr>
+            <tr><td class="num">0.088 = √(2/256)</td><td class="num">1.00</td><td class="num">× 1</td><td>Healthy</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>Row one in full, so you can see where the gain column comes from.
+      <code>0.02 × √(256 / 2) = 0.02 × 11.31 = 0.226</code>. Applied eight times that is
+      <code>0.226⁸ = 0.0000069</code>, or about one part in 150 000. Now do row two yourself. You should
+      get <code>2.26⁸ ≈ 690</code>. The last row is built so the gain is exactly 1:
+      <code>0.088 × 11.31 = 1.00</code>.</p>
+
+      <p>The last row is <strong>He initialisation</strong>: draw weights with standard deviation
+      <code>√(2 / fan_in)</code>, where <code>fan_in</code> is the number of inputs to the layer. The
+      2 is there to pay for the half of the signal ReLU removes. For activations that keep more of
+      the negative side, the matching rule uses <code>√(1 / fan_in)</code> — the same idea with a
+      different constant.</p>
+
+      <p>Measure it yourself rather than trusting the table:</p>
+
+      <div class="code">
+        <div class="code__head"><span>init_scale.py</span><span class="lang">python</span></div>
+        <pre><code>import torch
+
+x = torch.randn(512, 256)                      # 512 examples, 256 features
+
+for std in (0.02, 0.20, (2 / 256) ** 0.5):
+    h = x
+    for _ in range(8):                         # 8 layers, no bias, ReLU each time
+        W = torch.randn(256, 256) * std
+        h = torch.relu(h @ W)
+    rms = h.pow(2).mean().sqrt().item()
+    print(f"std {std:.3f}  ->  signal after 8 layers {rms:.3e}")
+
+# std 0.020  ->  ~7e-06      the signal has vanished
+# std 0.200  ->  ~7e+02      the signal has exploded
+# std 0.088  ->  ~1e+00      unchanged</code></pre>
+      </div>
+
+      <div class="callout callout--pitfall">
+        <span class="callout__label">Fails silently</span>
+        <p class="mt-0">Both failures look like "the model does not learn". Neither raises an
+        error. The gradients travel back through the same chain of multiplications. So a vanished
+        forward signal means vanished gradients in the early layers, and those layers keep their
+        random starting values for the whole run. Before you tune the learning rate, print the
+        RMS of the activations at each layer.</p>
+      </div>
+
+      <h2 id="modules"><span class="h-num">02 · 6</span>Writing a layer by hand</h2>
+
+      <p>You could write a layer as a plain function and keep its weights in a list. Then you
+      would hand that list to the optimizer yourself, move each tensor to the device yourself, and
+      remember every one of them when you saved the model. <code>nn.Module</code> exists so you do
+      not have to.</p>
+
+      <p>It is a container with one useful trick. Any tensor you assign to <code>self</code> and
+      wrap in <code>nn.Parameter</code> is registered automatically. It then appears in
+      <code>.parameters()</code>, moves with <code>.to(device)</code>, and is picked up by the
+      optimizer. It is also saved by <code>state_dict()</code>. That is the plain dictionary of
+      parameter names to tensors that <code>torch.save</code> writes to disk, and the only thing
+      you actually ship when you share a trained model. Everything else is ordinary Python.</p>
+
+      <div class="code">
+        <div class="code__head"><span>mylinear.py</span><span class="lang">python</span></div>
+        <pre><code>import math
+import torch
+import torch.nn as nn
+
+class MyLinear(nn.Module):
+    def __init__(self, in_features, out_features):
+        super().__init__()
+        w = torch.randn(in_features, out_features) * math.sqrt(2.0 / in_features)
+        self.weight = nn.Parameter(w)                      # learned
+        self.bias   = nn.Parameter(torch.zeros(out_features))
+
+    def forward(self, x):                                  # x: (B, in_features)
+        return x @ self.weight + self.bias                 # (B, out_features)
+
+class MLP(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.fc1 = MyLinear(784, 128)
+        self.fc2 = MyLinear(128, 10)
+
+    def forward(self, x):
+        return self.fc2(torch.relu(self.fc1(x.flatten(1))))
+
+print(sum(p.numel() for p in MLP().parameters()))          # 101770</code></pre>
+      </div>
+
+      <p>784 × 128 + 128 = 100 480, and 128 × 10 + 10 = 1 290. Together, 101 770
+      <span class="term" data-term="parameters">parameters</span> — the same model you trained in
+      Lesson 01, now with no <code>nn.Linear</code> anywhere in it. The bias is added by
+      broadcasting: a tensor of shape <code>(128,)</code> is stretched across all <code>B</code>
+      rows without being copied. <code>B</code> is the batch size, and this course uses that letter
+      for it everywhere, even though PyTorch's own documentation often writes <code>N</code>.</p>
+
+      <div class="callout callout--pitfall">
+        <span class="callout__label">Common trap</span>
+        <p class="mt-0"><code>nn.Linear</code> stores its weight with shape
+        <code>(out_features, in_features)</code> and computes <code>x @ weight.T</code>. The layer
+        above stores <code>(in_features, out_features)</code>. Both are correct, but a
+        <code>state_dict</code> saved from one will not load into the other, and the error message
+        talks about size mismatch rather than about the transpose. Pick one convention and write it
+        in a comment.</p>
+      </div>
+
+      <h2 id="convolution"><span class="h-num">02 · 7</span>Convolution: the same detector everywhere</h2>
+
+      <p>An MLP treats a picture as a flat list of 784 numbers. That throws away the single most
+      useful fact about an image: pixels near each other belong together, and a shape means the same
+      thing wherever it appears. A convolution keeps both facts.</p>
+
+      <figure class="scene" data-scene="nn-conv">
+        <div class="scene__head">
+          <span class="scene__badge">animation</span>
+          <span class="scene__title">Nine weights, twenty-five outputs</span>
+        </div>
+        <div class="scene__stage">
+          <svg viewBox="0 0 900 330" role="img" aria-label="A three by three kernel sliding across a seven by seven image and writing values into a five by five feature map, beside a parameter count comparison">
+            <g id="cv-plot"></g>
+          </svg>
+        </div>
+      </figure>
+
+      <p>Five words carry the whole idea:</p>
+
+      <ul>
+        <li><strong>Kernel</strong> — a small block of weights, usually 3 × 3. It is the detector.</li>
+        <li><strong>Stride</strong> — how far the kernel jumps between positions. Stride 2 halves the
+            output size.</li>
+        <li><strong>Padding</strong> — a border of zeros added around the input, so the output can
+            keep the input's size.</li>
+        <li><strong>Channels</strong> — the depth of the input and the number of kernels. A 3 × 3
+            kernel on a 3-channel image is 3 × 3 × 3 = 27 weights, and 32 such kernels give 32 output
+            channels.</li>
+        <li><strong>Feature map</strong> — the output of one kernel: "where in this picture did my
+            detector fire?"</li>
+      </ul>
+
+      <div class="eq">H_out  =  (H_in + 2·padding − kernel) / stride  +  1     (integer division)</div>
+
+      <p>The saving comes from <strong>weight sharing</strong>. A dense layer mapping a 28 × 28
+      image to a 26 × 26 output would need 784 × 676 = 529 984 weights. Each of those weights would
+      learn about one pixel position only. One 3 × 3 kernel needs 9 weights and a bias, and it
+      applies at every position. It also generalises. A detector trained on edges in the top-left
+      corner works in the bottom-right corner for free.</p>
+
+      <div class="code">
+        <div class="code__head"><span>cnn_shapes.py</span><span class="lang">python</span></div>
+        <pre><code>import torch
+import torch.nn as nn
+
+x    = torch.randn(32, 1, 28, 28)          # B, C, H, W
+c1   = nn.Conv2d(1, 32, kernel_size=3)     # 1*32*3*3 + 32  =    320 params
+c2   = nn.Conv2d(32, 64, kernel_size=3)    # 32*64*3*3 + 64 = 18 496 params
+pool = nn.MaxPool2d(2)
+
+h = pool(torch.relu(c2(torch.relu(c1(x)))))
+print(h.shape)                             # torch.Size([32, 64, 12, 12])
+print(h.flatten(1).shape)                  # torch.Size([32, 9216])</code></pre>
+      </div>
+
+      <p>28 → 26 → 24, then the pool halves it to 12. Now count the parameters of the whole
+      classifier, and look at where they are:</p>
+
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Layer</th><th>Output shape</th><th>Parameters</th></tr></thead>
+          <tbody>
+            <tr><td><code>Conv2d(1, 32, 3)</code></td><td>(B, 32, 26, 26)</td><td class="num">320</td></tr>
+            <tr><td><code>Conv2d(32, 64, 3)</code></td><td>(B, 64, 24, 24)</td><td class="num">18 496</td></tr>
+            <tr><td><code>MaxPool2d(2)</code></td><td>(B, 64, 12, 12)</td><td class="num">0</td></tr>
+            <tr><td><code>Flatten</code></td><td>(B, 9216)</td><td class="num">0</td></tr>
+            <tr><td><code>Linear(9216, 128)</code></td><td>(B, 128)</td><td class="num">1 179 776</td></tr>
+            <tr><td><code>Linear(128, 10)</code></td><td>(B, 10)</td><td class="num">1 290</td></tr>
+            <tr><td><strong>Total</strong></td><td></td><td class="num"><strong>1 199 882</strong></td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="callout callout--note">
+        <span class="callout__label">Two different resources</span>
+        <p class="mt-0">More than 97% of this model's parameters sit in one dense layer, while nearly
+        all of the arithmetic happens in the two convolutions. Parameters and compute are separate
+        budgets. Part III of this course shrinks the first — quantization makes weights smaller —
+        while Lesson 08 attacks the second. Confusing the two is why people are surprised when a
+        smaller model is not faster.</p>
+      </div>
+
+      <h2 id="pooling-norms"><span class="h-num">02 · 8</span>Pooling, and two kinds of normalisation</h2>
+
+      <p>Two more parts and the classifier is complete. Without pooling, every layer works at full
+      resolution and the dense layer that follows explodes in size. Without normalisation, the
+      careful signal scale of section 5 lasts about a hundred steps and then drifts away.</p>
+
+      <p><strong>Pooling</strong> shrinks a feature map by summarising small neighbourhoods.
+      <code>MaxPool2d(2)</code> takes each 2 × 2 block and keeps the largest value, turning
+      24 × 24 into 12 × 12. It has no parameters. It buys two things. First, less work in every
+      layer that follows. Second, a little tolerance to shift: moving a feature by one pixel often
+      does not change which value is the largest. Many modern architectures replace it with a
+      stride-2 convolution, which does the same shrinking but learns how.</p>
+
+      <p><strong>Normalisation</strong> is section 5's problem solved over and over instead of once.
+      He initialisation sets the signal size correctly on step zero. Training then moves the weights
+      and the sizes drift again. A normalisation layer resets them on every forward pass.</p>
+
+      <p>What it computes is short. Take a group of numbers, subtract their mean, divide by their
+      standard deviation. The group now has mean 0 and typical size 1. Then multiply by a learned
+      <strong>gain</strong> and add a learned <strong>shift</strong>, so the layer can undo the
+      normalisation if that turns out to be what it wants. Try it on real numbers. The row
+      <code>(2, 4, 4, 4, 5, 5, 7, 9)</code> has mean 5 and standard deviation 2. It normalises to
+      <code>(−1.5, −0.5, −0.5, −0.5, 0, 0, 1, 2)</code>: same order, new scale.</p>
+
+      <p>Batch normalisation and layer normalisation differ in one thing only: which group they
+      average over. <strong>Batch normalisation</strong> averages each feature across all the
+      examples in the <span class="term" data-term="batch">batch</span>, so an example's output
+      depends on the other examples travelling with it. At evaluation time there may be no batch
+      to average over, so it falls back on <strong>running statistics</strong>. Those are a mean
+      and a variance accumulated over training, stored inside the model, and reused at inference.
+      Batch norm also behaves badly with very small batches, and is awkward for sequences of
+      different lengths.</p>
+
+      <p><strong>Layer normalisation</strong> averages each example across its own features. It
+      never looks at its neighbours, works with a batch of one, and needs no running statistics.
+      That independence is why convolutional vision models mostly use batch norm. Every
+      transformer normalises per example instead — layer norm, or its cheaper cousin RMSNorm,
+      which is the one Lesson 03 builds.</p>
+
+      <p>With that, you have one of the two halves of a transformer block. A block is
+      <strong>attention</strong> plus <strong>an MLP</strong>, with a normalisation before each and
+      a <strong>residual connection</strong> around each. A residual connection means the block's
+      input is added back onto its output — <code>x + f(x)</code> — rather than replaced, so the
+      gradient always has a short path home. Lesson 03 shows why a deep stack cannot train without
+      it. The MLP is the layer you wrote in section 6, with SwiGLU in the middle instead of ReLU.
+      Lesson 03 adds the piece that is missing.</p>
+
+      <div class="project">
+        <span class="project__label">Project 02</span>
+        <h3>An MLP and a CNN, no nn.Linear</h3>
+        <p>Rebuild the Lesson 01 model without the layer that did the work for you, then check your
+        own backward pass against autograd, then move to images where convolutions earn their keep.
+        The point is not to write a better layer than PyTorch's. The point is that after this you
+        will never again be unsure what is inside one.</p>
+        <ol class="steps">
+          <li>Write <code>MyLinear</code> with <code>nn.Parameter</code> and He initialisation, as
+              above. Build the 784 → 128 → 10 MLP and confirm
+              <code>sum(p.numel() for p in model.parameters())</code> prints <code>101770</code>.</li>
+          <li>Train it on MNIST with <code>torchvision.datasets.MNIST</code>, the same five-line loop
+              as Lesson 01. Reach the same accuracy you reached before, above 97%.</li>
+          <li>Write the backward pass of that MLP <strong>by hand</strong>, with no autograd. Start
+              from <code>dlogits = softmax(logits) − onehot(labels)</code>, the result in the "one
+              more gradient" box of section 2. Then <code>dW2 = h.T @ dlogits</code>, and so on
+              back to <code>dW1</code>. If your loss used <code>reduction='mean'</code>, divide
+              <code>dlogits</code> by the batch size first; forgetting that is the usual reason
+              this check fails. Compare each tensor with the autograd result and print the largest
+              absolute difference. Anything below <code>1e-5</code> means you got it right.</li>
+          <li>Implement a convolution with <code>torch.nn.functional.unfold</code>: extract every
+              patch, reshape the kernel to a matrix, do one matrix multiply, reshape the result back
+              to <code>(B, C_out, H_out, W_out)</code>. Check it against <code>nn.Conv2d</code> with
+              the same weights.</li>
+          <li>Build the CNN from the table above and train it on CIFAR-10
+              (<code>torchvision.datasets.CIFAR10</code>) for 20 epochs. Two numbers must change
+              first, because CIFAR-10 images are 3-channel and 32 × 32, not 1-channel and 28 × 28.
+              Change <code>Conv2d(1, 32, 3)</code> to <code>Conv2d(3, 32, 3)</code>, and
+              <code>Linear(9216, 128)</code> to <code>Linear(12544, 128)</code>. The second number
+              comes from the new shape chain, 32 → 30 → 28 → pool → 14, and
+              64 × 14 × 14 = 12 544. Count the parameters again: you should get 1 626 442.
+              Expect 65–72% test accuracy, not more. There is no augmentation and no dropout here,
+              so the validation loss turns upward long before epoch 20. That curve is the
+              overfitting section of Lesson 01, and seeing it is part of the exercise.</li>
+        </ol>
+        <p><strong>Then break it on purpose</strong>, and measure what you broke:</p>
+        <ul>
+          <li>Delete every <code>relu</code> from the MLP. What accuracy can it still reach, and why
+              is that number the same as a single-layer model?</li>
+          <li>Replace He initialisation with <code>* 0.02</code>, then with <code>* 0.2</code>. Print
+              the RMS of the activations after each layer for the first batch. Which one produces
+              <code>nan</code> first?</li>
+          <li>Set the learning rate to <code>0.5</code> and count how many hidden units output zero
+              for the whole validation set after one epoch. Those units are dead.</li>
+          <li>Remove <code>MaxPool2d</code>. How many parameters does the first dense layer need now,
+              and how much slower is one epoch?</li>
+        </ul>
+        <dl class="project__grid">
+          <div class="project__stat"><dt>Data</dt><dd>MNIST, then CIFAR-10 (50k train)</dd></div>
+          <div class="project__stat"><dt>Size</dt><dd>101 770 MLP · 1 626 442 CNN on CIFAR-10</dd></div>
+          <div class="project__stat"><dt>Time</dt><dd>≈ 10 s/epoch MLP on CPU · 20–35 s/epoch CNN on MPS</dd></div>
+          <div class="project__stat"><dt>Target</dt><dd>&gt; 97% MNIST · 65–72% CIFAR-10 in 20 epochs</dd></div>
+        </dl>
+      </div>
+
+      <h2 id="check">Check yourself</h2>
+
+      <div class="check">
+        <p class="check__q">Hold <code>∂L/∂z₁</code> at 6.75, but suppose the input <code>x</code>
+        were 3.0 instead of 2.0. What are <code>∂L/∂w₁</code> and <code>∂L/∂b₁</code> now?</p>
+        <div class="check__opts">
+          <button class="check__opt">13.50 and 6.75 — neither depends on x</button>
+          <button class="check__opt" data-right>20.25 and 6.75 — only the weight gradient moves</button>
+          <button class="check__opt">20.25 and 10.125 — both scale with x</button>
+          <button class="check__opt">6.75 and 20.25 — the bias takes the input, the weight does not</button>
+        </div>
+        <p class="check__why">Because <code>z₁ = w₁·x + b₁</code>, the local derivative
+        <code>∂z₁/∂w₁</code> is <code>x</code>, so the weight gradient scales with the input:
+        6.75 × 3.0 = 20.25. But <code>∂z₁/∂b₁</code> is 1 whatever <code>x</code> is. So while
+        <code>∂L/∂z₁</code> is held fixed, only the weight gradient moves. Note the word
+        <em>held</em>. Change <code>x</code> for real and both gradients move, because
+        <code>∂L/∂z₁</code> itself changes. With <code>x = 3.0</code> the forward pass gives
+        <code>z₁ = 1.6</code> and <code>z₂ = −2.0</code>, so <code>∂L/∂z₁</code> becomes 9.0. The
+        two gradients are then 27.0 and 9.0. Only the <em>local</em> derivative of a bias ignores
+        the input.</p>
+      </div>
+
+      <div class="check">
+        <p class="check__q">You remove every activation function from a 5-layer MLP with hidden
+        widths 512, 512, 512, 512. What is the model now equivalent to?</p>
+        <div class="check__opts">
+          <button class="check__opt">The same model, only slower to train</button>
+          <button class="check__opt">A 2-layer MLP with one ReLU</button>
+          <button class="check__opt" data-right>A single linear layer from input to output</button>
+          <button class="check__opt">A model that cannot be trained at all</button>
+        </div>
+        <p class="check__why">Five matrix multiplies in a row can be replaced by their product, which
+        is one matrix. The model still trains and the loss still falls — it just cannot represent
+        anything a single matrix cannot represent, so it plateaus early.</p>
+      </div>
+
+      <div class="check">
+        <p class="check__q">You apply <code>nn.Conv2d(3, 16, kernel_size=5, padding=2)</code> to a
+        batch of 32 × 32 colour images. How many parameters does it have, and what shape comes
+        out?</p>
+        <div class="check__opts">
+          <button class="check__opt">1 200 parameters, output (B, 16, 28, 28)</button>
+          <button class="check__opt">400 parameters, output (B, 16, 32, 32)</button>
+          <button class="check__opt" data-right>1 216 parameters, output (B, 16, 32, 32)</button>
+          <button class="check__opt">1 216 parameters, output (B, 16, 28, 28)</button>
+        </div>
+        <p class="check__why">Each of the 16 output channels needs a kernel spanning all 3 input
+        channels: 3 × 5 × 5 = 75 weights, plus one bias. 16 × 75 = 1 200, plus 16 biases = 1 216.
+        For the shape, put the numbers in the formula from section 7:
+        (32 + 2 × 2 − 5) / 1 + 1 = 32. Padding 2 with a 5 × 5 kernel keeps the size exactly. The
+        input size never enters the parameter count — that is the point of weight sharing.</p>
+      </div>
+
+      <div class="terms">
+        <span class="terms__label">Key words from this lesson</span>
+        <dl>
+          <dt>Neuron <span class="en">also: unit</span></dt>
+          <dd>One weighted sum of the inputs, plus a bias, plus a non-linear function.</dd>
+
+          <dt>Bias <span class="en">/ˈbaɪəs/</span></dt>
+          <dd>The one number in a neuron that is added rather than multiplied. It shifts the decision away from zero.</dd>
+
+          <dt>Backpropagation <span class="en">often: backprop</span></dt>
+          <dd>Walking the recorded operations in reverse and multiplying local derivatives, to get a gradient for every parameter.</dd>
+
+          <dt>Local derivative</dt>
+          <dd>How much one operation's output changes when its own input changes. Each operation knows only this.</dd>
+
+          <dt>Non-linearity <span class="en">also: activation function</span></dt>
+          <dd>Any function whose graph is not a straight line. Without one between two linear layers, the pair collapses into a single layer.</dd>
+
+          <dt>Dead unit <span class="en">also: dead ReLU</span></dt>
+          <dd>A neuron whose sum is always negative, so ReLU outputs zero, the gradient is zero, and it can never recover.</dd>
+
+          <dt>Initialisation</dt>
+          <dd>The scale of the random numbers a network starts from. It decides whether the signal survives the depth.</dd>
+
+          <dt>Kernel <span class="en">also: filter</span></dt>
+          <dd>The small block of weights a convolution slides over its input. Usually 3 × 3.</dd>
+
+          <dt>Feature map</dt>
+          <dd>The output of one kernel over the whole input: a picture of where that detector fired.</dd>
+
+          <dt>Weight sharing</dt>
+          <dd>Using the same weights at every position, so the parameter count does not grow with the size of the input.</dd>
+
+          <dt>Normalisation</dt>
+          <dd>Subtract the mean of a group of numbers, divide by their standard deviation, then apply a learned gain and shift.</dd>
+
+          <dt>Layer normalisation <span class="en">also: LayerNorm</span></dt>
+          <dd>Rescaling each example using only its own features, so the result never depends on the other examples in the batch.</dd>
+
+          <dt>Residual connection <span class="en">also: skip connection</span></dt>
+          <dd>Adding a block's input back onto its output, x + f(x), so the gradient always has a short path back through the network.</dd>
+        </dl>
+      </div>
+
+      <h2 id="resources">Go deeper</h2>
+
+      <div class="resources">
+        <a class="res" href="https://github.com/karpathy/nn-zero-to-hero" target="_blank" rel="noopener">
+          <span class="res__kind" data-kind="code">code</span>
+          <span class="res__body">
+            <span class="res__title">Karpathy — Neural Networks: Zero to Hero</span>
+            <span class="res__why">The micrograd notebook builds an autograd engine in about 100 lines. Do it after this lesson; it is the same chain rule, written as code.</span>
+          </span>
+        </a>
+        <a class="res" href="https://docs.pytorch.org/docs/stable/notes/autograd.html" target="_blank" rel="noopener">
+          <span class="res__kind" data-kind="docs">docs</span>
+          <span class="res__body">
+            <span class="res__title">Autograd mechanics</span>
+            <span class="res__why">Read the section on the graph being rebuilt every iteration. It explains why a Python <code>if</code> inside <code>forward()</code> works at all.</span>
+          </span>
+        </a>
+        <a class="res" href="https://docs.pytorch.org/docs/stable/notes/broadcasting.html" target="_blank" rel="noopener">
+          <span class="res__kind" data-kind="docs">docs</span>
+          <span class="res__body">
+            <span class="res__title">Broadcasting semantics</span>
+            <span class="res__why">Open this the first time your hand-written layer produces a tensor with one dimension too many. Adding a bias is broadcasting, and so is the bug next to it.</span>
+          </span>
+        </a>
+        <a class="res" href="https://d2l.ai/" target="_blank" rel="noopener">
+          <span class="res__kind" data-kind="course">course</span>
+          <span class="res__body">
+            <span class="res__title">Dive into Deep Learning</span>
+            <span class="res__why">The reference for the exact formulas: convolution output sizes, initialisation variance, batch versus layer normalisation, each with runnable code.</span>
+          </span>
+        </a>
+      </div>
+
+      <div class="callout callout--try">
+        <span class="callout__label">Next</span>
+        <p class="mt-0">You can now build any feed-forward network from parts you wrote yourself.
+        The convolution is not a detour, either. It is the same layer that reads a spectrogram in
+        <strong>Lesson 11</strong>, where the offline voice assistant this course builds turns sound
+        into text. In <strong>Lesson 03</strong> we add the piece that made language models
+        possible: attention, one matrix at a time. Tokens, embeddings, heads, causal masks — and the
+        block that repeats.</p>
+      </div>
+
+    </article>
+  </main>
+
+  <aside class="toc-rail"></aside>
+</div>
+
+<script src="../assets/js/vendor/gsap.min.js"></script>
+<script src="../assets/js/scene.js"></script>
+<script src="../assets/js/svgkit.js"></script>
+<script src="../data/lessons.js"></script>
+<script src="../data/glossary.js"></script>
+<script src="../assets/js/course.js"></script>
+<script src="../data/narration/02.js"></script>
+<script src="../data/narration/02.timing.js" onerror="void 0"></script>
+<script src="../assets/js/scenes/02.js"></script>
+<script src="../assets/js/film.js"></script>
+</body>
+</html>

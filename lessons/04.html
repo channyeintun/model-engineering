@@ -1,0 +1,1040 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>04 · Train your own tiny GPT — Model Engineering</title>
+<meta name="description" content="Pretraining as an engineering job: one long token stream, one loss at every position, and a budget you can actually pay.">
+<link rel="stylesheet" href="../assets/css/course.css">
+</head>
+<body data-lesson="04">
+
+<div class="shell shell--wide">
+  <nav class="rail" aria-label="Lessons"></nav>
+
+  <main class="main">
+    <article class="prose">
+
+      <header class="lesson-head">
+        <span class="lesson-head__num">04</span>
+        <h1>Train your own tiny GPT</h1>
+        <p class="lead">A language model is not trained on questions and answers. It is trained on one
+        very long stream of text, cut into equal blocks, with a cross-entropy loss at every single
+        position. This lesson turns that sentence into a training run you can afford.</p>
+        <div class="lesson-head__meta">
+          <span class="chip"><b>Part II</b> · Language models</span>
+          <span class="chip">≈ <b>125 min</b> reading</span>
+          <span class="chip">Project · <b>A ~15M parameter GPT that writes stories</b></span>
+          <span class="chip">Needs · <b>Lessons 01, 03</b></span>
+        </div>
+      </header>
+
+      <section class="outcomes">
+        <h2>By the end you can</h2>
+        <ul>
+          <li>Write the <strong>next-token objective</strong> in four lines of PyTorch, and say why the labels are the inputs shifted by one.</li>
+          <li>Turn a folder of documents into <strong>packed fixed-length blocks</strong> with no wasted compute.</li>
+          <li>Predict the <strong>loss at step 0</strong> before you run anything, and diagnose a curve that goes wrong.</li>
+          <li>Use <strong>C ≈ 6ND</strong> to convert a model shape into a number of hours.</li>
+          <li>Explain why on-device models are <strong>deliberately overtrained</strong> compared with the compute-optimal point.</li>
+          <li>Implement <strong>temperature, top-k and top-p</strong> sampling, and a key-value (KV) cache with separate prefill and decode paths.</li>
+        </ul>
+      </section>
+
+      <h2 id="objective"><span class="h-num">04 · 1</span>The objective is one loss, T times</h2>
+
+      <p><span class="term" data-term="pretraining">Pretraining</span> has exactly one rule: given the
+      tokens so far, predict the next one. A <strong>GPT</strong> — a generative pre-trained transformer —
+      is the decoder-only model you built in Lesson 03, trained under that one rule. It sounds like a
+      single prediction per example. It is not. Because of the causal mask from Lesson 03, a block of
+      <code>T</code> tokens produces <code>T</code> predictions in one forward pass, and every one of
+      them is graded.</p>
+
+      <p>So the objective is not new. It is Lesson 01's cross-entropy, applied at every position at
+      once, and then averaged into one number so that gradient descent has a single surface to walk
+      down. Three letters carry the shapes for the rest of the lesson: <code>B</code> is the batch
+      size, <code>T</code> is the block length in tokens, and <code>V</code> is the vocabulary size.</p>
+
+      <p>One convention, stated once. Every logarithm here is a <strong>natural</strong> logarithm, so
+      the loss is measured in <strong>nats</strong> per token. A nat is a bit on base <em>e</em> instead
+      of base 2: one nat is 1/ln 2 ≈ 1.44 bits. That conversion returns in perplexity and in bits per
+      byte.</p>
+
+      <figure class="scene" data-scene="gpt-objective">
+        <div class="scene__head">
+          <span class="scene__badge">animation</span>
+          <span class="scene__title">One block in, T graded predictions out</span>
+        </div>
+        <div class="scene__stage">
+          <svg viewBox="0 0 900 330" role="img" aria-label="A row of input tokens, a row of predictions, a target row built by shifting the inputs one place left, and a per-position loss that is averaged into one number">
+            <g id="ob-plot"></g>
+          </svg>
+        </div>
+      </figure>
+
+      <p>The labels are the inputs, moved one place to the left. There is no separate label file, no
+      annotation step, no human in the loop. That is the whole reason pretraining scales: the text
+      labels itself.</p>
+
+      <p>Two names for the rest of the lesson. <code>x</code> is the block of inputs and <code>y</code>
+      is the same block shifted one place left. The next section builds them; here is what the loss does
+      with them.</p>
+
+      <div class="code">
+        <div class="code__head"><span>objective.py</span><span class="lang">python</span></div>
+        <pre><code>import torch.nn.functional as F
+
+# x, y: (B, T) int64. y is x shifted one place left — see get_batch below.
+logits = model(x)                            # (B, T, V)
+
+loss = F.cross_entropy(
+    logits.reshape(-1, V),                   # B*T rows, V scores each
+    y.reshape(-1),                           # B*T correct token ids
+)                                            # one scalar, the mean over every position</code></pre>
+      </div>
+
+      <div class="callout callout--pitfall">
+        <span class="callout__label">The shift that fails silently</span>
+        <p class="mt-0">Shift the labels the wrong way, or forget to shift them at all, and nothing
+        crashes. The model learns to copy its input, which it can do almost perfectly, so the training
+        loss falls close to <code>0</code> within a few hundred steps and the samples are garbage.
+        <strong>A loss that drops below about 1.0 in the first thousand steps of pretraining is a bug,
+        not a breakthrough.</strong> Print one batch and check by hand that
+        <code>y[0][3] == x[0][4]</code>.</p>
+      </div>
+
+      <div class="callout callout--key">
+        <span class="callout__label">Remember this</span>
+        <p class="mt-0">One forward pass over a block of 256 tokens gives you 255 training signals, not
+        one. This is why <span class="term" data-term="attention">attention</span> with a causal mask is
+        so efficient to train, and it is also why the same trick does not work for image classification,
+        where one image gives one label.</p>
+      </div>
+
+      <h2 id="data"><span class="h-num">04 · 2</span>Data: a corpus, a tokenizer, one long stream</h2>
+
+      <p>Choose the corpus before the architecture. Here it is <strong>TinyStories</strong>
+      (<code>roneneldan/TinyStories</code>, licence CDLA-Sharing-1.0, about 480 MB, 2.12 million
+      training rows). It is short children's stories written with a small vocabulary. That matters: on
+      simple text a model of a few million parameters can produce coherent output, which the same model
+      trained on general web text cannot.</p>
+
+      <p>If you want the flavour of real web text instead, a good alternative is
+      <code>HuggingFaceFW/fineweb-edu</code> with the config <code>sample-10BT</code>, loaded with
+      <code>streaming=True</code> so you do not download twenty gigabytes. Expect worse samples at this
+      model size: web text is harder than children's stories.</p>
+
+      <h3 id="tokenizer">Train the tokenizer first</h3>
+
+      <p>The <span class="term" data-term="token">token</span> vocabulary is a real engineering choice,
+      not a default to copy. The embedding table has <code>V × d</code> entries, and small models tie
+      the input embedding to the output head, so you pay for it once — but you still pay.</p>
+
+      <p>For a model under about 200 million parameters, keep <code>V</code> between 8k and 32k. This
+      project goes smaller still, 4,096, because TinyStories uses a narrow vocabulary and a small
+      <code>V</code> leaves more of the parameter budget inside the layers. As a comparison,
+      nanochat's <b>d20</b> — the <em>d</em> is depth, so twenty transformer blocks — uses 65,536,
+      chosen so that token ids fit into a <code>uint16</code>.</p>
+
+      <div class="code">
+        <div class="code__head"><span>tokenizer.py</span><span class="lang">python</span></div>
+        <pre><code>from datasets import load_dataset
+from transformers import AutoTokenizer
+
+ds = load_dataset("roneneldan/TinyStories", split="train")
+
+old = AutoTokenizer.from_pretrained("gpt2")          # borrow the byte-level byte-pair (BPE) recipe
+
+def corpus_iter(dataset, batch=1000):
+    for i in range(0, len(dataset), batch):
+        yield dataset[i : i + batch]["text"]
+
+tok = old.train_new_from_iterator(corpus_iter(ds), vocab_size=4096)
+tok.save_pretrained("./tiny-tokenizer")</code></pre>
+      </div>
+
+      <p><code>train_new_from_iterator</code> keeps the algorithm and the pre-tokenizer of the old
+      tokenizer and learns new merges on your corpus. It only works on fast, Rust-backed tokenizers,
+      which in <code>transformers</code> v5 is every tokenizer.</p>
+
+      <h3 id="packing">Packing, not padding</h3>
+
+      <p>Documents have random lengths and a batch has to be a rectangle. The naive fix is padding, and
+      padding is pure waste: a padded position costs the same matrix multiply as a real one and
+      contributes nothing to the gradient. Packing concatenates every document into one stream, puts an
+      end-of-text token between them, and cuts the stream into blocks of exactly <code>T</code>
+      tokens.</p>
+
+      <figure class="scene" data-scene="gpt-packing">
+        <div class="scene__head">
+          <span class="scene__badge">animation</span>
+          <span class="scene__title">Three documents become two full blocks</span>
+        </div>
+        <div class="scene__stage">
+          <svg viewBox="0 0 900 300" role="img" aria-label="Documents of different lengths first padded with grey cells, then concatenated into one stream with end-of-text separators and cut into equal blocks">
+            <g id="pk-plot"></g>
+          </svg>
+        </div>
+      </figure>
+
+      <div class="code">
+        <div class="code__head"><span>pack.py</span><span class="lang">python</span></div>
+        <pre><code>import numpy as np
+
+BLOCK, eos = 256, tok.eos_token_id
+
+def encode(batch):
+    return {"ids": [x + [eos] for x in tok(batch["text"])["input_ids"]]}
+
+enc = ds.map(encode, batched=True, remove_columns=ds.column_names)
+
+with open("train.bin", "wb") as f:                       # one long stream on disk
+    for row in enc:
+        np.asarray(row["ids"], dtype=np.uint16).tofile(f)
+
+arr = np.memmap("train.bin", dtype=np.uint16, mode="r")  # never loaded into RAM
+n = len(arr) // BLOCK
+blocks = arr[: n * BLOCK].reshape(n, BLOCK)              # (n, 256)
+print(n, "blocks,", arr.size, "tokens")</code></pre>
+      </div>
+
+      <p>Two details in that file are worth naming. <code>uint16</code> holds ids up to 65,535, so any
+      vocabulary at or below 65,536 halves your disk and your memory-map traffic. And
+      <code>np.memmap</code> means the operating system pages the stream in on demand — you can train
+      on a file larger than your RAM without writing a single line of streaming code.</p>
+
+      <p>Run the same pipeline on the validation split into <code>val.bin</code>. Keep the two files
+      completely separate. A validation set that shares documents with the training set will report a
+      loss that is too low, and you will not find out until the samples disappoint you.</p>
+
+      <h3 id="batching">From blocks to (x, y)</h3>
+
+      <p><code>blocks</code> is still one array. The training loop wants pairs. This is the five-line
+      function that closes the gap, and it is where the label shift lives:</p>
+
+      <div class="code">
+        <div class="code__head"><span>batch.py</span><span class="lang">python</span></div>
+        <pre><code>import numpy as np, torch
+
+def get_batch(blocks, bs, dev):
+    idx = np.random.randint(0, len(blocks), bs)          # bs random block numbers
+    b = torch.from_numpy(blocks[idx].astype("int64"))    # (bs, 256)
+    return b[:, :-1].to(dev), b[:, 1:].to(dev)          # x is 255 tokens, y is the same block shifted left
+
+x, y = get_batch(blocks, 32, dev)
+assert (x[0, 1:] == y[0, :-1]).all()                     # the shift, checked once, out loud</code></pre>
+      </div>
+
+      <p>Say it once, because three later snippets depend on it: <strong>the shift lives in the
+      loader.</strong> From here on no loss function slices anything. A 256-token block therefore trains
+      on 255 positions, which is where the "255 training signals" figure comes from.</p>
+
+      <p>The random indices are not laziness. Neighbouring blocks come from the same documents, so a
+      batch of neighbours is a batch of one topic.</p>
+
+      <div class="callout callout--note">
+        <span class="callout__label">Worth knowing</span>
+        <p class="mt-0">This naive cut is called <strong>wrapped</strong> packing, and it is what
+        classic pretraining does: a document may be cut across a block boundary, and the model simply
+        learns from both halves. For instruction fine-tuning in Lesson 05 that is not acceptable, because
+        cutting an assistant answer in half teaches the model to stop in the middle. There the default is
+        best-fit-decreasing packing, which never splits an example.</p>
+      </div>
+
+      <h2 id="step"><span class="h-num">04 · 3</span>What one optimizer step really is</h2>
+
+      <p>Here is the problem this section solves. Your device holds maybe 32 blocks at a time, but
+      pretraining wants tens of thousands of tokens in every step, or the gradient is too noisy to
+      follow. Take small steps anyway and the loss curve is a jagged mess. Two lines of code fix it, and
+      neither is obvious.</p>
+
+      <p>So forget batch size for a moment. The number that decides how your run behaves is
+      <strong>tokens per optimizer step</strong>:</p>
+
+      <div class="eq">tokens_per_step = <i>micro_batch</i> × <i>T</i> × accum_steps × world_size
+
+   <i>micro_batch</i>  rows on the device at once     <i>T</i>  block length, in tokens
+   accum_steps  backward passes before one step
+   world_size   how many GPUs run the same model in parallel; 1 on your machine</div>
+
+      <p>Multi-GPU training is out of scope for this course, so <code>world_size</code> is 1 in every
+      number below. For this project: 32 × 256 × 8 × 1 = <strong>65,536</strong> tokens per step. For
+      scale, nanochat's d20 uses 524,288 tokens per step (2<sup>19</sup>) at block length 2,048, and
+      SmolLM3-3B used 2.36 million at block length 4,096.</p>
+
+      <p>One bookkeeping note, because section 04·2 was strict about it. This formula counts the tokens
+      <em>read from the stream</em>, not the positions graded. The loader spends one position per block
+      on the shift, so 32 × 255 × 8 = 65,280 positions actually get a loss. That is 0.4% fewer, and
+      every budget number below ignores the difference.</p>
+
+      <p>Two runs with the same tokens per step behave almost identically, whatever combination of
+      micro-batch and accumulation produced it. That is the knob to reason about. It is a rule of thumb,
+      not a law: it holds only while the learning rate stays fixed, and only while no layer depends on
+      the micro-batch. Verify it yourself — run micro-batch 64 with <code>ACC = 4</code> and check that
+      the two curves lie on top of each other.</p>
+
+      <figure class="scene" data-scene="gpt-step">
+        <div class="scene__head">
+          <span class="scene__badge">animation</span>
+          <span class="scene__title">Eight small backward passes, one honest step</span>
+        </div>
+        <div class="scene__stage">
+          <svg viewBox="0 0 900 320" role="img" aria-label="Eight micro-batches feeding one gradient buffer that fills up, a readout counting tokens per step to 65,536, then a gradient vector too long being scaled back to length one while keeping its direction">
+            <g id="st-plot"></g>
+          </svg>
+        </div>
+      </figure>
+
+      <p><strong>Gradient accumulation</strong> is what makes that possible on one small GPU. Lesson 01
+      showed that PyTorch adds into <code>.grad</code> instead of replacing it, and called that a bug
+      waiting to happen. Here it is the feature: run several micro-batches, call
+      <code>backward()</code> on each, divide the loss so the sum comes out as an average, and step
+      once. Memory scales with the micro-batch. The effective batch scales with the product.</p>
+
+      <p><strong>Gradient clipping</strong> is the second line you must not skip. Compute the global
+      L2 norm over every gradient — the square root of the sum of the squares of every gradient in the
+      model. If it is larger than a limit, scale every gradient down by the same factor. The direction
+      is unchanged, only the length is capped.</p>
+
+      <div class="callout callout--math">
+        <span class="callout__label">The maths, once</span>
+        <div class="eq"><u>g</u>  ←  <u>g</u> × min(1, clip / ‖<u>g</u>‖₂)
+
+   <u>g</u>  all gradients, treated as one long vector      clip  = 1.0</div>
+        <p>Once by hand: if the norm is 4.0 and the limit is 1.0, then min(1, 1/4) = 0.25 and every
+        gradient is multiplied by 0.25. A gradient of −3.2 becomes −0.8, one of +0.4 becomes +0.1, and
+        the ratio between them never changes. That is "same direction, shorter".</p>
+        <p>A limit of <code>1.0</code> is what SmolLM3 pretraining used, and it is the default in
+        <code>transformers</code> and in TRL (Transformer Reinforcement Learning, Hugging Face's
+        training library for fine-tuning and alignment, which you will use from Lesson 05 onwards).
+        Without clipping, one corrupt document produces one enormous gradient, every weight jumps, and
+        the loss curve spikes and often never recovers. Log the norm <em>before</em> clipping — that
+        number is your early warning.</p>
+      </div>
+
+      <h2 id="schedule"><span class="h-num">04 · 4</span>Warmup, then cosine decay</h2>
+
+      <p>A constant <span class="term" data-term="learning rate">learning rate</span> is the wrong choice
+      for pretraining, at both ends of the run. At the start the model is random, the gradients are
+      large and badly correlated, and a full-size step throws the weights somewhere useless. At the end
+      you want small steps to settle into a minimum rather than bounce around it.</p>
+
+      <p>So the schedule has two parts. <strong>Warmup</strong> raises the learning rate linearly from
+      near zero over the first few hundred steps. <strong>Cosine decay</strong> then lowers it smoothly
+      to a floor, usually about one tenth of the peak, over the rest of the run.</p>
+
+      <p>The training loop below also carries one line you have not met. Without it, activations are
+      stored in 32-bit and a batch that should fit does not, so it is worth two minutes before the
+      code.</p>
+
+      <div class="callout callout--note">
+        <span class="callout__label">Automatic mixed precision, in one box</span>
+        <p class="mt-0"><strong>Automatic mixed precision (AMP)</strong> is what
+        <code>torch.autocast</code> switches on. Inside that block, PyTorch runs the expensive operations
+        in 16-bit — matrix multiplies above all — and keeps the delicate ones in 32-bit: softmax, the
+        normalisation layers, the loss, and the master copy of the weights. Activation memory roughly
+        halves and the matrix multiplies get faster.</p>
+        <p>The two 16-bit formats are not interchangeable. BF16 has the same exponent range as FP32, so
+        nothing else is needed. FP16's range is far narrower, and small gradients fall below its smallest
+        number and become exactly zero, silently. <code>torch.amp.GradScaler</code> is the fix: it
+        multiplies the loss by a large factor before <code>backward()</code> so the gradients land back
+        inside FP16's range, then divides that factor out before the step. Lesson 07 explains the bit
+        layouts.</p>
+      </div>
+
+      <div class="code">
+        <div class="code__head"><span>train_step.py</span><span class="lang">python</span></div>
+        <pre><code>import math, torch, torch.nn.functional as F
+
+ACC = 8            # micro-batches per optimizer step: 32 x 256 x 8 = 65,536 tokens
+TOTAL = 4300       # D // tokens_per_step = 284_000_000 // 65_536 = 4,333, rounded down
+WARMUP = 200       # about 5% of TOTAL — a rule of thumb, not a derived number
+
+def lr_at(step, peak=1e-3, floor=1e-4):
+    if step &lt; WARMUP:
+        return peak * (step + 1) / WARMUP            # linear warmup
+    t = (step - WARMUP) / max(1, TOTAL - WARMUP)     # 0 -> 1
+    return floor + 0.5 * (peak - floor) * (1 + math.cos(math.pi * t))
+
+opt.zero_grad(set_to_none=True)
+for i in range(TOTAL * ACC):
+    x, y = get_batch(blocks, 32, dev)                # (B, T) int64, already shifted
+    with torch.autocast(device_type=dev, dtype=amp_dtype):
+        logits = model(x)                            # (B, T, V)
+        loss = F.cross_entropy(logits.flatten(0, 1), y.flatten())
+    (loss / ACC).backward()                          # gradients accumulate
+    if (i + 1) % ACC == 0:
+        step = i // ACC
+        for g in opt.param_groups:
+            g["lr"] = lr_at(step)
+        gnorm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        opt.step()
+        opt.zero_grad(set_to_none=True)</code></pre>
+      </div>
+
+      <p>Two of those constants have a source and one does not. <code>TOTAL</code> is the training
+      budget divided by the tokens per step, derived in section 04·6. <code>ACC</code> is whatever makes
+      the micro-batch fit in memory. <code>WARMUP</code> is only a rule of thumb — a few hundred steps,
+      or roughly 5% of the run. Nobody derives it; people raise it when the loss spikes.</p>
+
+      <p>Use <code>AdamW</code>, as in Lesson 01. <code>amp_dtype</code> depends on your hardware:
+      <code>torch.bfloat16</code> on Apple Silicon and on modern NVIDIA cards. A free Colab T4 is a
+      Turing chip — NVIDIA's 2018 generation, two generations before BF16 support — so there you need
+      <code>torch.float16</code> together with <code>torch.amp.GradScaler</code>, exactly as the box
+      above describes.</p>
+
+      <div class="callout callout--pitfall">
+        <span class="callout__label">Common trap</span>
+        <p class="mt-0">A sharp loss spike a few steps <em>after</em> warmup finishes means the peak
+        learning rate is too high — warmup was hiding it. Lower the peak or lengthen the warmup. Do not
+        respond by lowering the floor; the floor is not the problem.</p>
+      </div>
+
+      <h2 id="curve"><span class="h-num">04 · 5</span>Reading the loss curve by the numbers</h2>
+
+      <p>The loss is mean cross-entropy in <strong>nats per token</strong>, and you can predict its very
+      first value before you run anything. A freshly initialised model is close to uniform over the
+      vocabulary, so it assigns probability <code>1/V</code> to the correct token, and
+      <code>−ln(1/V) = ln(V)</code>. With <code>V</code> = 4,096 that is ln(4096) = 8.32, and you can
+      check it on a calculator right now.</p>
+
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Vocabulary V</th><th>Loss at step 0 = ln(V)</th><th>Used by</th></tr></thead>
+          <tbody>
+            <tr><td class="num">4,096</td><td class="num">8.32</td><td>this lesson's project</td></tr>
+            <tr><td class="num">32,768</td><td class="num">10.40</td><td>typical tiny-model choice</td></tr>
+            <tr><td class="num">65,536</td><td class="num">11.09</td><td>nanochat d20</td></tr>
+            <tr><td class="num">128,256</td><td class="num">11.76</td><td>SmolLM3-3B, Llama 3.x</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>Lesson 01 promised you would watch a loss fall from about 10.8. That figure was for a
+      50,000-token vocabulary. The rule is <code>ln(V)</code>, and now you can compute it for your own
+      tokenizer. If your first logged loss is not close to that number, stop: either the initialisation
+      is wrong or the labels are wrong. Nothing later in the run will fix it.</p>
+
+      <figure class="scene" data-scene="gpt-loss">
+        <div class="scene__head">
+          <span class="scene__badge">animation</span>
+          <span class="scene__title">Three phases, three kinds of sample, and one dishonest axis</span>
+        </div>
+        <div class="scene__stage">
+          <svg viewBox="0 0 900 320" role="img" aria-label="A falling loss curve with three sample points, showing repeated common tokens, then words, then sentences, plus a divergence branch and a log-axis version of the same run">
+            <g id="lc-plot"></g>
+          </svg>
+        </div>
+      </figure>
+
+      <p>Four numeric signals are worth logging on every optimizer step, and none of them is
+      accuracy:</p>
+
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>What you log</th><th>Healthy shape</th><th>What a bad shape means</th></tr></thead>
+          <tbody>
+            <tr><td>train loss</td><td>near <code>ln(V)</code>, then a fast drop, then a slow straight decline against log(tokens)</td><td>flat from the start: labels or learning rate. Near zero: the label shift is missing</td></tr>
+            <tr><td><code>grad_norm</code> before clipping</td><td>settles into a narrow band after warmup</td><td>a spike of 10× to 100× is the signature of a run that is about to diverge</td></tr>
+            <tr><td>validation loss</td><td>tracks the training loss closely on a single pass over a large corpus</td><td>a widening gap means you are repeating data</td></tr>
+            <tr><td>tokens seen</td><td>rises linearly; it is your real x-axis</td><td>steps are not comparable between runs, tokens are</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 id="perplexity">Perplexity, and where it stops helping</h3>
+
+      <p><span class="term" data-term="perplexity">Perplexity</span> is <code>exp(loss)</code>. It has
+      a useful reading: roughly how many equally likely tokens the model was choosing between. A model
+      at loss 8.32 over a 4,096-token vocabulary has perplexity 4,096 — it has learned nothing yet. At
+      loss 2.0 the perplexity is 7.4.</p>
+
+      <div class="code">
+        <div class="code__head"><span>evaluate.py</span><span class="lang">python</span></div>
+        <pre><code>import math, torch, torch.nn.functional as F
+
+@torch.no_grad()
+def val_loss(model, blocks, bs=16):
+    model.eval()
+    total, n = 0.0, 0
+    for i in range(0, len(blocks), bs):
+        b = torch.from_numpy(blocks[i : i + bs].astype("int64"))
+        x, y = b[:, :-1].to(dev), b[:, 1:].to(dev)   # the same shift as get_batch
+        logits = model(x)
+        l = F.cross_entropy(logits.flatten(0, 1), y.flatten())
+        total += l.item() * x.size(0)
+        n += x.size(0)
+    model.train()
+    return total / n
+
+l = val_loss(model, val_blocks)
+print(f"val loss {l:.3f}   perplexity {math.exp(l):.1f}")</code></pre>
+      </div>
+
+      <div class="callout callout--pitfall">
+        <span class="callout__label">Perplexity is not a leaderboard</span>
+        <p class="mt-0">Perplexity is only comparable between models that use <strong>the same
+        tokenizer</strong> and <strong>the same evaluation text</strong>. A model with a larger
+        vocabulary produces fewer tokens for the same sentence, so its per-token loss is spread
+        differently, and the two numbers cannot be compared. To compare across tokenizers, use
+        <strong>bits per byte</strong>: <code>bpb = (loss × n_tokens) / (ln 2 × n_bytes)</code>. It is
+        measured per byte of the original text, so the tokenizer cancels out. The division by ln 2 is
+        the nats-to-bits conversion from section 04·1: multiplying by 1/ln 2 ≈ 1.44 turns a nat into a
+        bit. Multiplying by <code>n_tokens</code> and dividing by <code>n_bytes</code> moves the "per"
+        from tokens to bytes.</p>
+      </div>
+
+      <h2 id="scaling"><span class="h-num">04 · 6</span>How many tokens? Scaling laws, and why you overtrain</h2>
+
+      <p>Without this section you start a run and find out how long it takes by waiting. That is fine
+      for one afternoon and fatal for a budget. Two formulas replace the waiting with arithmetic you can
+      do before you type anything.</p>
+
+      <div class="callout callout--math">
+        <span class="callout__label">The maths, once</span>
+        <div class="eq">C  ≈  6 × <b>N</b> × <i>D</i>            <i>D*</i>  ≈  20 × <b>N</b>
+
+   C  training compute, in FLOPs      <b>N</b>  non-embedding parameters
+   <i>D</i>  training tokens                  <i>D*</i>  the compute-optimal choice of <i>D</i></div>
+        <p>The 6 is two FLOPs — floating-point operations — per parameter per token in the forward
+        pass, plus four in the backward pass. The <code>D* ≈ 20N</code> rule comes from Chinchilla
+        (Hoffmann et al., 2022), which trained 70 billion parameters on 1.4 trillion tokens and beat a
+        280-billion model on the same compute budget.</p>
+      </div>
+
+      <div class="callout callout--key">
+        <span class="callout__label">The whole sum, for this project</span>
+        <p class="mt-0">Every number is on this page. Follow it with a calculator.</p>
+        <ol class="mt-0">
+          <li><b>N</b> = 14.2 M non-embedding parameters, from the project table below.</li>
+          <li><i>D*</i> = 20 × 14.2e6 = <b>284 M tokens</b>. At 65,536 tokens per step that is
+              284e6 ÷ 65,536 = 4,333 steps, which we round to <code>TOTAL = 4300</code> — 282 M
+              tokens. That is where the constant in <code>train_step.py</code> comes from.</li>
+          <li><i>C</i> = 6 × 14.2e6 × 282e6 = <b>2.4e16 FLOPs</b>.</li>
+          <li>A free Colab T4 is quoted at 65 TFLOP/s in FP16. That is the marketing number.
+              This model sustains about <b>5%</b> of it, which is 3.3 TFLOP/s — the next callout says
+              why.</li>
+          <li>2.4e16 ÷ 3.3e12 = <b>7,300 seconds ≈ 2 hours</b>. Compare that with the 1.5 – 3 h row in
+              the wall-clock table below. They agree, because the table was built from this sum.</li>
+        </ol>
+        <p>That is the whole worksheet, and it transfers. For any other model: pick <b>N</b> from your
+        memory budget, pick <i>D</i> (floor <code>20N</code>, on-device target 500 to 2,000 tokens per
+        parameter), compute <code>6ND</code>, divide by your measured FLOPs per second, and multiply by
+        the price per second to get the invoice.</p>
+      </div>
+
+      <div class="callout callout--pitfall">
+        <span class="callout__label">Why 5% and not 40%</span>
+        <p class="mt-0">You will read that a well-tuned run reaches 35% to 45% of a GPU's peak FLOPs.
+        That figure is real, and it is for a <em>large</em> model on a data-centre card. Your
+        15 M-parameter model with 256-token blocks is a different animal. Its matrices are small, so each
+        kernel finishes before the GPU is properly busy, and the run is dominated by launching kernels
+        rather than by arithmetic. A few percent of peak is normal there.</p>
+        <p>The part that generalises: <strong>utilisation is a property of the shape, not of the
+        chip.</strong> Measure it once on your own model — time 50 steps, multiply tokens by 6N, divide
+        by seconds — and reuse your own number.</p>
+      </div>
+
+      <figure class="scene" data-scene="gpt-budget">
+        <div class="scene__head">
+          <span class="scene__badge">animation</span>
+          <span class="scene__title">From a model shape to a number of hours, and then past it</span>
+        </div>
+        <div class="scene__stage">
+          <svg viewBox="0 0 900 300" role="img" aria-label="A chain from model shape to parameter count to token count to FLOPs and hours, above a logarithmic axis of tokens per parameter with markers at 20 and at 3700">
+            <g id="bd-plot"></g>
+          </svg>
+        </div>
+      </figure>
+
+      <p>Chinchilla answers a specific question: <em>given a fixed training budget, what is the best
+      model?</em> That is the right question for a lab that trains once and then serves from its own
+      data centre. It is the wrong question for a model that ships to a phone.</p>
+
+      <p>If your model runs on a device, you pay training cost once and inference cost millions of
+      times. Every hour you add to training makes every future generation cheaper, because a smaller,
+      longer-trained model beats a larger, briefly-trained one at the same quality. So you deliberately
+      train far past the compute-optimal point.</p>
+
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Model</th><th>Parameters</th><th>Training tokens</th><th>Tokens per parameter</th><th>× Chinchilla</th></tr></thead>
+          <tbody>
+            <tr><td>Chinchilla 70B</td><td class="num">70 B</td><td class="num">1.4 T</td><td class="num">20</td><td class="num">1×</td></tr>
+            <tr><td>nanochat d20</td><td class="num">561 M</td><td class="num">11.2 B</td><td class="num">20</td><td class="num">1×</td></tr>
+            <tr><td>SmolLM3-3B</td><td class="num">3.08 B</td><td class="num">11.2 T</td><td class="num">~3,700</td><td class="num">~185×</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>SmolLM3-3B was trained about 185 times past its compute-optimal point. That is not a mistake
+      and it is not excess. It is the defining economic fact of small-model engineering, and it explains
+      why a 3-billion-parameter model released in 2026 is far better than a 3-billion-parameter model
+      released in 2022.</p>
+
+      <p>Our project sits at the Chinchilla point, not past it, for one reason only: you have to be able
+      to finish it today. Its 282 M tokens are 20 per parameter. The overtraining regime is what a team
+      with more GPU time would do with exactly the same code — and the fourth self-check question at
+      the end of this lesson makes you price two days of it.</p>
+
+      <h2 id="sampling"><span class="h-num">04 · 7</span>Generation: choosing one token</h2>
+
+      <p>Training is finished. Now the model produces <span class="term" data-term="logits">logits</span>
+      over <code>V</code> tokens at the last position, and something has to pick one. That choice is not
+      part of the model, it costs nothing, and it changes the output more than another hour of training
+      would.</p>
+
+      <p>One notation warning first. The letter <code>T</code> is already taken in this lesson: it is
+      the block length, from the tokens-per-step formula onwards. Sampling temperature is therefore
+      written <b>τ</b> here, and <code>temp</code> in the code. They are the same knob.</p>
+
+      <figure class="scene" data-scene="gpt-sampling">
+        <div class="scene__head">
+          <span class="scene__badge">animation</span>
+          <span class="scene__title">The same distribution, reshaped and then cut in two different ways</span>
+        </div>
+        <div class="scene__stage">
+          <svg viewBox="0 0 900 300" role="img" aria-label="A bar chart of token probabilities being sharpened and flattened by temperature, then truncated by top-k and by top-p, with the chosen token changing">
+            <g id="sm-plot"></g>
+          </svg>
+        </div>
+      </figure>
+
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Method</th><th>What it does</th><th>Typical value</th><th>When it hurts</th></tr></thead>
+          <tbody>
+            <tr><td>Greedy</td><td>Take the highest logit every time</td><td>—</td><td>Repeats itself, gets stuck in loops</td></tr>
+            <tr><td>Temperature</td><td>Divide the logits by <b>τ</b> before <span class="term" data-term="softmax">softmax</span></td><td class="num">τ = 0.6 – 0.7</td><td>High values make the model wander off topic; near 0 it becomes greedy</td></tr>
+            <tr><td>Top-k</td><td>Keep the k highest logits, discard the rest, renormalise</td><td class="num">k = 20</td><td>k is fixed, so when the model is certain it still admits k−1 wrong answers</td></tr>
+            <tr><td>Top-p</td><td>Keep the shortest list whose probabilities reach p</td><td class="num">p = 0.8 – 0.95</td><td>Rarely; it adapts to the model's confidence. This is the default to reach for</td></tr>
+            <tr><td>Beam search</td><td>Keep the k best <em>whole sequences</em> so far, ranked by total log-probability, and extend all of them</td><td class="num">k = 4 – 8</td><td>k times the compute, and bland text — but it is standard in speech recognition, where there is one right answer. Lesson 11 uses it</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>Top-p, also called nucleus sampling (arXiv:1904.09751), is the one that adapts. When the model
+      is sure, the list is one token long. When it is unsure, the list grows. Top-k cannot do that,
+      because k is a constant. In practice people combine them: a temperature, then top-p, and often a
+      generous top-k as a safety net.</p>
+
+      <div class="code">
+        <div class="code__head"><span>generate.py</span><span class="lang">python</span></div>
+        <pre><code>import torch
+
+@torch.no_grad()
+def generate(model, ids, n=120, temp=0.7, top_k=None, top_p=0.9):
+    cache = None
+    for _ in range(n):
+        step_ids = ids if cache is None else ids[:, -1:]    # prefill, then decode
+        logits, cache = model(step_ids, cache=cache)        # see cache_attention.py
+        z = logits[:, -1] / temp                            # (B, V); temp is the tau above
+        p = torch.softmax(z, dim=-1)
+
+        if top_k:                                           # top-k, three lines
+            v, _ = torch.topk(p, top_k, dim=-1)             # v[..., -1] is the k-th largest
+            p = torch.where(p &lt; v[..., -1:], torch.zeros_like(p), p)
+            p = p / p.sum(-1, keepdim=True)                 # renormalise, or top_p below cuts
+                                                            # 90% of whatever top-k left
+
+        srt, idx = torch.sort(p, descending=True, dim=-1)
+        # cumsum minus self = the probability mass strictly BEFORE this token.
+        # For the first token that mass is 0, so it always passes, whatever top_p is.
+        keep = (srt.cumsum(-1) - srt) &lt; top_p
+        srt = torch.where(keep, srt, torch.zeros_like(srt))
+        pick = torch.multinomial(srt / srt.sum(-1, keepdim=True), 1)
+        ids = torch.cat([ids, idx.gather(-1, pick)], dim=1)
+    return ids</code></pre>
+      </div>
+
+      <div class="callout callout--pitfall">
+        <span class="callout__label">Moved in transformers v5</span>
+        <p class="mt-0">When you use a Hugging Face model rather than your own, the sampling settings
+        live on <code>model.generation_config</code>, not on <code>model.config</code>. That moved in v5.
+        Setting them on <code>config</code> now does nothing at all, silently, and you will spend an hour
+        wondering why <code>temperature</code> has no effect.</p>
+      </div>
+
+      <h2 id="cache"><span class="h-num">04 · 8</span>Prefill and decode are two different machines</h2>
+
+      <p>Look again at the loop above. The first iteration passes the whole prompt; every iteration
+      after that passes exactly one token. That is not an optimisation detail, it is two different
+      workloads with two different bottlenecks.</p>
+
+      <p>The reason it works is the causal mask. The keys and values computed for position 7 can never
+      depend on position 8, so once you have them they are final. Store them and you never compute them
+      again. That store is the key-value cache, almost always written <span class="term" data-term="kv cache">KV cache</span>.</p>
+
+      <figure class="scene" data-scene="gpt-decode">
+        <div class="scene__head">
+          <span class="scene__badge">animation</span>
+          <span class="scene__title">One big pass, then many tiny ones</span>
+        </div>
+        <div class="scene__stage">
+          <svg viewBox="0 0 900 320" role="img" aria-label="A prompt processed in a single pass that fills several cache columns at once, then generated tokens each adding one more column while a memory meter grows">
+            <g id="kv-plot"></g>
+          </svg>
+        </div>
+      </figure>
+
+      <div class="compare">
+        <div class="compare__col compare__col--a">
+          <h4>Prefill</h4>
+          <ul>
+            <li>The whole prompt in one forward pass.</li>
+            <li>Large matrix multiplies, many rows at once.</li>
+            <li>The chip is doing arithmetic — <strong>compute-bound</strong>.</li>
+            <li>You measure <strong>time to first token</strong>.</li>
+            <li>A longer prompt costs more here, and only here.</li>
+          </ul>
+        </div>
+        <div class="compare__col compare__col--b">
+          <h4>Decode</h4>
+          <ul>
+            <li>One token per pass, forever.</li>
+            <li>Every weight in the model is read to produce one token.</li>
+            <li>The chip is waiting for memory — <strong>memory-bound</strong>.</li>
+            <li>You measure <strong>tokens per second</strong>.</li>
+            <li>Halving the bytes per weight roughly halves the time per token.</li>
+          </ul>
+        </div>
+      </div>
+
+      <p>That last line is the whole argument for Lesson 07. Quantization does not make the arithmetic
+      faster; it makes the weights smaller, and during decode the weights are what you are waiting for.</p>
+
+      <h3 id="cache-code">Building the cache</h3>
+
+      <p>The model you wrote in Lesson 03 takes no cache and returns none, so
+      <code>model(step_ids, cache=cache)</code> above fails on the first call until you add six lines to
+      the attention block. Here they are.</p>
+
+      <div class="code">
+        <div class="code__head"><span>cache_attention.py</span><span class="lang">python</span></div>
+        <pre><code># inside attention, after q, k, v are projected and reshaped to
+# (B, H, T, head_dim) -- H query heads, head_dim the width of one head
+
+past_len = 0 if cache is None else cache[0].shape[2]     # how many tokens are already stored
+q = rope(q, offset=past_len)                             # position of this token in the WHOLE sequence
+k = rope(k, offset=past_len)
+
+if cache is not None:
+    k = torch.cat([cache[0], k], dim=2)                  # dim 2 is time: old keys, then new
+    v = torch.cat([cache[1], v], dim=2)
+
+new_cache = (k, v)                                       # hand this back to the caller
+out = F.scaled_dot_product_attention(q, k, v, is_causal=(q.shape[2] &gt; 1))</code></pre>
+      </div>
+
+      <p>Two traps live in those six lines, and neither one raises an error.</p>
+
+      <p><strong>The time axis.</strong> Keys and values are shaped
+      <code>(B, H, T, head_dim)</code>, so the concatenation must be on dimension 2. Concatenate on the
+      head axis instead and the shapes still work out, while the model quietly grows heads and generates
+      confident nonsense.</p>
+
+      <p><strong>Rotary position embedding (RoPE) offsets.</strong> During decode you pass one token, so
+      its position inside its own tensor is 0 — but its real position is <code>past_len</code>. Apply
+      RoPE at 0 and every generated token believes it is the first word of the text. The output stays
+      grammatical and stops holding together across a sentence.</p>
+
+      <p>The mask needs no new code. During prefill the query length equals the key length, so Lesson
+      03's causal mask applies unchanged. During decode there is one query against
+      <code>past_len + 1</code> keys, and one query may legally see all of them — which is why
+      <code>is_causal</code> is off when the query length is 1.</p>
+
+      <div class="callout callout--math">
+        <span class="callout__label">Cache size, exactly</span>
+        <div class="eq">bytes = 2 × layers × kv_heads × head_dim × tokens × bytes_per_element</div>
+        <p><code>kv_heads</code> is Lesson 03's <code>G</code>, the number of key/value groups, and
+        <code>head_dim</code> is its <code>d_h</code>, the width of one head. Same two quantities,
+        spelled out.</p>
+        <p>For this lesson's model — 8 layers, 6 key-value heads, head dimension 64, FP16 at 2 bytes
+        per number — that is 2 × 8 × 6 × 64 × 2 = <strong>12,288 bytes, or 12 KiB per token</strong>,
+        so a full 256-token context costs 3 MiB. The same formula on a real 1-billion-parameter model,
+        and the grouped-query attention that shrinks it, is worked through in Lesson 03 §5. On a phone
+        the cache, not the weights, is often the real memory limit.</p>
+      </div>
+
+      <div class="project">
+        <span class="project__label">Project 04</span>
+        <h3>A ~15M parameter GPT that writes stories</h3>
+        <p>Take the transformer block you wrote in Lesson 03 and train it, from random weights, until it
+        writes short stories that stay on topic. Nothing here is a toy version of the real thing: the
+        pipeline below is the same one that produced every model in this course, only smaller.</p>
+
+        <p><strong>Two things change from Lesson 03, and the parameter count changes with them.</strong>
+        Stack <b>eight</b> of those blocks now, not six. And use the 4,096-entry tokenizer you trained
+        in section 04·2, not Lesson 03's 8,192 or the 65-character vocabulary of its project. The block
+        itself is untouched, so its 1,770,240 parameters are the same number Lesson 03 §8 printed. Six
+        blocks on 65 characters came to 10.65 M. Eight blocks on 4,096 tokens come to 15.7 M, and that
+        is the model the rest of this lesson budgets for. Lesson 09 loads this one, so use these
+        numbers.</p>
+
+        <p>Be clear about what this model is for. It is <strong>the model you understand
+        completely</strong>, and it is not the brain of the capstone assistant. That job goes to the open
+        instruct model you fine-tune in Lesson 05, which Lessons 07 to 10 quantize, profile, export and
+        run. Your tiny GPT reappears once, in Lesson 09, as the warm-up export.</p>
+
+        <p>The shape, and where the parameters go. <code>d</code> is the model width, the same
+        <code>d_model</code> as in Lesson 03. <code>d_ff</code> is the width inside the feed-forward
+        block, the <span class="term" data-term="mlp">multi-layer perceptron (MLP)</span>, and
+        <code>V</code> and <code>T</code> are the vocabulary size and the block length as before:</p>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Part</th><th>Formula</th><th>Parameters</th></tr></thead>
+            <tbody>
+              <tr><td>Attention, per layer</td><td><code>4 · d²</code></td><td class="num">589,824</td></tr>
+              <tr><td>SwiGLU feed-forward block (MLP), per layer</td><td><code>3 · d · d_ff</code></td><td class="num">1,179,648</td></tr>
+              <tr><td>Two RMSNorms, per layer</td><td><code>2 · d</code></td><td class="num">768</td></tr>
+              <tr><td>One block</td><td>—</td><td class="num">1,770,240</td></tr>
+              <tr><td>Eight blocks</td><td>—</td><td class="num">14,161,920</td></tr>
+              <tr><td>Embedding, tied with the output head</td><td><code>V · d</code></td><td class="num">1,572,864</td></tr>
+              <tr><td>Final norm</td><td><code>d</code></td><td class="num">384</td></tr>
+              <tr><td><strong>Total</strong></td><td><code>d=384, d_ff=1024, V=4096, T=256</code></td><td class="num"><strong>15,735,168</strong></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>15.7 million — the kind of number that gets written as "15M" on a model card. Note that 14.2
+        million of them are non-embedding, and that is the <b>N</b> in <code>C = 6ND</code>.</p>
+
+        <ol class="steps">
+          <li>Train a 4,096-entry BPE tokenizer on TinyStories and save it.</li>
+          <li>Pack the train and validation splits into two <code>uint16</code> stream files, and cut
+              them into 256-token blocks.</li>
+          <li>Build the model: 8 layers, <code>d_model</code> 384, 6 heads, SwiGLU with
+              <code>d_ff</code> 1024, RMSNorm, RoPE, tied embedding. Print the parameter count and check
+              it against the table.</li>
+          <li>Train with AdamW for <strong>4,300 optimizer steps</strong> at 65,536 tokens per step —
+              282 M tokens, which is 20 per parameter. Clip gradients at 1.0, warm up over 200 steps,
+              then cosine decay from 1e-3 to 1e-4.</li>
+          <li>Log loss, <code>grad_norm</code> and tokens seen. Sample 100 tokens from the prompt
+              <code>"Once upon a time"</code> every 500 steps and paste the samples into your notes.</li>
+          <li>Add the cache to your attention block (<code>cache_attention.py</code> above), then write
+              the sampler around it. Report validation loss and perplexity at the end.</li>
+        </ol>
+
+        <p><strong>Then break it on purpose.</strong> Each of these produces a different, recognisable
+        failure, and recognising them is worth more than the trained model:</p>
+        <ul>
+          <li>Remove the label shift. How many steps until the loss is under 0.1, and what do the
+              samples look like then?</li>
+          <li>Set <code>max_norm=1000.0</code> so clipping never fires. Watch <code>grad_norm</code>.</li>
+          <li>Set <code>WARMUP = 0</code>. What happens in the first 50 steps?</li>
+          <li>Generate at temperature 0.1 and at temperature 2.0 from the same checkpoint.</li>
+        </ul>
+
+        <p><strong>Then measure it.</strong> Time the prefill of a 256-token prompt, then time 256
+        decode steps, and divide both by the number of tokens. Call
+        <code>torch.mps.synchronize()</code> or <code>torch.cuda.synchronize()</code> before every
+        <code>perf_counter()</code> — without it you are timing the queue, not the work. The per-token
+        cost of the two phases will differ by more than an order of magnitude, and Lesson 08 is about
+        that gap.</p>
+
+        <dl class="project__grid">
+          <div class="project__stat"><dt>Data</dt><dd>TinyStories · 282 M tokens · 4,300 steps</dd></div>
+          <div class="project__stat"><dt>Size</dt><dd>15.7 M params · 31 MB in BF16 (2 bytes each)</dd></div>
+          <div class="project__stat"><dt>Time</dt><dd>≈ 2 h on a free T4, 4 – 8 h on a Mac</dd></div>
+          <div class="project__stat"><dt>Target</dt><dd>Grammatical sentences that keep one subject</dd></div>
+        </dl>
+      </div>
+
+      <h3 id="wallclock">Be honest about the clock</h3>
+
+      <p>These are engineering estimates, built from the sum three sections above, not measured
+      benchmarks. Measure your own and write the number down.</p>
+
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Machine</th><th>Run</th><th>Wall clock</th><th>Notes</th></tr></thead>
+          <tbody>
+            <tr><td>Free Colab T4, 16 GB</td><td>282 M tokens — this project</td><td class="num">1.5 – 3 h</td><td>2.4e16 FLOPs at ~3.3 TFLOP/s sustained; FP16 plus GradScaler, no BF16 on Turing</td></tr>
+            <tr><td>M-series Mac, MPS (Apple's Metal GPU backend)</td><td>282 M tokens</td><td class="num">4 – 8 h</td><td>unified memory, so no 16 GB wall; run it overnight</td></tr>
+            <tr><td>8 × H100 (for scale)</td><td>nanochat d20, 11.2 B tokens</td><td class="num">3 h 51 min</td><td>561 M params, about $92 of rented time</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>Compute is linear in tokens, so halving the tokens halves the clock. If two hours is too long
+      for a first attempt, run 1,000 steps. You get grammatical fragments rather than stories, which is
+      enough to prove the pipeline works.</p>
+
+      <p>The last row is there to set the scale honestly. A genuinely tiny language model is a
+      coffee break. A 561-million-parameter chat model is one evening and the price of a dinner. Neither
+      is a moonshot, and that is a recent change.</p>
+
+      <div class="callout callout--try">
+        <span class="callout__label">Try it</span>
+        <p class="mt-0">Before you start the long run, do the overfit test from Lesson 01 in its language-model
+        form: take <strong>one</strong> block of 256 tokens and train on that block alone. A correct
+        training loop drives the loss to nearly zero within a minute or two, and the model will then
+        recite that block back to you word for word. If it cannot, the bug is in your code and no amount
+        of data will hide it.</p>
+      </div>
+
+      <h2 id="check">Check yourself</h2>
+
+      <div class="check">
+        <p class="check__q">You retrain the tokenizer at <code>vocab_size=16384</code>, build a fresh
+        model, and print the loss on the first batch before any optimizer step. What should it be?</p>
+        <div class="check__opts">
+          <button class="check__opt">About 8.3, the same as before — the loss does not depend on V</button>
+          <button class="check__opt" data-right>About 9.7</button>
+          <button class="check__opt">About 16,384, because that is the number of classes</button>
+          <button class="check__opt">About 0.0, because no learning has happened yet</button>
+        </div>
+        <p class="check__why">A random model spreads its probability evenly over V tokens, so the correct
+        token gets <code>1/V</code> and the loss is <code>−ln(1/V) = ln(V)</code>. 16,384 is 2<sup>14</sup>,
+        so ln(16384) = 14 × ln 2 = 14 × 0.693 = 9.70. Quadrupling the vocabulary adds ln 4 = 1.39 to the
+        starting loss. 16,384 itself would be the perplexity.</p>
+      </div>
+
+      <div class="check">
+        <p class="check__q">Your pretraining loss reaches 0.04 after 300 steps and the generated text is
+        nonsense. What is the most likely cause?</p>
+        <div class="check__opts">
+          <button class="check__opt">The learning rate is too high</button>
+          <button class="check__opt">The model has too many parameters for the data</button>
+          <button class="check__opt" data-right>The labels are not shifted, so the model is copying its input</button>
+          <button class="check__opt">Gradient clipping is set too low</button>
+        </div>
+        <p class="check__why">Copying the input is a task the model can solve almost perfectly, so the
+        loss collapses. Real next-token prediction on natural text never reaches such a low loss.
+        Check that <code>y[b][t] == x[b][t+1]</code> on a printed batch.</p>
+      </div>
+
+      <div class="check">
+        <p class="check__q">After the prompt "Once upon a", your model gives the token "time" a
+        probability of 0.94. You are sampling with <code>top_k=3</code> and, separately, with
+        <code>top_p=0.8</code>. What is the difference?</p>
+        <div class="check__opts">
+          <button class="check__opt">They keep the same tokens, since 0.94 is above both thresholds</button>
+          <button class="check__opt" data-right>Top-k still keeps three tokens; top-p keeps only "time"</button>
+          <button class="check__opt">Top-p keeps three tokens; top-k keeps only "time"</button>
+          <button class="check__opt">Neither keeps anything, so the model stops</button>
+        </div>
+        <p class="check__why">k is a constant, so top-k admits two unlikely tokens even when the model is
+        certain. Top-p stops as soon as the cumulative probability reaches p, which here happens at the
+        first token. That adaptivity is why top-p is the better default.</p>
+      </div>
+
+      <div class="check">
+        <p class="check__q">You keep the same 14.2 M non-embedding parameters but decide to overtrain,
+        at 500 tokens per parameter instead of 20. Your T4 sustains 3.3 TFLOP/s on this model. Roughly
+        how long is the run?</p>
+        <div class="check__opts">
+          <button class="check__opt">About an hour, since the model has not changed size</button>
+          <button class="check__opt">About 2 h — 25 times the tokens, but training gets cheaper per token</button>
+          <button class="check__opt" data-right>About 50 h, so two days on one free GPU</button>
+          <button class="check__opt">About a year; overtraining is only for data centres</button>
+        </div>
+        <p class="check__why">D = 500 × 14.2e6 = 7.1e9 tokens. C = 6 × 14.2e6 × 7.1e9 = 6.05e17 FLOPs.
+        Divide by 3.3e12 FLOP/s and you get 1.8e5 seconds, which is about 51 hours. Nothing gets cheaper
+        per token: compute is exactly linear in D, so 25 times the tokens is 25 times the 2-hour run.
+        That is the trade small-model teams actually make.</p>
+      </div>
+
+      <div class="terms">
+        <span class="terms__label">Key words from this lesson</span>
+        <dl>
+          <dt>Next-token objective <span class="en">also: causal language modelling, autoregressive generation</span></dt>
+          <dd>Predict the token that follows, at every position of the block at once, and average the losses. A model that generates by feeding its own output back in is called <em>autoregressive</em>; Lessons 11 and 12 use that word for the same behaviour.</dd>
+
+          <dt>Nat</dt>
+          <dd>The unit of a loss measured with natural logarithms, as every loss in this course is. One nat is 1/ln 2 ≈ 1.44 bits.</dd>
+
+          <dt>Tokens per optimizer step</dt>
+          <dd>micro_batch × T × accum_steps × world_size. The one number that decides how a run behaves; the split between the factors is yours to choose.</dd>
+
+          <dt>Automatic mixed precision <span class="en">AMP</span></dt>
+          <dd>Running the matrix multiplies in 16-bit while keeping the master weights and the loss in 32-bit. FP16 also needs a GradScaler; BF16 does not.</dd>
+
+          <dt>Packing</dt>
+          <dd>Joining documents into one stream with a separator token, then cutting it into equal blocks so no position is wasted.</dd>
+
+          <dt>Gradient accumulation</dt>
+          <dd>Running several small batches and adding their gradients before one optimizer step, to get a large effective batch on a small device.</dd>
+
+          <dt>Gradient clipping</dt>
+          <dd>Capping the total length of the gradient vector while keeping its direction, so one bad batch cannot destroy the weights.</dd>
+
+          <dt>Warmup</dt>
+          <dd>Raising the learning rate from near zero over the first few hundred steps, before the real schedule starts.</dd>
+
+          <dt>Cosine decay</dt>
+          <dd>Lowering the learning rate along a cosine curve from its peak to a small floor over the rest of the run.</dd>
+
+          <dt>Tokens per parameter</dt>
+          <dd>Training tokens divided by parameters. About 20 is compute-optimal; on-device models go far higher on purpose.</dd>
+
+          <dt>Prefill</dt>
+          <dd>The first forward pass, which processes the whole prompt at once and fills the cache. Limited by arithmetic speed.</dd>
+
+          <dt>Decode</dt>
+          <dd>Every pass after prefill, producing one token at a time. Limited by memory bandwidth.</dd>
+
+          <dt>Bits per byte <span class="en">bpb</span></dt>
+          <dd>Loss measured per byte of original text instead of per token, so two models with different tokenizers can be compared.</dd>
+        </dl>
+      </div>
+
+      <h2 id="resources">Go deeper</h2>
+
+      <div class="resources">
+        <a class="res" href="https://github.com/karpathy/nanoGPT" target="_blank" rel="noopener">
+          <span class="res__kind" data-kind="code">code</span>
+          <span class="res__body">
+            <span class="res__title">nanoGPT</span>
+            <span class="res__why">The smallest complete pretraining repository worth reading. Open <code>train.py</code> beside your own and compare line by line.</span>
+          </span>
+        </a>
+        <a class="res" href="https://github.com/karpathy/nanochat" target="_blank" rel="noopener">
+          <span class="res__kind" data-kind="code">code</span>
+          <span class="res__body">
+            <span class="res__title">nanochat</span>
+            <span class="res__why">Tokenizer, pretraining, fine-tuning, inference and a web interface in about eight thousand lines. The reference for everything from here to Lesson 06.</span>
+          </span>
+        </a>
+        <a class="res" href="https://huggingface.co/learn/llm-course/chapter1/1" target="_blank" rel="noopener">
+          <span class="res__kind" data-kind="course">course</span>
+          <span class="res__body">
+            <span class="res__title">Hugging Face LLM Course</span>
+            <span class="res__why">Thirteen chapters. Read chapters 5 to 8 when you want the Datasets and Tokenizers libraries explained properly.</span>
+          </span>
+        </a>
+        <a class="res" href="https://github.com/huggingface/transformers/blob/main/MIGRATION_GUIDE_V5.md" target="_blank" rel="noopener">
+          <span class="res__kind" data-kind="docs">docs</span>
+          <span class="res__body">
+            <span class="res__title">transformers v5 migration guide</span>
+            <span class="res__why">Keep this open whenever you copy code from a blog post. Half of the snippets on the internet still use the v4 arguments.</span>
+          </span>
+        </a>
+      </div>
+
+      <div class="callout callout--try">
+        <span class="callout__label">Next</span>
+        <p class="mt-0">You now own a model that continues text, and nothing else. It cannot follow an
+        instruction, because nobody ever showed it one, which is exactly why it is not the model you
+        ship. In <strong>Lesson 05</strong> we take a much larger model somebody else paid to pretrain,
+        and teach it a task by changing under one percent of its weights. That model is the one the rest
+        of the course carries to the phone.</p>
+      </div>
+
+    </article>
+  </main>
+
+  <aside class="toc-rail"></aside>
+</div>
+
+<script src="../assets/js/vendor/gsap.min.js"></script>
+<script src="../assets/js/scene.js"></script>
+<script src="../assets/js/svgkit.js"></script>
+<script src="../data/lessons.js"></script>
+<script src="../data/glossary.js"></script>
+<script src="../assets/js/course.js"></script>
+<script src="../data/narration/04.js"></script>
+<script src="../data/narration/04.timing.js" onerror="void 0"></script>
+<script src="../assets/js/scenes/04.js"></script>
+<script src="../assets/js/film.js"></script>
+</body>
+</html>

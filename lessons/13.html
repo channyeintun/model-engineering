@@ -1,0 +1,1037 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>13 · Full-duplex conversation — Model Engineering</title>
+<meta name="description" content="Speech to speech, honestly: the 200 ms paradox, a real six-thread cascade, cancellation as bookkeeping, and what a phone can actually run offline.">
+<link rel="stylesheet" href="../assets/css/course.css">
+</head>
+<body data-lesson="13">
+
+<div class="shell shell--wide">
+  <nav class="rail" aria-label="Lessons"></nav>
+
+  <main class="main">
+    <article class="prose">
+
+      <header class="lesson-head">
+        <span class="lesson-head__num">13</span>
+        <h1>Full-duplex conversation</h1>
+        <p class="lead">People answer each other faster than they can possibly have planned an answer.
+        That single fact breaks the obvious design, and everything in this lesson is a response to it.
+        By the end you will have a voice assistant that runs with the network switched off — and an
+        honest account of what it can and cannot do.</p>
+        <div class="lesson-head__meta">
+          <span class="chip"><b>Part V</b> · Speech</span>
+          <span class="chip">≈ <b>115 min</b> reading</span>
+          <span class="chip">Project · <b>A fully offline voice assistant</b></span>
+          <span class="chip">Needs · <b>Lessons 07, 08, 09, 10, 11, 12</b></span>
+        </div>
+      </header>
+
+      <section class="outcomes">
+        <h2>By the end you can</h2>
+        <ul>
+          <li>Say why human turn-taking is a <strong>prediction</strong> system, and what that costs a machine.</li>
+          <li>Run a real speech-to-speech cascade, and spot the trap in its shipped defaults.</li>
+          <li>Draw the <strong>thread and queue graph</strong> that makes a cascade streamable.</li>
+          <li>Implement interruption as <strong>version bookkeeping</strong>, not as a race against a timer.</li>
+          <li>Write a <strong>turn-taking budget</strong> and show that policy, not arithmetic, dominates it.</li>
+          <li>Read any latency benchmark and name the three facts it is meaningless without.</li>
+          <li>Say what an <strong>audio-token</strong> model buys, and what it costs.</li>
+          <li>Place any voice agent in the <strong>four-layer taxonomy</strong> of the survey.</li>
+          <li>Test duplex behaviour on <strong>six recorded cases</strong>, never on one turn.</li>
+          <li>Ship a half-duplex offline assistant with fast barge-in, and say out loud what you gave up.</li>
+        </ul>
+      </section>
+
+      <h2 id="paradox"><span class="h-num">13 · 1</span>The 200 millisecond paradox</h2>
+
+      <p>Before any machinery, look at what you are competing with. If you get this number wrong,
+      every later decision is tuned against the wrong target. So start with people.</p>
+
+      <p>Levinson and Torreira measured natural conversation in 2015. The gap between one speaker
+      stopping and the next starting is called the <strong>floor-transfer offset</strong>. Its
+      distribution has one peak, at roughly <strong>200 ms</strong>. Between 51% and 55% of all
+      transitions are under 200 ms. Between 70% and 82% land under 500 ms. Stivers and colleagues
+      found the same peak across ten languages, so this is not an English habit.</p>
+
+      <p>Now the second number, from the same paper. Naming a single word takes a person about
+      <strong>600 ms</strong>. Two words take 740 to 800 ms. A whole sentence takes around 1500 ms.</p>
+
+      <p>Subtract. A reply that arrives 200 ms after silence, but needed 600 ms of planning, must have
+      begun <strong>400 ms before the other person stopped talking</strong>. There is no other way to
+      fit it. People do not detect the end of a turn. They predict it, and they start work early.</p>
+
+      <figure class="scene" data-scene="fd-paradox">
+        <div class="scene__head">
+          <span class="scene__badge">animation</span>
+          <span class="scene__title">A reply that starts before the question ends</span>
+        </div>
+        <div class="scene__stage">
+          <svg viewBox="0 0 900 300" role="img" aria-label="Two speech bars separated by a 200 millisecond gap, with a 600 millisecond planning bar underneath that begins 400 milliseconds before the first speaker finishes">
+            <g id="px-plot"></g>
+          </svg>
+        </div>
+      </figure>
+
+      <p>One more measurement kills the obvious objection. If people talked over each other
+      constantly, prediction would be cheap. They do not. In those recordings, 77% of the signal is
+      one speaker alone, 19.2% is silence, and only <strong>3.8%</strong> is two voices at once.
+      Overlap happens at 30.1% of transfers, with a modal length of 96 ms. People are precise, not
+      sloppy.</p>
+
+      <div class="callout callout--key">
+        <span class="callout__label">Remember this</span>
+        <p class="mt-0">A system that waits for silence and <em>then</em> starts thinking is
+        structurally incapable of human timing. It can be made fast. It can never be on time. Every
+        technique in this lesson either shortens the wait, hides it, or moves work before it.</p>
+      </div>
+
+      <p>Define the number you will be judged on before you build anything.
+      <strong>Voice-to-voice latency</strong> runs from the <em>last audio sample of the user's
+      speech</em> to the <em>first audio sample your speaker plays</em>. Start the clock anywhere
+      later and you have hidden your largest term inside your own instrument.</p>
+
+      <h2 id="run-it"><span class="h-num">13 · 2</span>The pipeline you can run tonight</h2>
+
+      <p>Box diagrams are easy to draw and easy to get wrong. So ground the architecture in a program
+      that exists, that you can install, and whose defaults you can read. Everything in the next three
+      sections is checked against one repository: <strong>huggingface/speech-to-speech</strong>,
+      version 0.2.12, Apache-2.0 licensed.</p>
+
+      <p>A <strong>cascade</strong> is four boxes in a line. Audio comes in. A detector decides where
+      speech starts and stops. <span class="term" data-term="asr">Automatic speech recognition
+      (ASR)</span> turns that audio into text. A large language model (LLM) writes an answer.
+      <span class="term" data-term="tts">Text-to-speech (TTS)</span> turns the answer back into audio.
+      Three of those four boxes are swappable models, and the repository makes that literal: three
+      command-line flags, <code>--stt</code>, <code>--llm_backend</code> and <code>--tts</code>.</p>
+
+      <p>Its command-line interface has three commands, all three below. <code>serve</code> speaks the
+      OpenAI Realtime protocol, <code>talk</code> is a microphone and speaker client, and
+      <code>local</code> composes both.</p>
+
+      <div class="code">
+        <div class="code__head"><span>quickstart.sh</span><span class="lang">shell</span></div>
+        <pre><code># v0.2.12 — the package classifies itself as alpha, so re-read `-h` before copying flags.
+speech-to-speech serve                    # binds 127.0.0.1:8765, not 0.0.0.0
+speech-to-speech talk --url ws://127.0.0.1:8765/v1/realtime
+speech-to-speech local                    # server and client in one process
+
+# Defaults: --stt parakeet-tdt  --llm_backend responses-api  --tts qwen3
+# and the default model name is gpt-5.4-mini, through the OpenAI Responses API.
+# That is a network call. To be genuinely local, point it at your own server:
+speech-to-speech local \
+  --responses_api_base_url http://127.0.0.1:8080/v1 \
+  --responses_api_api_key ''</code></pre>
+      </div>
+
+      <div class="callout callout--pitfall">
+        <span class="callout__label">Read the defaults, not the tagline</span>
+        <p class="mt-0">The repository describes itself as a way to "build local voice agents with
+        open-source models". Its shipped default language-model backend is a remote application
+        programming interface (API). A learner who follows the quickstart and then measures latency is
+        measuring somebody else's data centre, and will not notice. Any
+        screenshot, transcript or timing you publish must show the override above.</p>
+      </div>
+
+      <p>There is a second thing the defaults hide. The pipeline is Apache-2.0, but the models it
+      downloads are not. The default recogniser is CC-BY-4.0, which carries an attribution obligation.
+      Smart Turn is BSD-2-Clause. Shipping a product means honouring the union of those, not the
+      licence on the glue. <strong>The pipeline's licence is not the product's licence.</strong></p>
+
+      <h2 id="threads"><span class="h-num">13 · 3</span>Six threads and eight queues</h2>
+
+      <p>Write a cascade as four function calls and it works — once. It fails the moment you want
+      partial results, because a function call returns when it is finished. Audio arrives at 16,000
+      samples per second whether you are ready or not. So the cascade has to be a
+      <strong>dataflow graph</strong>, not a call stack.</p>
+
+      <p>The repository's abstraction fits on one screen. Every stage is a handler with three things:
+      an input queue, an output queue, and a stop flag. Each handler runs on its own thread and does
+      nothing but drain its input and fill its output.</p>
+
+      <div class="code">
+        <div class="code__head"><span>handler.py</span><span class="lang">python</span></div>
+        <pre><code>class BaseHandler:                              # generic over its input and output types
+    def run(self):
+        while not self.stop_event.is_set():
+            try:
+                item = self.queue_in.get(timeout=0.1)   # timeout, so the flag is polled
+            except Empty:
+                continue
+
+            if item is PIPELINE_END:                    # a sentinel bytes value
+                self.queue_out.put(PIPELINE_END)        # pass it on, then die
+                break
+
+            if not self.should_process_input(item):     # stale work, see 13 - 4
+                continue
+
+            for out in self.process(item):              # a generator, so it can stream
+                self.queue_out.put(self.output_for_queue(out, item))</code></pre>
+      </div>
+
+      <p>Two details there are worth stealing. The <code>timeout=0.1</code> exists so a blocked
+      <code>get</code> cannot ignore the stop flag. And <code>PIPELINE_END</code> is a sentinel placed
+      <em>on the queue</em> — the only way to wake a thread already blocked on it. A softer message,
+      <code>SESSION_END</code>, clears per-conversation state and leaves the thread alive, so a server
+      can reuse the pipeline for the next caller.</p>
+
+      <figure class="scene" data-scene="fd-cascade">
+        <div class="scene__head">
+          <span class="scene__badge">animation</span>
+          <span class="scene__title">Six threads, eight queues, one side channel</span>
+        </div>
+        <div class="scene__stage">
+          <svg viewBox="0 0 900 320" role="img" aria-label="Six handler boxes joined by queue pills in two rows, with a dashed side channel carrying protocol events straight to the client">
+            <g id="cs-plot"></g>
+          </svg>
+        </div>
+      </figure>
+
+      <p>Count the boxes: there are six, not four.
+      <span class="term" data-term="vad">Voice activity detection (VAD)</span> segments the audio.
+      Speech-to-text (STT) transcribes it. The language model answers. Speech synthesis speaks. Those
+      are the four everybody predicts. The two nobody predicts are the interesting ones.</p>
+
+      <p>A <strong>transcription notifier</strong> sits between recognition and the language model and
+      emits protocol events. An <strong>output processor</strong> sits after the language model, and
+      its job is <em>ordering</em>. It places text parts, tool-call events, usage events and the
+      matching synthesis inputs on <em>one</em> queue, so a later part cannot overtake an earlier one.
+      A naive cascade gets this wrong and the user hears a sentence out of order.</p>
+
+      <p>There is also a side channel. A separate text-output queue carries protocol events straight
+      to the transport, bypassing the audio path entirely. That is why the client can be told
+      <code>speech_started</code> before recognition has produced a single token.</p>
+
+      <div class="callout callout--note">
+        <span class="callout__label">Worth knowing</span>
+        <p class="mt-0">These are Python threads, not processes. The global interpreter lock (GIL)
+        normally lets only one Python thread run at a time. This works because every stage sits inside
+        compiled code that releases that lock. The tell is in the source tree: a lock file dedicated to
+        serialising calls into Apple's array framework.</p>
+      </div>
+
+      <p>Trace one frame to make it concrete. The client sends base64-encoded pulse-code modulation
+      (PCM) audio. The server resamples it to 16 kHz and splits it into 512-sample chunks — exactly
+      <strong>32 ms</strong> each. On the way back out, audio is paced as 20 ms frames. Every timing in
+      this lesson is a multiple of one of those two.</p>
+
+      <h2 id="cancel"><span class="h-num">13 · 4</span>Interruption is bookkeeping, not speed</h2>
+
+      <p>Ask an engineer to implement <span class="term" data-term="barge-in">barge-in</span> and they
+      will reach for a stopwatch. It feels like a latency problem: the user spoke, we must stop
+      quickly. That instinct produces races, half-cancelled state, and audio from an answer that was
+      abandoned two turns ago. Barge-in is not a timing problem. It is a versioning problem.</p>
+
+      <p>The fix is one integer. Every unit of work in the graph carries the generation it belongs to.
+      When the user interrupts, the counter increments, and everything stamped with an older
+      generation becomes stale <em>wherever it happens to be</em>. Each handler drops stale items at
+      the top of its loop. The repository states the intent plainly: no timing games required.</p>
+
+      <div class="code">
+        <div class="code__head"><span>cancel.py</span><span class="lang">python</span></div>
+        <pre><code>class CancelScope:
+    """Interruption is a version number. Nothing here looks at a clock."""
+    def __init__(self):
+        self.generation = 0
+
+    def bump(self):                  # the user started speaking over us
+        self.generation += 1
+        return self.generation
+
+    def is_stale(self, gen):
+        return gen != self.generation
+
+def should_process_input(self, item):            # called by every handler
+    return not self.cancel_scope.is_stale(item.cancel_generation)</code></pre>
+      </div>
+
+      <figure class="scene" data-scene="fd-bargein">
+        <div class="scene__head">
+          <span class="scene__badge">animation</span>
+          <span class="scene__title">One counter cancels work in three threads at once</span>
+        </div>
+        <div class="scene__stage">
+          <svg viewBox="0 0 900 330" role="img" aria-label="A timeline where the user speaks over the assistant, followed by three handler boxes whose queued work is discarded when a generation counter increments">
+            <g id="bi-plot"></g>
+          </svg>
+        </div>
+      </figure>
+
+      <p>Now the half that nobody implements. Cancelling generation does not stop <em>sound</em>. Audio
+      already handed to the operating system's output unit is committed and will play. Do the
+      arithmetic: with a 400 ms playback buffer, a cancel decided in 50 ms still leaves 450 ms of your
+      assistant's voice in the user's ear. The decision was correct and the product feels broken.</p>
+
+      <p>So keep the output buffer in the tens of milliseconds, and flush it explicitly. The 20 ms
+      output pacing above bounds how stale a cancel can be. On a phone the audio session is yours to
+      configure, and its default is usually too generous.</p>
+
+      <p>There is a third step, and it is the quietest bug in voice agents. After you stop, the
+      conversation history must contain what the user <em>heard</em>, not what the model
+      <em>generated</em>. Only the audio callback knows that, so count played samples.</p>
+
+      <div class="code">
+        <div class="code__head"><span>bargein.py</span><span class="lang">python</span></div>
+        <pre><code>def barge_in(history, out_q, spoken, played):
+    gen = cancel_scope.bump()                 # 1. every older item is now stale
+    with out_q.mutex:
+        out_q.queue.clear()                   # 2. drop audio that has not been played
+
+    kept, acc = [], 0                         # 3. rebuild from what was actually heard
+    for text, n_samples in spoken:
+        if acc >= played:
+            break                             # this chunk never started playing
+        kept.append(text)                     # partly played: keep it whole
+        acc += n_samples
+
+    history[-1]['content'] = ' '.join(kept)
+    return gen</code></pre>
+      </div>
+
+      <p>A partly played chunk is kept whole. That rounds in the safe direction, because the user did
+      hear its beginning. Skip step 3 and the assistant believes it said things nobody heard, then
+      refers back to them. Nothing crashes, no metric moves, and the conversation quietly stops making
+      sense.</p>
+
+      <h2 id="budget"><span class="h-num">13 · 5</span>Where the latency actually lives</h2>
+
+      <p>Here is the trap that wastes weekends. A learner profiles the model, finds the language model
+      is the biggest number, shrinks it, and the assistant still feels slow. The reason is that the
+      dominant cost is not arithmetic. It is <strong>policy</strong>: how long you deliberately wait to
+      be sure the user has finished.</p>
+
+      <p>Three jobs get conflated, and they are genuinely different.
+      <span class="term" data-term="vad">Voice activity detection</span> asks "is there speech energy
+      in this 32 ms frame?". It is acoustic and stateless.
+      <span class="term" data-term="endpointing">Endpointing</span> asks "has the user stopped?" — a
+      detector plus a silence timer. <strong>Semantic turn detection</strong> asks "is the user
+      finished, or just thinking?". Only the third is a language question.</p>
+
+      <p>The frame-level detector is free. Silero VAD is MIT licensed and accepts 8 kHz or 16 kHz
+      only. Quote the filename, never "the model size": <code>silero_vad.jit</code> is 2,272,526 bytes,
+      <code>silero_vad.onnx</code> is 2,327,524 bytes, and the 16 kHz build
+      <code>silero_vad_16k_op15.onnx</code> is 1,289,603 bytes. Its own README reports under 1 ms to
+      process a 30 ms chunk on a single CPU thread.</p>
+
+      <p>What is not free is the waiting. These are the shipped defaults, and they are the real
+      budget:</p>
+
+      <div class="code">
+        <div class="code__head"><span>turn-taking.sh</span><span class="lang">shell</span></div>
+        <pre><code>--thresh 0.6                        # speech probability needed to count as speech
+--min_silence_ms 64                 # silence before the segment is closed
+--min_speech_ms 384                 # shorter bursts are not a turn
+--min_speech_continuation_ms 192    # speech needed to re-confirm a reopened turn
+--speech_pad_ms 500                 # audio kept from BEFORE the trigger, prepended
+--speculative_reopen_ms 800         # a finished turn stays reopenable this long
+--smart_turn_incomplete_delay_ms 600   # stall before spending compute on a doubtful turn
+--smart_turn_max_wait_ms 2000       # ceiling on that stall</code></pre>
+      </div>
+
+      <p>Read those as arithmetic. In the good case you spend 64 ms deciding the silence is real, then
+      hold the output for 800 ms in case the user resumes. In the doubtful case you deliberately stall
+      for 600 ms before spending any compute at all, under a 2000 ms ceiling. Before the language
+      model emits one token, the policy has already claimed most of a second.</p>
+
+      <p>The 800 ms hold is subtler than it looks. The work starts immediately; only the
+      <em>commit</em> waits, so the hold and the pipeline run in parallel. On a server, where the
+      pipeline finishes in 300 ms, the hold is the entire latency. On a phone it is free.</p>
+
+      <figure class="scene" data-scene="fd-waterfall">
+        <div class="scene__head">
+          <span class="scene__badge">animation</span>
+          <span class="scene__title">A phone budget, stage by stage</span>
+        </div>
+        <div class="scene__stage">
+          <svg viewBox="0 0 900 340" role="img" aria-label="A waterfall chart of eight pipeline stages on a phone summing to about 1250 milliseconds, against a marked 500 millisecond architectural floor and a 1500 millisecond target">
+            <g id="fw-plot"></g>
+          </svg>
+        </div>
+      </figure>
+
+      <div class="callout callout--math">
+        <span class="callout__label">The honest phone budget, added by hand</span>
+        <div class="eq">capture and framing        32 <u>ms</u>
+silence detection          64 <u>ms</u>
+turn decision              40 <u>ms</u>   (budgeted, not measured)
+recognition finalise      150 <u>ms</u>
+first token from the LM   300 <u>ms</u>   (with a working GPU delegate)
+decode to the first clause 400 <u>ms</u>
+first audio chunk out     200 <u>ms</u>
+playback buffer            60 <u>ms</u>
+total                    1246 <u>ms</u></div>
+        <p>Eight rows, each defensible, and none of them the model's fault. The 800 ms commit hold
+        starts at 96 ms, where row two ends, so it runs alongside rows three to eight and finishes at
+        896 ms. On this device it costs nothing.
+        That is why the course target is a <strong>median voice-to-voice under 1.5 s</strong> rather
+        than a number borrowed from a cloud demo.</p>
+      </div>
+
+      <p>That repository publishes <strong>no end-to-end latency table at all</strong>. What it publishes instead is the policy above. When a project gives you a policy
+      rather than a number, the policy is the number.</p>
+
+      <div class="callout callout--note">
+        <span class="callout__label">Worth knowing</span>
+        <p class="mt-0">Lesson 08 showed that generation is
+        <span class="term" data-term="memory bound">memory-bound</span>, so time per token is set by
+        how fast weights can be read. That still holds. But notice its place here. Halving the model
+        might save 200 ms of decode. Removing 500 ms of pointless silence costs nothing and saves
+        more.</p>
+      </div>
+
+      <h2 id="smart-turn"><span class="h-num">13 · 6</span>Semantic endpointing, and its error rate</h2>
+
+      <p>A silence timer has no good value. Set it to 200 ms and you cut people off mid-thought. Set it
+      to 1200 ms and every exchange feels dead. The reason is that pause length carries very little
+      information about whether a sentence is finished. You need something that reads the speech.</p>
+
+      <p>Smart Turn v3.2 is that thing, and it is the best cost-per-benefit trade in this lesson. A
+      Whisper-Tiny encoder — the same encoder you met in Lesson 11 — with a shallow linear
+      <strong>head</strong> on top. A head here is one added output layer, not an attention head from
+      Lesson 03. About 8 million parameters. It classifies "turn complete" or "turn not complete" from the raw
+      waveform, with no transcript at all. It runs <em>after</em> the detector, not instead of it.</p>
+
+      <p>The file is <code>smart-turn-v3.2-cpu.onnx</code>, 8,679,182 bytes — 8.7 MB in
+      <span class="term" data-term="onnx">Open Neural Network Exchange (ONNX)</span> form, under a
+      BSD-2-Clause licence. The GPU build is 32.4 MB. That is small enough to be a rounding error in a
+      phone app.</p>
+
+      <figure class="scene" data-scene="fd-endpoint">
+        <div class="scene__head">
+          <span class="scene__badge">animation</span>
+          <span class="scene__title">The turn that reopened</span>
+        </div>
+        <div class="scene__stage">
+          <svg viewBox="0 0 900 300" role="img" aria-label="A sentence with a pause in the middle: the detector closes the segment, the classifier calls it incomplete, speech resumes inside the delay window, and the turn reopens as a second revision">
+            <g id="ep-plot"></g>
+          </svg>
+        </div>
+      </figure>
+
+      <p>The mechanism is a two-stage handshake. The detector finalises a segment. The classifier then
+      judges it. If it says complete, recognition and the language model start at once and the output
+      commits after the 800 ms hold. If it says incomplete, the system stalls 600 ms before spending
+      compute. If speech resumes during either window, the turn <strong>reopens as a newer
+      revision</strong>: the accumulated audio is re-emitted, and the previous revision's work is
+      discarded before it can reach the user.</p>
+
+      <p>Now the honest half, which the press release will not tell you. The repository ships its own
+      benchmark file. Over <strong>31,527 samples in 23 languages, overall accuracy is 92.63%</strong>,
+      with precision 0.909 and recall 0.947. The false positive rate — turns it declares finished that
+      were not — is 4.73%. The false negative rate is 2.64%.</p>
+
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Language</th><th>Accuracy</th><th>Misjudged turns</th></tr></thead>
+          <tbody>
+            <tr><td>Korean</td><td class="num">96.96%</td><td>1 in 33</td></tr>
+            <tr><td>English</td><td class="num">94.26%</td><td>1 in 17</td></tr>
+            <tr><td>Spanish</td><td class="num">89.57%</td><td>1 in 10</td></tr>
+            <tr><td>Chinese</td><td class="num">85.79%</td><td>1 in 7</td></tr>
+            <tr><td>Vietnamese</td><td class="num">79.38%</td><td>1 in 5</td></tr>
+            <tr><td><strong>Overall</strong></td><td class="num"><strong>92.63%</strong></td><td><strong>1 in 13</strong></td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>Read that table as a design constraint, not as a score. One turn in thirteen is misjudged on
+      average, and closer to one in five for the worst-served language. <strong>The reopen window is
+      not defensive coding. It is load-bearing.</strong> The architecture assumes a classifier that is
+      wrong regularly, and a user who corrects it by carrying on.</p>
+
+      <div class="callout callout--pitfall">
+        <span class="callout__label">Which number is checkable</span>
+        <p class="mt-0">You will see "12 ms on CPU" quoted for this model. That figure is the title of
+        a blog post by the team that built it. The model card itself measures nothing: no hardware, no
+        thread count, no method. A competing secondary source says 65 ms. Treat the latency as
+        vendor-reported, in the tens of milliseconds, on unstated hardware. The size and the accuracy
+        are published as files you can download and re-run. Prefer numbers you can re-run.</p>
+      </div>
+
+      <p>One consequence for your own tuning. When a semantic classifier is doing the deciding, the
+      detector's silence timer must come <em>down</em>, to something like the 64 ms default above. Its
+      job is no longer to judge the turn. Its job is only to wake the classifier. Leave the old
+      800 ms <em>silence</em> timer in place and you pay for both while improving nothing. That is a
+      different 800 from 13 · 5's commit hold. A hold runs in parallel and costs a phone nothing. A
+      silence timer runs in series and delays every turn.</p>
+
+      <h2 id="benchmarks"><span class="h-num">13 · 7</span>How to read a benchmark without being lied to</h2>
+
+      <p>Everything after this point is somebody's published number, so stop and learn to read them.
+      This is not scepticism for its own sake. Two choices in your capstone flip completely depending
+      on which benchmark you believe.</p>
+
+      <div class="callout callout--math">
+        <span class="callout__label">One definition, used once</span>
+        <div class="eq">real-time factor  =  compute time  /  audio duration</div>
+        <p><em>Compute time</em> is the wall-clock seconds the model spent working. <em>Audio
+        duration</em> is the seconds of sound it produced or consumed. Lower is better. Exactly 1.0
+        means the model takes one second to handle one second of audio, so it can just barely keep
+        up.</p>
+      </div>
+
+      <p>Now watch that definition break. The speech-to-speech repository's own synthesis benchmark
+      computes the ratio <em>upside down</em>, as audio divided by time, so higher is better there.
+      Moonshine reports a third thing, "compute load", where anything above 100% cannot keep up: on an
+      Apple M3 laptop, Whisper Large v3 scores 330.65%. Same field, three conventions, one figure that
+      means "good" in one and "unusable" in another.</p>
+
+      <p>Here is the worked example that matters most to your project. Every row below comes from one
+      controlled run of the sherpa-onnx runtime, on a MacBook Pro, with the thread count pinned to
+      <strong>one</strong>.</p>
+
+      <figure class="scene" data-scene="fd-rtf">
+        <div class="scene__head">
+          <span class="scene__badge">animation</span>
+          <span class="scene__title">File size does not predict speed</span>
+        </div>
+        <div class="scene__stage">
+          <svg viewBox="0 0 900 320" role="img" aria-label="Seven text-to-speech builds ranked by file size on the left and by real-time factor on the right, with connecting lines showing the order does not survive">
+            <g id="rt-plot"></g>
+          </svg>
+        </div>
+      </figure>
+
+      <p>Read the two Kokoro rows. Kokoro has 82 million parameters — the largest model in that
+      table — and it is the only one that <strong>cannot keep up on a single core</strong>. A
+      real-time factor of 1.128 means ten seconds of speech take 11.3 seconds to synthesise — on a
+      laptop core, before any phone penalty applies. An assistant built on it falls further behind the
+      longer it talks. Nor is big always slow: Matcha at 122 MB scores 0.118, Kitten Nano at 23 MB
+      scores 0.389.</p>
+
+      <p>Then read the int8 row, because it overturns something the whole course has implied. Quantizing
+      Kokoro to int8 cut it from 330 MB to 128 MB and made it <strong>1.75 times slower</strong>. Piper
+      shows the same shape: fp32 at 0.114, fp16 at 0.123, int8 at 0.320. Lesson 07 promised smaller.
+      Lesson 08 explained why smaller is usually faster — fewer bytes to read. Neither promised that a
+      runtime has fast kernels for those operations on that chip. <strong>Quantization buys bytes.
+      It buys milliseconds only when the kernels exist.</strong></p>
+
+      <div class="callout callout--pitfall">
+        <span class="callout__label">The same model, two honest measurements</span>
+        <p class="mt-0">Kyutai reports Pocket TTS at about 6 times real time, with roughly 200 ms to
+        the first audio chunk. That was a MacBook Air M4 CPU, 2 cores, one stream at a time. Picovoice
+        reports the same model at 1,670 ms to first speech. That was an AMD Ryzen 7 5700X, under about
+        200 simulated concurrent interactions, while benchmarking against the vendor's own product.
+        Both are probably honest. They are not the same workload, and neither is a phone. Do not
+        average them. Do not pick the flattering one.</p>
+      </div>
+
+      <p>Carry one rule out of this section. <strong>A latency number without hardware, thread count
+      and concurrency is not a number.</strong> Nearly every impressive figure in this field was
+      measured on a laptop, a 32-core server, or a data-centre graphics card.</p>
+
+      <h2 id="audio-tokens"><span class="h-num">13 · 8</span>The other family: audio tokens</h2>
+
+      <p>The cascade you have been building throws three things away, and the people who built the
+      alternative said so precisely. Pipelines "cannot emulate the experience of real conversations".
+      First, their complexity induces multi-second latency. Second, text as the intermediate modality
+      loses non-linguistic information such as emotion and non-speech sounds. Third, they "rely on a
+      segmentation into speaker turns, which does not take into account overlapping speech,
+      interruptions and interjections".</p>
+
+      <p>That last clause is the deep one. In a cascade the turn is a load-bearing beam. In the
+      alternative it does not exist. The alternative is Moshi, and it has four separable pieces that
+      are usually described as one.</p>
+
+      <p><strong>One: a neural audio codec.</strong> Mimi turns 24 kHz audio into tokens at
+      <strong>12.5 Hz</strong> — one frame every 80 ms — at about 1.1 kbps, fully streaming. Its
+      latency is exactly its frame size. It uses residual vector quantization (RVQ), where several
+      codebooks each encode what the previous ones missed. This is what makes audio cheap enough for a
+      language model to eat.</p>
+
+      <p><strong>Two: parallel streams.</strong> Its own speech and the user's speech are separate
+      streams on one clock. Every frame it consumes a user token and emits its own. There is no turn
+      boundary anywhere in the architecture, so overlap needs no special case.</p>
+
+      <p><strong>Three: an inner monologue.</strong> It also predicts time-aligned text tokens, one
+      step <em>ahead</em> of the audio. That is a cascade folded inside a single forward pass, and it
+      is what keeps the speech coherent.</p>
+
+      <p><strong>Four: a hierarchical split.</strong> A large temporal transformer steps once per
+      frame; a small depth transformer predicts the codebooks inside that frame. That keeps the
+      sequence short instead of multiplying its length by the codebook count.</p>
+
+      <p>The reported latency is 160 ms in theory: one 80 ms frame plus 80 ms of acoustic delay. In
+      practice it goes as low as 200 ms, on an L4 data-centre graphics card. Note the hardware in that
+      sentence. It is the whole reason section 13 · 11 exists.</p>
+
+      <div class="callout callout--key">
+        <span class="callout__label">Remember this</span>
+        <p class="mt-0">Do the duty-cycle arithmetic. 12.5 frames per second times 8 codebooks is
+        <strong>100 audio tokens generated and 100 consumed, every second, forever</strong>. A cascade
+        is bursty: it is idle while you speak and idle while it plays. An audio-token model never
+        idles. On a phone, that difference is thermal, not arithmetic.</p>
+      </div>
+
+      <p>There is a quality cost too, and it should temper any excitement. In one published comparison
+      table, Moshi at 7 billion parameters scores 29.51 on VoiceBench, against 63.57 for a 3 billion
+      parameter cascade-style model. Training a language model on audio tokens appears to cost it a
+      great deal of raw intelligence.</p>
+
+      <h2 id="layers"><span class="h-num">13 · 9</span>Four places to put the duplex decision</h2>
+
+      <p>You will meet dozens of systems that call themselves full-duplex, and the label tells you
+      almost nothing. One question from the 2026 full-duplex survey sorts all of them: <strong>where
+      does the duplex decision live?</strong></p>
+
+      <figure class="scene" data-scene="fd-layers">
+        <div class="scene__head">
+          <span class="scene__badge">animation</span>
+          <span class="scene__title">Outside the model, on its hidden state, in its tokens, or nowhere yet</span>
+        </div>
+        <div class="scene__stage">
+          <svg viewBox="0 0 900 320" role="img" aria-label="Four panels showing the duplex decision placed outside the model, attached to its hidden state, inside its token sequence, and in a shared latent that has no published system">
+            <g id="ly-plot"></g>
+          </svg>
+        </div>
+      </figure>
+
+      <ul>
+        <li><strong>L0, module level.</strong> An external scheduler outside the model decides. This is
+            FireRedChat, FlexDuo, X-Talk, SoulX-Duplug and every detector-plus-cancel-button design —
+            including yours.</li>
+        <li><strong>L1, hidden-state level.</strong> A small added layer reads the model's hidden state
+            and predicts the conversational state from it. MinMo and Freeze-Omni sit here.</li>
+        <li><strong>L2, token level.</strong> Duplex is encoded in the token sequence itself. Moshi,
+            OmniFlatten, SyncLLM and Mini-Omni2.</li>
+        <li><strong>L3, representation level.</strong> A shared latent across both streams.
+            <em>No published system exists.</em></li>
+      </ul>
+
+      <p>The survey pairs this with a state machine of five states — idle, listen, speak, wait, dual.
+      Use them as a checklist. Detection is idle to listen. Endpointing is listen to speak. The
+      <em>wait</em> state is exactly the one a silence timer cannot represent. Most bugs in voice
+      agents are a missing transition.</p>
+
+      <p>It also draws a distinction worth adopting. <strong>Substantive</strong> full-duplex means
+      incoming audio causally changes the outgoing stream right now. <strong>Apparent</strong>
+      full-duplex means two concurrent threads that look simultaneous but cannot actually react
+      mid-utterance. Most shipped voice agents in 2025 and 2026 are the second kind. That is a
+      legitimate architecture. It is not the same thing as Moshi, and calling it the same is how
+      roadmaps get written that cannot be delivered.</p>
+
+      <div class="callout callout--key">
+        <span class="callout__label">The floor, stated exactly</span>
+        <p class="mt-0">The survey writes that L0 systems "share a structural latency floor". Even when
+        the decision module fires in about 100 ms, it says, the language model forward pass plus
+        first-chunk synthesis pushes the response delay "to roughly 500 ms". Read
+        <strong>floor</strong>, not target. It is an architectural argument, and it assumes a
+        server-class forward pass. A phone running a 1 to 2 billion parameter model lands at 0.9 to
+        2.0 s. Nobody reaches 500 ms on a handset in 2026.</p>
+      </div>
+
+      <p>One L1 design deserves your attention, because it is the most portable idea in the field.
+      Freeze-Omni takes a frozen 7 billion parameter <strong>backbone</strong> — the main language
+      model, reused unchanged — and adds a classification head on its last layer, predicting a
+      chunk-level state. It trains on 60,000 multi-round text dialogues using 8 graphics cards. So it
+      buys duplex behaviour without retraining the brain. Swap the backbone for the model you
+      fine-tuned in Lesson 05 and the recipe still makes sense.</p>
+
+      <h2 id="failures"><span class="h-num">13 · 10</span>What breaks, and the test plan that catches it</h2>
+
+      <p>Everything so far assumed the microphone hears the user. It does not. It hears the room, which
+      contains your own loudspeaker. Get this wrong and none of the rest works, so start at the
+      physical layer.</p>
+
+      <p>Without <strong>acoustic echo cancellation (AEC)</strong>, the detector fires on the
+      assistant's own voice, and the assistant interrupts itself forever. The signature is sentences
+      that die after two or three words, over and over. Cancellation works because you know exactly what
+      samples you sent to the speaker, so you can predict the echo and subtract it.</p>
+
+      <p>But note where it is weakest. <strong>Double-talk</strong> — both sides speaking at once — is
+      the hardest case for any canceller, because it must remove the echo while preserving the user's
+      overlapping voice. That is a separation problem, not a subtraction problem. A duplex assistant
+      lives permanently inside the case its canceller handles worst.</p>
+
+      <div class="callout callout--pitfall">
+        <span class="callout__label">The headphone self-deception</span>
+        <p class="mt-0">Headphones remove the echo path acoustically. So every duplex bug in this
+        section disappears the moment you plug them in, which makes headphones the best diagnostic you
+        have and the worst demo you can give. A barge-in bug that vanishes with headphones is
+        acoustic, not logical. Demo on the loudspeaker, in a room, with someone else talking. Every
+        platform offers echo cancellation, hardware support is not guaranteed on every device, and you
+        must budget for a software fallback.</p>
+      </div>
+
+      <p>The decision layer has its own failure list. Not every overlap is a barge-in. The evaluation
+      suites separate four cases that need four different responses. The user genuinely interrupting.
+      The user backchannelling — "mm-hm", meaning <em>keep going</em>. The user talking to somebody
+      else. And background speech from a television. Stop for the first. Continue for the other
+      three.</p>
+
+      <p>Now read published results as a <em>trade-off surface</em>, not a leaderboard. The field's
+      central finding is that nobody is both fast and polite.</p>
+
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>System</th><th>Fast at</th><th>Bad at</th></tr></thead>
+          <tbody>
+            <tr><td>Moshi</td><td>0.265 s to take a turn, 0.257 s to stop</td><td>grabs the floor at 0.985 of pauses; "mm-hm" derails it 94% of the time</td></tr>
+            <tr><td>Gemini Live</td><td>takes only 0.255 of pauses, answers sensibly (3.376 of 5)</td><td>1.301 s to respond</td></tr>
+            <tr><td>GPT-4o Realtime</td><td>stops in 0.23 s when interrupted</td><td>answers background speech 93% of the time</td></tr>
+            <tr><td>Nova Sonic</td><td>ignores 99% of background speech</td><td>ignores 76% of genuine interruptions</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>Those numbers use the <strong>takeover rate (TOR)</strong>: the fraction of opportunities on
+      which the system claims the floor. You want it low during a pause and high during a real
+      handover, which is precisely why one threshold cannot satisfy both.</p>
+
+      <p>A third suite tested chained tool-use tasks with real disfluent human speech. The cascade row
+      is the one to sit with. A Whisper to GPT-4o to speech cascade took its turn <strong>100% of the
+      time</strong> — perfect politeness, by construction, because it cannot speak while listening. It
+      finished those multi-step tasks in 10.12 s, against 6.89 s for the best commercial duplex system.
+      That 10.12 s is <em>task-completion</em> latency across chained API calls. It is not how long the
+      cascade takes to say hello. Misread it and the whole capstone looks absurd.</p>
+
+      <p>That suite measures one more thing you should steal: <strong>filler rate</strong>. Ultravox
+      emits a content-free "let me check that for you" before 88.0% of its answers. Filler is a
+      legitimate technique for hiding thinking time. Measure it, or you will mistake it for
+      responsiveness.</p>
+
+      <p>Turn the failures into a test plan. Six cases cover most of it: a standard turn; a
+      <strong>latched</strong> turn; a cooperative barge-in; a backchannel; a third party talking in
+      the room; and a hesitation with a long silence. Latched means the next speaker starts with no
+      gap at all. Record all six, replay them on every change, and never evaluate
+      duplex on a single turn — boundaries blur across rounds even when round one looked perfect.</p>
+
+      <h2 id="verdict"><span class="h-num">13 · 11</span>The honest verdict, and the capstone</h2>
+
+      <p>Now walk the pipeline and mark each stage solved or not solved on phone silicon, with the
+      measurement and the hardware attached. The shape of the answer is not what most people expect.</p>
+
+      <p><strong>Recognition is solved.</strong> Take Qualcomm's published figures for a Whisper-Tiny
+      build on the neural processing unit (NPU). The encoder takes 15.24 ms on a Snapdragon 8 Elite,
+      the decoder about 1.5 ms per token, and peak memory is 20 to 27 MB — for a 30-second window. The
+      caveat from Lesson 11 still applies: Whisper is not streaming, so streaming Whisper is a chunking
+      trick. For genuine streaming use a Zipformer transducer at 68 MB int8, or the Moonshine
+      streaming-tiny build of Lesson 11: 34 million parameters, 4.49% word error rate (WER) on
+      LibriSpeech clean. Its 50 ms response latency was measured on an M3 laptop, not a phone.</p>
+
+      <p><strong>Detection and turn-taking are solved.</strong> 2.3 MB plus 8.7 MB, single-digit to
+      tens of milliseconds. This is the cheapest naturalness you will ever buy.</p>
+
+      <p><strong>Synthesis is solved if you choose correctly</strong>, which is section 13 · 7's whole
+      point. Piper at real-time factor 0.114 and 75 MB, or Pocket TTS at 100 million parameters, MIT
+      licensed, six languages, with voice cloning. Not Kokoro on one thread. Check the licence too:
+      Piper is GPL-3.0, which matters for a commercial app.</p>
+
+      <p><strong>The language model is the bottleneck, in three ways at once.</strong> Time to first
+      token, decode rate, and resident memory. And the ratio between backends is the durable lesson:</p>
+
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>A 1B model, two backends</th><th>Prefill</th><th>Decode</th><th>Memory</th></tr></thead>
+          <tbody>
+            <tr><td>Galaxy S25 Ultra, NPU, 4-bit quantization-aware training (QAT)</td><td class="num">5,836 tok/s</td><td class="num">85 tok/s</td><td class="num">626 MB</td></tr>
+            <tr><td>Same family, phone CPU, int4</td><td class="num">~322 tok/s</td><td class="num">47 tok/s</td><td class="num">1,138 MB</td></tr>
+            <tr><td><strong>Ratio</strong></td><td class="num"><strong>≈ 18×</strong></td><td class="num"><strong>≈ 1.8×</strong></td><td></td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>Eighteen times on prefill, but under two times on decode. That is Lesson 08 again: decode is
+      memory-bandwidth-bound, so a faster processor barely helps — which is also why vendor benchmarks
+      lead with prefill. A second measurement shows the fragility: a 2,583 MB model reaches 0.3 s to
+      first token on an iPhone 17 Pro GPU and 1.9 s on its CPU. A silently failed delegate turns your
+      good demo into your bad one. Ship a CPU fallback and measure it.</p>
+
+      <div class="callout callout--key">
+        <span class="callout__label">The verdict, stated plainly</span>
+        <p class="mt-0">A half-duplex offline cascade with fast barge-in is buildable today, on a
+        phone, with no network. The 500 ms figure is an architectural floor assuming a server-class
+        forward pass. A phone lands at 0.9 to 2.0 s. <strong>No shipped product runs full-duplex
+        Moshi-class speech-to-speech on a phone.</strong> The reference implementation's supported path
+        assumes a 24 GB graphics card, and its iOS app calls itself a proof of
+        concept. Nobody publishes phone real-time factor, memory or thermals for a 7 billion parameter
+        model running in both directions at 12.5 frames per second. Apple and Google both ship
+        on-device transcription and on-device text generation. Neither ships an on-device
+        conversational loop that speaks — which is exactly the gap you are about to fill.</p>
+      </div>
+
+      <p>So name the trade out loud. <strong>Your capstone wins on manners, not on timing.</strong> It
+      handles a thinking pause, stops when interrupted, ignores the television, and never talks over
+      its user. And it answers about a second later than a cloud assistant. That is a design decision,
+      not a bug, and it belongs in your README as one.</p>
+
+      <div class="project">
+        <span class="project__label">Project 13</span>
+        <h3>A fully offline voice assistant</h3>
+        <p>This is the capstone of the whole course, and you will train nothing. The brain is
+        <strong>the model you fine-tuned in Lesson 05</strong>, quantized to int4 in Lesson 07 and
+        exported in Lesson 09. The ears are the streaming recogniser from Lesson 11. The voice is
+        Piper or Pocket TTS — <em>not</em> Kokoro, for the reason section 13 · 7 measured. Your job is
+        to connect them, give each stage a millisecond budget, and prove whether you met it.</p>
+
+        <figure class="scene" data-scene="fd-offline">
+          <div class="scene__head">
+            <span class="scene__badge">animation</span>
+            <span class="scene__title">The whole system, with the network removed</span>
+          </div>
+          <div class="scene__stage">
+            <svg viewBox="0 0 900 300" role="img" aria-label="A device outline containing microphone, detector, turn classifier, streaming recogniser, language model, streaming synthesiser and speaker, with a crossed-out server outside it">
+              <g id="of-plot"></g>
+            </svg>
+          </div>
+        </figure>
+
+        <ol class="steps">
+          <li>Capture 16 kHz mono audio in 512-sample chunks and run Silero VAD on every chunk. Print
+              the speech probability and confirm it costs under a millisecond.</li>
+          <li>Set the silence threshold low — 64 ms is the reference default — and use it only to wake
+              the turn classifier. Log every verdict with the audio that produced it.</li>
+          <li>Add the reopen window. If speech resumes within your hold, discard the in-flight work and
+              re-emit the accumulated audio as a new revision. Section 13 · 6 explains why this is not
+              optional.</li>
+          <li>Run a genuinely streaming recogniser and forward only the stable prefix — the part of the
+              transcript that has stopped changing. A Zipformer transducer through
+              <code>sherpa-onnx</code> is about 68 MB at int8.</li>
+          <li>Generate with the model you fine-tuned in Lesson 05, at int4, through the runtime you
+              exported in Lesson 09. Speak the first clause as soon as a sentence boundary appears.</li>
+          <li>Implement barge-in as three steps in order: bump the generation counter, flush the
+              playback buffer, and truncate the assistant's message to what was actually played.</li>
+        </ol>
+
+        <p>On disk: 2.3 MB of detector, 8.7 MB of turn classifier, 68 MB of recogniser, 191 MB of
+        language model and 75 MB of voice. That is <strong>345 MB</strong>, an app you can genuinely
+        ship. The 191 MB is Lesson 09's int4 export. Resident memory is the number that
+        will kill you: design for 2 GB, and gate anything above 3 GB by device tier.</p>
+
+        <p><strong>Then measure it honestly.</strong> One timestamp is the whole experiment. The
+        detector reports the end of speech only after its silence window has elapsed, and it hands you
+        a sample index rather than a clock reading. So convert: record the wall clock when capture
+        opens, then add the sample index divided by 16,000. Timing from the event instead hides the
+        wait inside your own instrument.</p>
+
+        <div class="code">
+          <div class="code__head"><span>measure.py</span><span class="lang">python</span></div>
+          <pre><code>import time
+
+class V2V:
+    """Voice-to-voice latency. The clock starts at the user's last speech sample."""
+    def __init__(self, t_stream_start):
+        self.t_stream_start = t_stream_start          # perf_counter() when capture opened
+        self.t0, self.samples = None, []
+
+    def on_user_speech_end(self, end_index):          # a sample index, not an event time
+        self.t0 = self.t_stream_start + end_index / 16000
+
+    def on_first_output_sample(self):                 # when audio reaches the device
+        if self.t0 is not None:
+            self.samples.append((time.perf_counter() - self.t0) * 1000)
+            self.t0 = None
+
+    def report(self):
+        s = sorted(self.samples)
+        print(f"n={len(s)} median={s[len(s)//2]:.0f} ms p90={s[int(len(s)*0.9)]:.0f} ms")</code></pre>
+        </div>
+
+        <p>Report the median <em>and</em> the 90th percentile. A user feels the slow replies, not the
+        average one. Then run the six test cases from section 13 · 10 and break it on purpose:</p>
+
+        <ul>
+          <li>Raise the <em>silence</em> threshold from 64 ms to 800 ms — the timer in series, not the
+              parallel commit hold. How far did the median move? That gap is the size of the prize.</li>
+          <li>Remove phrase chunking and speak only complete answers. Watch time to first audio grow
+              with answer length.</li>
+          <li>Switch the synthesiser to a build with a real-time factor above 1.0. Listen to it fall
+              behind mid-sentence.</li>
+          <li>Disable echo cancellation on the loudspeaker. Count the self-interruptions in one
+              minute.</li>
+          <li>Interrupt mid-sentence, then ask "what did you just say?". If it names something you
+              never heard, step 6 above is missing.</li>
+          <li>Read a phone number aloud with a pause in the middle, in every language you support. This
+              is where the 79.38% row lives.</li>
+        </ul>
+
+        <p><strong>When you miss the budget</strong>, cut in this order. The silence wait first, then
+        the playback buffer, then finer synthesis chunks. Then check that your GPU or NPU delegate is
+        actually being used. Shrinking the model comes last, because it is the only change that costs
+        quality.</p>
+
+        <dl class="project__grid">
+          <div class="project__stat"><dt>Data</dt><dd>None — no training in this lesson</dd></div>
+          <div class="project__stat"><dt>Size</dt><dd>345 MB on disk, ~2 GB resident</dd></div>
+          <div class="project__stat"><dt>Time</dt><dd>An evening of wiring, a week of tuning, one evening to measure</dd></div>
+          <div class="project__stat"><dt>Target</dt><dd>Median voice-to-voice under 1.5 s, offline</dd></div>
+        </dl>
+      </div>
+
+      <h2 id="check">Check yourself</h2>
+
+      <div class="check">
+        <p class="check__q">Your phone cascade costs: capture 32 ms, silence detection 64, turn
+        decision 40, recognition finalise 150, first token 300, decode to the first clause 400, first
+        audio chunk 200, playback buffer 60. The classifier says the turn is complete, so work starts
+        at once while the 800 ms commit hold runs alongside it. What is the time to first audio?</p>
+        <div class="check__opts">
+          <button class="check__opt">2046 ms — the hold is added to the pipeline</button>
+          <button class="check__opt" data-right>1246 ms — the hold finished at 896 ms, long before the audio was ready</button>
+          <button class="check__opt">896 ms — the hold is the only term that matters</button>
+          <button class="check__opt">446 ms — the hold replaces the four stages it overlaps</button>
+        </div>
+        <p class="check__why">The eight stages add to 1246 ms. The hold starts once silence is
+        detected, at 96 ms, and ends at 896 ms, so it is already over. On a server whose pipeline
+        finishes in 300 ms the same hold would <em>be</em> the latency.</p>
+      </div>
+
+      <div class="check">
+        <p class="check__q">Lesson 12 asked for a voice under 100 MB. A colleague proposes Kokoro at
+        int8: 128 MB on disk, down from 330 MB at fp32. On one CPU thread its real-time factor is
+        1.972. What happens when you ship it?</p>
+        <div class="check__opts">
+          <button class="check__opt">It synthesises 1.972 times faster than real time, so it is the best choice in the table</button>
+          <button class="check__opt">Nothing — real-time factor only matters when you batch many streams on a server</button>
+          <button class="check__opt" data-right>Ten seconds of speech take about 20 seconds to synthesise, so it falls further behind the longer it talks</button>
+          <button class="check__opt">It uses 1.972 times more memory than the fp32 build, which is the real problem</button>
+        </div>
+        <p class="check__why">Real-time factor is compute time divided by audio duration, so 1.972
+        means roughly twice as long as the sound it produces. Note the second trap too: the int8 build
+        is 2.6 times smaller on disk than the fp32 build and 1.75 times slower, so the file size
+        predicted the speed backwards.</p>
+      </div>
+
+      <div class="check">
+        <p class="check__q">Your Vietnamese testers complain that the assistant cuts them off
+        mid-sentence. The turn classifier scores 92.63% overall but 79.38% on Vietnamese, and its false
+        positive rate is 4.73%. Your reopen window is currently disabled to save compute. What is the
+        right fix?</p>
+        <div class="check__opts">
+          <button class="check__opt">Replace the classifier with a 1.2 second silence timer, which has no error rate</button>
+          <button class="check__opt">Raise the detector's speech threshold from 0.6 to 0.9 so it triggers less often</button>
+          <button class="check__opt">Retrain the classifier on Vietnamese before shipping anything else</button>
+          <button class="check__opt" data-right>Turn the reopen window back on, because the architecture must survive a classifier that is wrong about one turn in five</button>
+        </div>
+        <p class="check__why">At 79.38% accuracy roughly one turn in five is misjudged, so no threshold
+        makes the classifier reliable. The reopen window is what makes a wrong verdict recoverable: the
+        user simply keeps talking, the turn reopens as a new revision, and the abandoned work is
+        discarded before it is heard. Retraining may help later, but the architecture has to tolerate
+        error either way.</p>
+      </div>
+
+      <div class="terms">
+        <span class="terms__label">Key words from this lesson</span>
+        <dl>
+          <dt>Floor-transfer offset</dt>
+          <dd>The gap between one speaker stopping and the next starting. It peaks near 200 ms.</dd>
+
+          <dt>Voice-to-voice latency <span class="en">also: response latency</span></dt>
+          <dd>Time from the user's last speech sample to the first sample your speaker plays.</dd>
+
+          <dt>Endpointing <span class="en">also: end-of-turn detection</span></dt>
+          <dd>Deciding that the person has finished, not merely paused. A detector plus a timer.</dd>
+
+          <dt>Semantic turn detection</dt>
+          <dd>Judging turn completion from the speech itself, not from the length of the silence.</dd>
+
+          <dt>Reopen window</dt>
+          <dd>A short period after a turn closes. Speech resuming inside it reopens the turn and discards the work in flight.</dd>
+
+          <dt>Generation counter <span class="en">also: cancel scope</span></dt>
+          <dd>The version number every unit of work carries, so an interruption invalidates all older work wherever it sits.</dd>
+
+          <dt>Barge-in</dt>
+          <dd>The user speaks while the assistant is speaking, and the assistant stops, flushes and truncates.</dd>
+
+          <dt>Backchannel</dt>
+          <dd>A short sound such as "mm-hm" that means "keep going". It must not be treated as an interruption.</dd>
+
+          <dt>Acoustic echo cancellation <span class="en">often written AEC</span></dt>
+          <dd>Subtracting your own output from the microphone signal, using the samples you sent to the speaker.</dd>
+
+          <dt>Double-talk</dt>
+          <dd>Both sides speaking at once. The case a canceller handles worst, and the case duplex lives in.</dd>
+
+          <dt>Real-time factor</dt>
+          <dd>Compute time divided by audio duration. Lower is better; 1.0 is exactly real time. Always quote hardware, threads and concurrency with it.</dd>
+
+          <dt>Takeover rate <span class="en">often written TOR</span></dt>
+          <dd>How often a system claims the floor when it could. Low during pauses, high at real handovers.</dd>
+
+          <dt>Substantive vs apparent full-duplex</dt>
+          <dd>Whether incoming audio really changes the outgoing stream now, or two threads merely run side by side.</dd>
+
+          <dt>Inner monologue</dt>
+          <dd>An audio-token model predicting the text of its own speech, one step ahead of the audio.</dd>
+        </dl>
+      </div>
+
+      <h2 id="resources">Go deeper</h2>
+
+      <div class="resources">
+        <a class="res" href="https://github.com/huggingface/speech-to-speech" target="_blank" rel="noopener">
+          <span class="res__kind" data-kind="code">code</span>
+          <span class="res__body">
+            <span class="res__title">huggingface/speech-to-speech</span>
+            <span class="res__why">The cascade this lesson is built on. Read baseHandler.py and thread_manager.py first — together they are under 100 lines and contain the whole idea.</span>
+          </span>
+        </a>
+        <a class="res" href="https://pmc.ncbi.nlm.nih.gov/articles/PMC4464110/" target="_blank" rel="noopener">
+          <span class="res__kind" data-kind="paper">paper</span>
+          <span class="res__body">
+            <span class="res__title">Levinson &amp; Torreira — Timing in turn-taking</span>
+            <span class="res__why">Where the 200 ms gap and the 600 ms planning cost both come from. Read it when you want to argue about latency targets with data.</span>
+          </span>
+        </a>
+        <a class="res" href="https://huggingface.co/pipecat-ai/smart-turn-v3" target="_blank" rel="noopener">
+          <span class="res__kind" data-kind="code">code</span>
+          <span class="res__body">
+            <span class="res__title">Smart Turn v3</span>
+            <span class="res__why">Open weights and per-language benchmark files. Download the benchmark table before you trust any claim about it, including this lesson's.</span>
+          </span>
+        </a>
+        <a class="res" href="https://arxiv.org/abs/2606.19453" target="_blank" rel="noopener">
+          <span class="res__kind" data-kind="paper">paper</span>
+          <span class="res__body">
+            <span class="res__title">A Survey of Full-Duplex Spoken Dialogue Systems</span>
+            <span class="res__why">The four-layer taxonomy, the five-state machine and the 500 ms architectural floor. The one paper to read if you read one.</span>
+          </span>
+        </a>
+        <a class="res" href="https://arxiv.org/abs/2604.04847" target="_blank" rel="noopener">
+          <span class="res__kind" data-kind="paper">paper</span>
+          <span class="res__body">
+            <span class="res__title">Full-Duplex-Bench v3</span>
+            <span class="res__why">Disfluent human speech and chained tool use. Cite benchmarks by arXiv number — two unrelated suites in this field share an abbreviation.</span>
+          </span>
+        </a>
+        <a class="res" href="https://github.com/kyutai-labs/moshi" target="_blank" rel="noopener">
+          <span class="res__kind" data-kind="code">code</span>
+          <span class="res__body">
+            <span class="res__title">Moshi and the Mimi codec</span>
+            <span class="res__why">The reference token-level design. Read its README's prose against its own artefact table — they disagree about quantization, which is a lesson in itself.</span>
+          </span>
+        </a>
+      </div>
+
+      <div class="callout callout--try">
+        <span class="callout__label">Where to go now</span>
+        <p class="mt-0">That is the whole course. You started in <strong>Lesson 01</strong> with one
+        weight and one gradient, and you finish holding a device that listens, thinks and answers with
+        no server behind it. The honest next step is not another architecture — it is
+        <strong>evaluation</strong>. Run the six test cases, record your median and 90th percentile,
+        and find the first conversation your assistant cannot handle.</p>
+      </div>
+
+    </article>
+  </main>
+
+  <aside class="toc-rail"></aside>
+</div>
+
+<script src="../assets/js/vendor/gsap.min.js"></script>
+<script src="../assets/js/scene.js"></script>
+<script src="../assets/js/svgkit.js"></script>
+<script src="../data/lessons.js"></script>
+<script src="../data/glossary.js"></script>
+<script src="../assets/js/course.js"></script>
+<script src="../data/narration/13.js"></script>
+<script src="../data/narration/13.timing.js" onerror="void 0"></script>
+<script src="../assets/js/scenes/13.js"></script>
+<script src="../assets/js/film.js"></script>
+</body>
+</html>

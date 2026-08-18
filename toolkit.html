@@ -1,0 +1,175 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Setup & toolkit — Model Engineering</title>
+<meta name="description" content="Install once, run every project in the course. Pinned versions, Apple Silicon notes, and the traps that waste an afternoon.">
+<link rel="stylesheet" href="assets/css/course.css">
+</head>
+<body data-page="toolkit">
+
+<div class="shell shell--wide">
+  <nav class="rail" aria-label="Lessons"></nav>
+
+  <main class="main">
+    <article class="prose">
+
+      <header class="lesson-head">
+        <span class="eyebrow">reference · read before Project 01</span>
+        <h1>Setup &amp; toolkit</h1>
+        <p class="lead">One environment for the whole course. These versions were checked in
+        <strong>August 2026</strong>, and they matter more than usual right now, because two of the
+        libraries had breaking releases that make most tutorials on the internet wrong.</p>
+      </header>
+
+      <h2 id="pins"><span class="h-num">tools · 1</span>The pinned set</h2>
+
+      <p>Pin these. When a lesson shows code, it was written against exactly this set.</p>
+
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Package</th><th>Version</th><th>Used from</th><th>Note</th></tr></thead>
+          <tbody>
+            <tr><td><code>torch</code></td><td class="num">2.13.0</td><td>Lesson 01</td><td>Everything. Includes the Apple <code>mps</code> backend.</td></tr>
+            <tr><td><code>torchvision</code></td><td class="num">0.28.0</td><td>Lesson 01</td><td>MNIST and CIFAR loaders.</td></tr>
+            <tr><td><code>torchaudio</code></td><td class="num">2.11.0</td><td>Lesson 11</td><td>Audio loading, spectrograms.</td></tr>
+            <tr><td><code>transformers</code></td><td class="num">5.15.0</td><td>Lesson 03</td><td><strong>v5 is a breaking release.</strong> See below.</td></tr>
+            <tr><td><code>datasets</code></td><td class="num">5.0.1</td><td>Lesson 04</td><td>Loading scripts were removed in v4. See below.</td></tr>
+            <tr><td><code>peft</code></td><td class="num">0.20.0</td><td>Lesson 05</td><td>LoRA and QLoRA.</td></tr>
+            <tr><td><code>trl</code></td><td class="num">1.10.0</td><td>Lesson 05</td><td>Supervised fine-tuning and DPO trainers.</td></tr>
+            <tr><td><code>accelerate</code></td><td class="num">1.14.0</td><td>Lesson 04</td><td>Device placement, mixed precision.</td></tr>
+            <tr><td><code>torchao</code></td><td class="num">0.18.0</td><td>Lesson 07</td><td>The PyTorch-native quantization path.</td></tr>
+            <tr><td><code>onnxruntime</code></td><td class="num">1.28.0</td><td>Lesson 09</td><td>Needs Python 3.11 or newer.</td></tr>
+            <tr><td><code>executorch</code></td><td class="num">1.4.1</td><td>Lesson 09</td><td>PyTorch's own on-device runtime.</td></tr>
+            <tr><td><code>coremltools</code></td><td class="num">9.0</td><td>Lesson 09</td><td>Apple export. Validated against torch 2.7 — expect friction.</td></tr>
+            <tr><td><code>mlx</code> / <code>mlx-lm</code></td><td class="num">0.32.0 / 0.31.3</td><td>optional</td><td>Apple-Silicon-native training and inference.</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="code">
+        <div class="code__head"><span>setup.sh</span><span class="lang">bash</span></div>
+        <pre><code>python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+
+pip install torch==2.13.0 torchvision==0.28.0 torchaudio==2.11.0
+pip install transformers==5.15.0 datasets==5.0.1 accelerate==1.14.0
+pip install peft==0.20.0 trl==1.10.0 torchao==0.18.0
+pip install jupyterlab matplotlib
+
+python -c "import torch; print(torch.__version__, torch.backends.mps.is_available())"</code></pre>
+      </div>
+
+      <p>Install the export tools later, in Lesson 09. They pull in a lot and some of them
+      conflict with each other, so it is better to keep a second virtual environment for
+      exporting than to fight the resolver now.</p>
+
+      <h2 id="breaking"><span class="h-num">tools · 2</span>Two breaking changes that will confuse you</h2>
+
+      <div class="callout callout--pitfall">
+        <span class="callout__label">transformers v5</span>
+        <p><strong>Most code you find online is v4 code and will not run.</strong> What changed:</p>
+        <ul>
+          <li>The dtype argument is <code>dtype=</code>, not <code>torch_dtype=</code>.</li>
+          <li><code>load_in_4bit=</code> and <code>load_in_8bit=</code> are gone. Pass
+              <code>quantization_config=BitsAndBytesConfig(...)</code> instead.</li>
+          <li>TensorFlow and Flax support was removed. It is PyTorch only.</li>
+          <li>Everything saves as safetensors; <code>safe_serialization=False</code> no longer exists.</li>
+          <li>One tokenizer class per model. Call the tokenizer directly rather than
+              <code>encode_plus</code>.</li>
+          <li>The command line tool is <code>transformers</code>, not <code>transformers-cli</code>.</li>
+        </ul>
+      </div>
+
+      <div class="callout callout--pitfall">
+        <span class="callout__label">datasets v4 and later</span>
+        <p class="mt-0">Dataset loading scripts were removed, and <code>trust_remote_code=True</code>
+        no longer exists. Any dataset whose data sits behind a <code>.py</code> loader now raises
+        <code>RuntimeError: Dataset scripts are no longer supported</code>. This silently breaks a
+        lot of older audio tutorials. Each lesson names a dataset that was confirmed to load; use
+        the one it names.</p>
+      </div>
+
+      <h2 id="mac"><span class="h-num">tools · 3</span>If you are on a Mac</h2>
+
+      <p>Apple Silicon is a good machine for this course, with three things to know.</p>
+
+      <ul>
+        <li><strong>Memory is shared.</strong> There is no separate video memory, so the model,
+        the data and everything else compete for the same RAM. A 16 GB machine can LoRA-fine-tune
+        models of roughly one to two billion parameters in bf16. An 8 GB machine is fine for
+        everything up to Lesson 06.</li>
+        <li><strong>No <code>bitsandbytes</code>, no CUDA kernels, no Triton.</strong> The 4-bit
+        NF4 path used by most QLoRA tutorials is CUDA-only. Lesson 05 gives you the alternative.</li>
+        <li><strong>Some operations still fall back to the CPU.</strong> If you hit one, set
+        <code>PYTORCH_ENABLE_MPS_FALLBACK=1</code>. It will be slower but it will run.</li>
+      </ul>
+
+      <div class="code">
+        <div class="code__head"><span>~/.zshrc</span><span class="lang">bash</span></div>
+        <pre><code>export PYTORCH_ENABLE_MPS_FALLBACK=1</code></pre>
+      </div>
+
+      <h2 id="colab"><span class="h-num">tools · 4</span>If you use a free Colab GPU</h2>
+
+      <p>The free tier gives you an NVIDIA T4 with 16 GB. Two consequences:</p>
+
+      <ul>
+        <li><strong>A T4 cannot do bf16.</strong> It is a Turing card: fp16 tensor cores yes,
+        bfloat16 no. Use <code>torch.amp.autocast('cuda', dtype=torch.float16)</code> together with
+        a <code>GradScaler</code>. On Apple Silicon and newer NVIDIA cards, use bf16 and skip the
+        scaler.</li>
+        <li><strong>Sessions are killed when idle</strong>, and there is a weekly cap. Save
+        checkpoints to Google Drive rather than to the session disk, and assume the machine will
+        disappear.</li>
+      </ul>
+
+      <div class="callout callout--key">
+        <span class="callout__label">The rule this course follows</span>
+        <p class="mt-0">No project needs more than about <strong>two hours</strong> of training.
+        If a lesson describes something longer, it also gives you a checkpoint so you can carry on
+        without waiting.</p>
+      </div>
+
+      <h2 id="reading-code"><span class="h-num">tools · 5</span>A habit worth building now</h2>
+
+      <p>Before you debug maths, print shapes. Most failures in this course are a tensor of the
+      wrong shape or data on the wrong device, and both are visible in one line.</p>
+
+      <div class="code">
+        <div class="code__head"><span>debug.py</span><span class="lang">python</span></div>
+        <pre><code>def peek(name, t):
+    print(f"{name:12} {tuple(t.shape)}  {t.dtype}  {t.device}  "
+          f"min={t.min().item():.3f} max={t.max().item():.3f}")
+
+peek("images", images)
+peek("logits", logits)</code></pre>
+      </div>
+
+      <p>And the single most useful test in machine learning: take ten examples and try to
+      <strong>overfit them on purpose</strong>. A correct training loop drives the loss on ten
+      samples to nearly zero within a minute. If it cannot, stop tuning hyper-parameters — the bug
+      is in your code.</p>
+
+      <div class="callout callout--try">
+        <span class="callout__label">Ready</span>
+        <p class="mt-0">That is everything you need installed. Go to
+        <a href="lessons/01.html">Lesson 01</a> and build the first model.</p>
+      </div>
+
+    </article>
+  </main>
+
+  <aside class="toc-rail"></aside>
+</div>
+
+<script src="assets/js/vendor/gsap.min.js"></script>
+<script src="assets/js/scene.js"></script>
+<script src="assets/js/svgkit.js"></script>
+<script src="data/lessons.js"></script>
+<script src="data/glossary.js"></script>
+<script src="assets/js/course.js"></script>
+</body>
+</html>

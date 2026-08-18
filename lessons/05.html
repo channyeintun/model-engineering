@@ -1,0 +1,1020 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>05 · Fine-tuning and LoRA — Model Engineering</title>
+<meta name="description" content="Take somebody else's model and teach it your task by training less than one percent of the weights.">
+<link rel="stylesheet" href="../assets/css/course.css">
+</head>
+<body data-lesson="05">
+
+<div class="shell shell--wide">
+  <nav class="rail" aria-label="Lessons"></nav>
+
+  <main class="main">
+    <article class="prose">
+
+      <header class="lesson-head">
+        <span class="lesson-head__num">05</span>
+        <h1>Fine-tuning and LoRA</h1>
+        <p class="lead">Somebody already spent a month of GPU time teaching a model to read and write.
+        You do not need to repeat that. You need to change a small part of its behaviour — and you can
+        do that by training less than one percent of its numbers.</p>
+        <div class="lesson-head__meta">
+          <span class="chip"><b>Part II</b> · Language models</span>
+          <span class="chip">≈ <b>105 min</b> reading</span>
+          <span class="chip">Project · <b>LoRA fine-tune a small open model</b></span>
+          <span class="chip">Needs · <b>Lessons 01, 03, 04</b></span>
+        </div>
+      </header>
+
+      <section class="outcomes">
+        <h2>By the end you can</h2>
+        <ul>
+          <li>Work out the <strong>memory bill</strong> of full fine-tuning, in your head.</li>
+          <li>Explain low-rank adaptation (<strong>LoRA</strong>) as an equation, and say what <code>r</code> and <code>alpha</code> do.</li>
+          <li>Choose <strong>target modules</strong>, rank and learning rate on purpose.</li>
+          <li>Write a supervised fine-tuning (<strong>SFT</strong>) script with a correct template and a correctly <strong>masked loss</strong>, and prove the mask works.</li>
+          <li>Say when direct preference optimization (<strong>DPO</strong>) is worth the trouble.</li>
+          <li>Merge an adapter into the base weights, and measure what the model <em>forgot</em>.</li>
+        </ul>
+      </section>
+
+      <h2 id="never-pretrain"><span class="h-num">05 · 1</span>You are almost never going to pretrain</h2>
+
+      <p>In Lesson 04 you trained a GPT of about 15 million parameters from nothing, and you saw the
+      price: hours of compute for a model that writes simple stories and little else.
+      <span class="term" data-term="pretraining">Pretraining</span> is where general ability comes
+      from, and it is expensive. SmolLM3-3B saw 11.2 trillion tokens, on 384 H100 GPUs for 24
+      days.</p>
+
+      <p>You will not buy that again. What you need is a model that already reads and writes English,
+      made to answer <em>in your format</em>, about <em>your domain</em>, with <em>your refusals</em>.
+      That is <span class="term" data-term="fine-tuning">fine-tuning</span>: cheap, minutes to hours
+      on one GPU, on one to fifty thousand examples.</p>
+
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Stage</th><th>Data</th><th>Compute</th><th>What it changes</th></tr></thead>
+          <tbody>
+            <tr><td>Pretraining</td><td>Trillions of tokens</td><td>384 H100 × 24 days for SmolLM3-3B</td><td>General ability: grammar, facts, reasoning</td></tr>
+            <tr><td>Supervised fine-tuning (SFT)</td><td>1k – 50k examples</td><td>Minutes to hours on one GPU</td><td>Format, tone, task behaviour</td></tr>
+            <tr><td>Preference alignment (DPO)</td><td>Pairs of answers</td><td>Similar to SFT</td><td>Which of two acceptable answers it prefers</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>These are not three sizes of one thing. Pretraining teaches the model what language
+      <em>is</em>. SFT teaches it what a good reply <em>looks like</em>. Preference training only
+      sorts between replies that are already reasonable. If your model cannot do the task at all, no
+      preference data will fix it.</p>
+
+      <div class="callout callout--key">
+        <span class="callout__label">Remember this</span>
+        <p class="mt-0">Fine-tuning cannot add knowledge the base model lacks. It reliably changes
+        <strong>behaviour</strong>: format, style, when to stop, which tool to call. If you need new
+        facts, use retrieval, not a fine-tune.</p>
+      </div>
+
+      <h2 id="memory-bill"><span class="h-num">05 · 2</span>The memory bill of full fine-tuning</h2>
+
+      <p>Take a real model: SmolLM3-3B, 3.08 billion parameters. Loading it for inference in bf16
+      costs 6.2 GB. Most engineers stop the arithmetic there, then wonder why training crashes on a
+      16 GB machine.</p>
+
+      <p>Training does not store one number per parameter. It stores four. Lesson 01 gave the reason:
+      AdamW keeps two running averages per parameter, and each parameter needs its own gradient. In
+      bytes, with a float32 master copy of the weights:</p>
+
+      <div class="eq">bytes  =  N × ( 4 + 4 + 8 )  =  16 N
+
+   N   how many parameters the model has — all of them, embeddings included
+   4   the <b>weight</b> itself, float32
+   4   its <u>gradient</u>
+   8   AdamW's two running averages of that <u>gradient</u></div>
+
+      <p>Lesson 04 wrote <code>N</code> too, but counted only non-embedding parameters, because that
+      is what the compute law needs. Here it is every parameter, because every one needs an optimizer
+      slot. A float32 number is 4 bytes, a bf16 number 2 — the table in Lesson 01.</p>
+
+      <p>16 bytes per parameter is the number to carry in your head. A 1-billion-parameter model
+      costs 16 GB to train, and a 3.08-billion one 49.3 GB — before a single activation is
+      stored.</p>
+
+      <figure class="scene" data-scene="lo-memory">
+        <div class="scene__head">
+          <span class="scene__badge">animation</span>
+          <span class="scene__title">Three bars, one laptop, and the line it cannot cross</span>
+        </div>
+        <div class="scene__stage">
+          <svg viewBox="0 0 900 330" role="img" aria-label="Stacked memory bars for weights, gradients and optimizer state rising past a 16 GB line, then shrinking under LoRA and QLoRA">
+            <g id="mem-plot"></g>
+          </svg>
+        </div>
+      </figure>
+
+      <p>Activations sit on top of all of this, and one of them is enormous. The logits tensor has
+      shape <code>(batch, sequence, vocabulary)</code>. With a batch of 8, a sequence of 2048 and a
+      vocabulary of 128,256, that one tensor is about 4.2 GB in bf16.</p>
+
+      <p>The <strong>output layer</strong> is what makes it that big. It turns each position's vector
+      into one score per vocabulary token. This is why TRL — Transformer Reinforcement Learning,
+      Hugging Face's library of ready-made training loops — makes <code>loss_type="chunked_nll"</code>
+      its default for SFT. <em>nll</em> is negative log-likelihood, the cross-entropy of Lesson 01.
+      The setting sends only the graded positions through the output layer, and computes the loss in
+      slices. TRL reports that this saves roughly 30% of the memory.</p>
+
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Method (3.08 B model)</th><th>Base weights</th><th>Gradients + AdamW</th><th>Total, before activations</th></tr></thead>
+          <tbody>
+            <tr><td>Full fine-tune, fp32 + AdamW</td><td class="num">12.3 GB</td><td class="num">37.0 GB</td><td class="num">49.3 GB</td></tr>
+            <tr><td>LoRA r=16, bf16 base</td><td class="num">6.2 GB</td><td class="num">0.5 GB</td><td class="num">6.6 GB</td></tr>
+            <tr><td>QLoRA r=16, 4-bit base</td><td class="num">≈ 1.6 GB</td><td class="num">0.5 GB</td><td class="num">≈ 2.0 GB</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="code">
+        <div class="code__head"><span>memory.py</span><span class="lang">python</span></div>
+        <pre><code>N = 3.08e9                      # SmolLM3-3B parameters
+BYTES_PER_PARAM = 4 + 4 + 8     # fp32 weight + fp32 gradient + two AdamW averages
+
+print(f"full fine-tune : {N * BYTES_PER_PARAM / 1e9:5.1f} GB")   #  49.3 GB
+
+trainable = 30.2e6              # LoRA r=16 on all linear layers
+print(f"LoRA  (bf16)   : {(2.0 * N + BYTES_PER_PARAM * trainable) / 1e9:5.1f} GB")   #   6.6 GB
+print(f"QLoRA (4-bit)  : {(0.5 * N + BYTES_PER_PARAM * trainable) / 1e9:5.1f} GB")   #   2.0 GB</code></pre>
+      </div>
+
+      <p>Look at the middle column. Gradients and optimizer state fall from 37 GB to half a gigabyte,
+      because they exist only for parameters being trained. That collapse is the point of the next
+      section.</p>
+
+      <h2 id="lora"><span class="h-num">05 · 3</span>LoRA: two thin matrices beside a frozen one</h2>
+
+      <p><span class="term" data-term="lora">LoRA</span> means Low-Rank Adaptation, and it is one
+      line of linear algebra. Freeze the original weight matrix. Beside it add a much cheaper matrix,
+      built as the product of two thin ones, and train only those.</p>
+
+      <div class="callout callout--math">
+        <span class="callout__label">The maths, once</span>
+        <div class="eq"><b>W</b>  =  <b>W₀</b>  +  (α / r) · <b>B</b><b>A</b>
+
+   <b>W₀</b>  the frozen original,  d_out × d_in
+   <b>B</b>   d_out × r,  initialised to all zeros
+   <b>A</b>   r × d_in,   initialised at random
+   r     the rank you choose.  Trainable numbers = r × (d_in + d_out)</div>
+        <p><b>A</b> and <b>B</b> together are the <strong>adapter</strong>. It is saved as its own
+        small file, about 60 MB for <code>r = 16</code> on a 3 B model. The base weights beside it are
+        never written to at all.</p>
+        <p>Because <b>B</b> starts at zero, the product <b>BA</b> starts at zero, so the adapted model
+        at step 0 is <em>exactly</em> the model you downloaded. There is no accuracy cliff when you
+        attach an adapter.</p>
+      </div>
+
+      <figure class="scene" data-scene="lo-lora">
+        <div class="scene__head">
+          <span class="scene__badge">animation</span>
+          <span class="scene__title">One frozen matrix, two thin trainable ones</span>
+        </div>
+        <div class="scene__stage">
+          <svg viewBox="0 0 900 300" role="img" aria-label="A frozen weight matrix with a parallel path through two thin matrices A and B, added back into the output">
+            <g id="lo-plot"></g>
+          </svg>
+        </div>
+      </figure>
+
+      <p>Count the numbers for one matrix. A query projection in SmolLM3-3B is 2048 × 2048, which is
+      4,194,304 parameters. The adapter at <code>r = 16</code> is
+      <code>16 × (2048 + 2048) = 65,536</code> — 1.6% of it. That 65,536 is also how many gradients
+      you store, and how many AdamW averages you keep two of.</p>
+
+      <p>The frozen base still sits in memory, because the forward pass runs through it. What
+      disappears is everything <em>backward</em> needs. That is why the gradient and optimizer bar
+      collapses while the weight bar does not.</p>
+
+      <div class="legend">
+        <span class="legend__item"><span class="legend__swatch" style="background:var(--c-frozen)"></span> frozen weights</span>
+        <span class="legend__item"><span class="legend__swatch" style="background:var(--c-param)"></span> trainable weights</span>
+        <span class="legend__item"><span class="legend__swatch" style="background:var(--c-grad)"></span> gradients</span>
+        <span class="legend__item"><span class="legend__swatch" style="background:var(--c-data)"></span> activations</span>
+      </div>
+
+      <h2 id="rank-alpha"><span class="h-num">05 · 4</span>Rank, alpha, and which modules to touch</h2>
+
+      <p>Rank is the capacity dial: the width of the bottleneck between <b>A</b> and <b>B</b>. Every
+      column of the update <b>BA</b> is built from the same <code>r</code> patterns, so <code>r</code>
+      is how many independent patterns the update may use. Trainable parameters grow linearly with
+      it.</p>
+
+      <p>Why can 16 patterns be enough for a 2048 × 2048 matrix? Full fine-tuning may change that
+      matrix in any of 2048 patterns. But a narrow task needs no general rewrite. It needs one small
+      correction, repeated: always answer in JSON, never apologise, prefer this label. That correction
+      lives in a few patterns, so allowing only <code>r</code> of them costs little. Not nothing: at
+      low rank LoRA reaches a slightly lower peak, and 05 · 8 shows what you get in exchange.</p>
+
+      <figure class="scene" data-scene="lo-rank">
+        <div class="scene__head">
+          <span class="scene__badge">animation</span>
+          <span class="scene__title">Turning the rank dial from 4 to 64</span>
+        </div>
+        <div class="scene__stage">
+          <svg viewBox="0 0 900 300" role="img" aria-label="Two thin adapter matrices growing thicker as the rank rises, with a live count of trainable parameters">
+            <g id="rk-plot"></g>
+          </svg>
+        </div>
+      </figure>
+
+      <p>Now the real counts for SmolLM3-3B, LoRA on every linear layer. Each projection costs
+      <code>r × (d_in + d_out)</code>, so add up one layer:</p>
+
+      <div class="code">
+        <div class="code__head"><span>one layer of SmolLM3-3B, per unit of rank</span><span class="lang">text</span></div>
+        <pre><code>q_proj      2048 -&gt;  2048      2048 +  2048  =   4,096
+k_proj      2048 -&gt;   512      2048 +   512  =   2,560   # 4 key/value groups
+v_proj      2048 -&gt;   512      2048 +   512  =   2,560
+o_proj      2048 -&gt;  2048      2048 +  2048  =   4,096
+gate_proj   2048 -&gt; 11008      2048 + 11008  =  13,056
+up_proj     2048 -&gt; 11008      2048 + 11008  =  13,056
+down_proj  11008 -&gt;  2048     11008 +  2048  =  13,056
+                                     one layer =  52,480
+
+36 layers x 52,480 = 1,889,280 trainable parameters per unit of rank</code></pre>
+      </div>
+
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Rank r</th><th>Trainable parameters</th><th>Share of 3.08 B</th><th>Typical use</th></tr></thead>
+          <tbody>
+            <tr><td class="num">8</td><td class="num">15.1 M</td><td class="num">0.49 %</td><td>Small style or format change</td></tr>
+            <tr><td class="num">16</td><td class="num">30.2 M</td><td class="num">0.98 %</td><td>A sensible default to start with</td></tr>
+            <tr><td class="num">64</td><td class="num">120.9 M</td><td class="num">3.9 %</td><td>A real new task</td></tr>
+            <tr><td class="num">256</td><td class="num">483.7 M</td><td class="num">15.7 %</td><td>Full post-training scale SFT</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>The project model is smaller. On <code>SmolLM2-360M-Instruct</code> that same
+      <code>r = 16</code> all-linear setting gives about 8.7 M trainable parameters, roughly 2.4% —
+      a larger share, because there are fewer frozen parameters to hide them among. Expect a number
+      near that from <code>print_trainable_parameters()</code>.</p>
+
+      <p><strong>Alpha is not a second capacity dial.</strong> It is a fixed scale on the adapter's
+      output, applied as <code>alpha / r</code>. Dividing by <code>r</code> is what makes the best
+      learning rate roughly independent of the rank: raise <code>r</code> and each pattern
+      contributes less, so the update does not explode. With <code>use_rslora=True</code> the scale
+      becomes <code>alpha / sqrt(r)</code>, which behaves better at high rank.</p>
+
+      <p>So what value? Most recipes use <code>alpha = 2r</code>, making the scale 2. Keep that unless
+      you have a reason; every block here follows it.</p>
+
+      <p><strong>Which modules?</strong> In Lesson 03 you built the four attention projections as
+      <code>self.wq</code>, <code>self.wk</code>, <code>self.wv</code> and <code>self.wo</code>.
+      Hugging Face models call the same four <code>q_proj</code>, <code>k_proj</code>,
+      <code>v_proj</code> and <code>o_proj</code>. Those are the names PEFT matches on. Older
+      tutorials target only those. The 2025 Thinking Machines report <em>LoRA Without Regret</em>
+      (linked under Go deeper) is direct: apply LoRA to <em>all</em> weight matrices, including the
+      feed-forward layers (<code>gate_proj</code>, <code>up_proj</code>, <code>down_proj</code>).
+      Attention-only at <code>r = 16</code> on SmolLM3-3B is 7.7 M parameters — four times smaller,
+      and raising the rank does not buy back the coverage you lost. PEFT now recommends
+      <code>target_modules="all-linear"</code>.</p>
+
+      <p>Two libraries do the work from here. <strong>PEFT</strong> — Parameter-Efficient
+      Fine-Tuning — implements LoRA and attaches it to any <code>transformers</code> model.
+      <strong>TRL</strong> wraps the Lesson 01 training loop as <code>SFTTrainer</code> and
+      <code>DPOTrainer</code>. Both are in the toolkit install.</p>
+
+      <div class="code">
+        <div class="code__head"><span>lora.py</span><span class="lang">python</span></div>
+        <pre><code>import torch
+from transformers import AutoModelForCausalLM
+from peft import LoraConfig, get_peft_model
+
+base = "HuggingFaceTB/SmolLM2-360M-Instruct"
+model = AutoModelForCausalLM.from_pretrained(base, dtype=torch.bfloat16)  # v5: dtype, not torch_dtype
+
+cfg = LoraConfig(
+    r=16,
+    lora_alpha=32,
+    lora_dropout=0.05,             # zero 5% of the adapter's activations each step
+    target_modules="all-linear",   # every linear layer, not attention only
+    task_type="CAUSAL_LM",
+)
+
+model = get_peft_model(model, cfg)
+model.print_trainable_parameters()   # read the real number; never trust an estimate</code></pre>
+      </div>
+
+      <div class="callout callout--pitfall">
+        <span class="callout__label">Common trap</span>
+        <p class="mt-0">LoRA needs a <strong>much higher</strong>
+        <span class="term" data-term="learning rate">learning rate</span> than full fine-tuning, about
+        ten times higher. Copy a full fine-tuning rate into a LoRA run and nothing crashes. The loss
+        barely moves, and you conclude LoRA does not work.</p>
+      </div>
+
+      <p>Several learning rates appear in this lesson. Here they are in one place, as starting
+      points:</p>
+
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Run</th><th>Start from</th><th>Why</th></tr></thead>
+          <tbody>
+            <tr><td>Full fine-tune, SFT</td><td class="num">1e-5</td><td>Every weight moves. <code>SFTConfig</code> ships with <code>2e-5</code>, the same ballpark</td></tr>
+            <tr><td>LoRA SFT</td><td class="num">1e-4</td><td>Only the adapter moves — about ten times higher</td></tr>
+            <tr><td>Full fine-tune, DPO</td><td class="num">1e-6</td><td>A small correction on a working model. <code>DPOConfig</code>'s own default</td></tr>
+            <tr><td>LoRA + DPO</td><td class="num">5e-6</td><td>Higher again, but preference training stays delicate</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>One rule sits under the whole table. Whatever a full fine-tune of the same stage wants, LoRA
+      wants several times more: about ten on the SFT row, five on the more delicate DPO row. Both
+      library defaults, <code>2e-5</code> and <code>1e-6</code>, are full-fine-tuning values. Neither
+      is a LoRA starting point. TRL's SmolLM3-3B reproduction used <code>1e-5</code> for its LoRA run
+      against <code>1e-6</code> for the full fine-tune — the same shape, pitched lower for a larger
+      model.</p>
+
+      <p>One more rule from that report: keep the <strong>effective batch size below about 32</strong>.
+      LoRA tolerates large batches worse than full fine-tuning, and more rank does not repair it.
+      Effective batch is <code>per_device_train_batch_size × gradient_accumulation_steps</code>, the
+      gradient accumulation of Lesson 01.</p>
+
+      <h2 id="qlora"><span class="h-num">05 · 5</span>QLoRA, and what to do on a Mac</h2>
+
+      <p>LoRA removed the gradients and the optimizer state. The frozen base weights are now the
+      biggest bar left. <strong>QLoRA</strong> — quantized LoRA — removes most of that too:
+      <span class="term" data-term="quantization">quantize</span> the frozen base to 4 bits, and keep
+      the adapters in bf16. The base is never updated, so the loss of precision in it is a one-time
+      cost rather than something that compounds during training.</p>
+
+      <p>Lesson 07 explains 4-bit storage properly. Here you need only the shape of the idea: each
+      weight becomes one of 16 levels, plus a scale shared by a small block. That is lossy, and a
+      frozen base tolerates it because nothing writes to it. <code>nf4</code> and double quantization
+      below are Lesson 07 terms — skipping the detail is safe.</p>
+
+      <div class="code">
+        <div class="code__head"><span>qlora.py</span><span class="lang">python</span></div>
+        <pre><code>import torch
+from transformers import BitsAndBytesConfig
+from trl import SFTTrainer, SFTConfig
+from peft import LoraConfig
+
+bnb = BitsAndBytesConfig(
+    load_in_4bit=True,
+    bnb_4bit_quant_type="nf4",              # 4-bit NormalFloat
+    bnb_4bit_compute_dtype=torch.float16,   # a free T4 has no bf16; use torch.bfloat16 on Ampere or newer
+    bnb_4bit_use_double_quant=True,         # quantize the scales too
+)
+
+trainer = SFTTrainer(                       # CUDA only — see the warning below
+    model="HuggingFaceTB/SmolLM3-3B",
+    args=SFTConfig(learning_rate=1e-4, max_length=2048, packing=True,
+                   fp16=True),              # matches the compute dtype above; use bf16=True instead on Ampere
+    train_dataset=ds,                       # ds: your dataset — built in sft.py below
+    quantization_config=bnb,                # passed straight to the trainer since TRL v1.8.0
+    peft_config=LoraConfig(r=256, lora_alpha=512, target_modules="all-linear"),
+)
+trainer.train()</code></pre>
+      </div>
+
+      <div class="callout callout--pitfall">
+        <span class="callout__label">Common trap</span>
+        <p class="mt-0"><strong><code>bitsandbytes</code> is CUDA only.</strong> There is no backend
+        for Metal Performance Shaders (MPS), PyTorch's GPU path on Apple Silicon, so the block above
+        cannot run on your MacBook at all. Every QLoRA tutorial assumes an NVIDIA card and does not
+        say so. On Apple Silicon you have two honest options. Run plain bf16 LoRA on a smaller base
+        such as <code>SmolLM2-360M-Instruct</code>, which fits in unified memory. Or use a free Colab
+        T4 for the QLoRA run. A T4 is a Turing card with <em>no</em> bf16, which is why the block
+        above is float16 throughout. <code>fp16=True</code> is how you ask the trainer for it. It wraps
+        each step in <code>torch.amp.autocast</code> and adds a <code>GradScaler</code> — the loss
+        scaler of Lesson 04, which stops small fp16 gradients rounding to zero.</p>
+      </div>
+
+      <div class="compare">
+        <div class="compare__col compare__col--a">
+          <h4>Apple Silicon, 16 GB</h4>
+          <ul>
+            <li>bf16 LoRA on a 0.3 B – 1 B base.</li>
+            <li>No <code>bitsandbytes</code>, no CUDA kernels.</li>
+            <li>Unified memory: no hard VRAM wall, so long sequences are easier.</li>
+            <li>Slower per step, but leave it running.</li>
+          </ul>
+        </div>
+        <div class="compare__col compare__col--b">
+          <h4>Free Colab T4, 16 GB of video memory (VRAM)</h4>
+          <ul>
+            <li>QLoRA works: 4-bit NF4 base, fp16 adapters.</li>
+            <li>fp16 plus a <code>GradScaler</code> everywhere — a Turing card has no bf16.</li>
+            <li>Idle-killed sessions, capped weekly quota.</li>
+            <li>Checkpoint often.</li>
+          </ul>
+        </div>
+      </div>
+
+      <h2 id="sft"><span class="h-num">05 · 6</span>Supervised fine-tuning in practice</h2>
+
+      <p>One decision comes first. A <strong>base</strong> model has only been pretrained: it
+      continues text and has no idea what a conversation is. An <strong>instruct</strong> model has
+      been through SFT and ships a chat template on its tokenizer. Everything below depends on that
+      template, so always start from an instruct model. The <code>-Instruct</code> suffix is how you
+      tell.</p>
+
+      <p>The loss for SFT is the cross-entropy you know from Lesson 01: predict the next
+      <span class="term" data-term="token">token</span>, with the labels shifted one step left.
+      Nothing new. What <em>is</em> new is the plumbing around it, and the plumbing is where
+      fine-tunes fail.</p>
+
+      <h3 id="chat-templates">Chat templates</h3>
+
+      <p>A chat template is a small program stored on the tokenizer, written in Jinja — the same
+      text-templating language web frameworks use to fill placeholders in a page. It turns a list of
+      messages into one flat string with role markers, such as
+      <code>&lt;|im_start|&gt;user … &lt;|im_end|&gt;</code>. The model has no concept of "messages";
+      it sees only that flat string of tokens.</p>
+
+      <p>Training and inference must use the <strong>same</strong> template. Otherwise the model is
+      trained to stop after one token and asked to stop after a different one, so it answers correctly
+      and then writes forever. A mismatched end-of-sequence token is the single most common cause of
+      "my fine-tuned model never stops".</p>
+
+      <h3 id="masking">Masking the loss</h3>
+
+      <p>If you hand TRL one flat <code>text</code> column, every position is graded, including the
+      user's words. You do not want that. You are not training a model to write user questions.</p>
+
+      <figure class="scene" data-scene="lo-mask">
+        <div class="scene__head">
+          <span class="scene__badge">animation</span>
+          <span class="scene__title">Which tokens are actually graded</span>
+        </div>
+        <div class="scene__stage">
+          <svg viewBox="0 0 900 300" role="img" aria-label="A chat transcript in token cells, with the prompt tokens greyed out and labelled minus one hundred while only the assistant tokens carry a gradient">
+            <g id="mk-plot"></g>
+          </svg>
+        </div>
+      </figure>
+
+      <p>The mask lives in the label tensor. Ignored positions get the value <code>-100</code>, which
+      PyTorch's cross-entropy skips. TRL picks the behaviour from your dataset's shape:</p>
+
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Dataset columns</th><th>Setting</th><th>What ends up in the loss</th></tr></thead>
+          <tbody>
+            <tr><td><code>text</code></td><td>default</td><td>Every token</td></tr>
+            <tr><td><code>prompt</code> + <code>completion</code></td><td><code>completion_only_loss=True</code> (default for this shape)</td><td>The completion only</td></tr>
+            <tr><td><code>messages</code></td><td><code>assistant_only_loss=True</code></td><td>The assistant turns only</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p><code>assistant_only_loss=True</code> needs the template to mark its assistant spans with
+      <code>{% generation %}</code> blocks, so TRL knows where they are. TRL patches some known
+      families automatically, and SmolLM3's template carries the markers. Neither
+      <code>SmolLM2-360M-Instruct</code> nor <code>Qwen3-0.6B</code> is guaranteed to carry them in
+      the copy you download. If they are missing, the setting quietly does nothing — and training on
+      every token looks exactly like a successful run until you read the output.</p>
+
+      <p>There is a way out, and it is the row above in that table. If your template has no
+      <code>{% generation %}</code> markers, rewrite the file with <code>prompt</code> and
+      <code>completion</code> columns instead of <code>messages</code>. Apply the template yourself to
+      everything up to the assistant's turn, and put the answer in <code>completion</code>. Then
+      <code>completion_only_loss=True</code> masks the prompt for you. It masks by column boundary
+      rather than by marker, so it works on any tokenizer.</p>
+
+      <p>So check it. Take one batch and print the tokens that survived the mask:</p>
+
+      <div class="code">
+        <div class="code__head"><span>check_mask.py</span><span class="lang">python</span></div>
+        <pre><code>tokenizer = trainer.processing_class          # build the SFTTrainer of sft.py first, then run this
+batch     = next(iter(trainer.get_train_dataloader()))
+labels    = batch["labels"][0]
+
+print(tokenizer.decode(batch["input_ids"][0][labels != -100]))
+print((labels != -100).sum().item(), "graded of", len(labels))</code></pre>
+      </div>
+
+      <p>A correct run prints assistant answers and the tokens ending their turns, and nothing else —
+      no system text, no user text. Expect several answers in a row rather than one, because
+      <code>packing=True</code> below puts several whole examples in each sequence. A broken run prints
+      the conversation entire, user turns included. Four lines, run once — the only thing between you
+      and the model that never stops.</p>
+
+      <p>Now the file. Your training set is one JSON object per line — a <code>.jsonl</code> file.
+      Each object holds a <code>messages</code> list, each message a role and a string. A
+      <code>system</code> turn is allowed, and is graded like the user's: not at all. One line of a
+      ticket classifier:</p>
+
+      <div class="code">
+        <div class="code__head"><span>my_task.jsonl — one line</span><span class="lang">json</span></div>
+        <pre><code>{"messages": [{"role": "system", "content": "You label support tickets."},
+              {"role": "user", "content": "My card was charged twice."},
+              {"role": "assistant", "content": "billing"}]}</code></pre>
+      </div>
+
+      <p>The chat template turns that line into one flat string:</p>
+
+      <div class="code">
+        <div class="code__head"><span>the same row, after apply_chat_template</span><span class="lang">text</span></div>
+        <pre><code>&lt;|im_start|&gt;system
+You label support tickets.&lt;|im_end|&gt;
+&lt;|im_start|&gt;user
+My card was charged twice.&lt;|im_end|&gt;
+&lt;|im_start|&gt;assistant
+billing&lt;|im_end|&gt;</code></pre>
+      </div>
+
+      <p>With <code>assistant_only_loss=True</code>, only the last two lines are graded: the word
+      <code>billing</code> and the <code>&lt;|im_end|&gt;</code> that closes its turn. Everything above
+      is labelled <code>-100</code>. How many <em>tokens</em> that is depends on how your tokenizer
+      splits <code>billing</code> — a handful at most, and <code>check_mask.py</code> prints the exact
+      count. That is the animation again, on a row you could write yourself.</p>
+
+      <div class="code">
+        <div class="code__head"><span>sft.py</span><span class="lang">python</span></div>
+        <pre><code>from datasets import load_dataset
+from peft import LoraConfig
+from trl import SFTTrainer, SFTConfig
+
+ds = load_dataset("json", data_files="my_task.jsonl", split="train")   # rows of {"messages": [...]}
+
+trainer = SFTTrainer(
+    model="HuggingFaceTB/SmolLM2-360M-Instruct",          # a model id string is enough now
+    args=SFTConfig(
+        output_dir="smol-360m-mytask",
+        learning_rate=1e-4,               # ~10x a full fine-tune
+        num_train_epochs=2,
+        per_device_train_batch_size=4,
+        gradient_accumulation_steps=4,    # effective batch 16 — stay under about 32
+        max_length=1024,                  # TRL v1.10: max_length, not max_seq_length
+        packing=True,                     # best-fit-decreasing: never splits an example
+        assistant_only_loss=True,
+        max_grad_norm=1.0,
+    ),
+    train_dataset=ds,
+    peft_config=LoraConfig(r=16, lora_alpha=32, target_modules="all-linear"),
+)
+trainer.train()</code></pre>
+      </div>
+
+      <p>One line deserves a note. Lesson 04 warned that naive wrapped packing cuts an assistant
+      answer in half, teaching the model to stop mid-sentence. TRL's <code>packing=True</code> uses
+      best-fit-decreasing packing: it fits whole examples into each sequence and never splits one.
+      That is Lesson 04's promise, kept.</p>
+
+      <p>While it runs, TRL logs <code>loss</code>, <code>entropy</code>,
+      <code>mean_token_accuracy</code>, <code>num_tokens</code>, <code>learning_rate</code> and
+      <code>grad_norm</code>. The most readable is <code>mean_token_accuracy</code>: the fraction of
+      graded positions where the model's top prediction was correct. A healthy SFT run moves it from
+      about 0.45 to around 0.60 – 0.70. <code>grad_norm</code> is logged <em>before</em> clipping, so
+      it is your early warning: a spike of ten to a hundred times means a bad batch is about to damage
+      the model.</p>
+
+      <h3 id="data">The data is the model</h3>
+
+      <p>For SFT, quality beats quantity by a wide margin. A thousand examples you have actually read
+      are worth more than a million scraped ones. Three habits, in order of importance:</p>
+
+      <ul>
+        <li><strong>Read fifty examples by hand.</strong> Every time. You will find broken formatting,
+        truncated answers and duplicated prompts — in an hour, rather than after a training run.</li>
+        <li><strong>Deduplicate, then decontaminate.</strong> Remove anything that also appears in your
+        evaluation set, or you are measuring memorisation.</li>
+        <li><strong>Generate with a bigger model, deliberately.</strong> Mainstream now: SmolLM3 used
+        preference pairs generated by Qwen3. Check the licence on the teacher's outputs before you
+        ship.</li>
+      </ul>
+
+      <h2 id="dpo"><span class="h-num">05 · 7</span>Preference alignment: what DPO actually does</h2>
+
+      <p>SFT teaches the model one correct answer per prompt. Preference training teaches it to prefer
+      one answer over another, from pairs where a human or a bigger model marked one as better.</p>
+
+      <p>The classic route was reinforcement learning. There the model generates a whole answer and
+      gets one score back — a single number for hundreds of tokens, not a target token at every
+      position. One generate-and-score cycle is an <em>episode</em>, or <em>rollout</em>. That is very
+      little feedback per unit of work, which is why it learns slowly. The recipe was a reward model
+      plus <strong>PPO</strong>, Proximal Policy Optimization: four models in memory, and unstable.
+      Almost nobody does that for small models now.</p>
+
+      <p><strong>DPO</strong> — Direct Preference Optimization — removes the reward model entirely. It
+      compares the current model with a frozen reference copy of itself, and pushes the chosen
+      answer's log-probability up relative to the rejected one.</p>
+
+      <div class="eq">Δ(y)  =  log π(y|x)  −  log π_ref(y|x)
+
+L  =  − log σ( β · [ Δ(chosen) − Δ(rejected) ] )
+
+   π       the model being trained
+   π_ref   a frozen copy of where it started
+   log π(y|x)  the log-probability of the whole answer y given the prompt x
+           (the bar means "given"), summed over its tokens, as in Lesson 01
+   σ       the sigmoid: it squashes any number into 0 to 1, so − log σ(z) is
+           large when z is negative, small when z is large
+   β       how hard to stay near π_ref (default 0.1)</div>
+
+      <p>Nothing is sampled and no reward model is trained. It is one forward pass of each model over
+      two answers, and a cross-entropy-shaped loss on the difference.</p>
+
+      <p><code>β · Δ(y)</code> is called the <strong>implicit reward</strong>. DPO trains no reward
+      model, but it behaves as if it had one, and that is the number TRL logs. Put small values
+      through the whole thing once:</p>
+
+      <div class="code">
+        <div class="code__head"><span>one preference pair, by hand</span><span class="lang">text</span></div>
+        <pre><code>log pi(chosen)     = -12.0      log pi_ref(chosen)   = -12.4
+log pi(rejected)   =  -9.0      log pi_ref(rejected) =  -9.1
+
+delta(chosen)     = -12.0 - (-12.4)  =  0.4
+delta(rejected)   =  -9.0 - ( -9.1)  =  0.1
+delta margin      =   0.4  -   0.1   =  0.3
+beta x margin     =   0.1  x   0.3   =  0.03   # this is rewards/margins
+
+loss = -log sigmoid(0.03) = 0.68               # -log sigmoid(0) = 0.693</code></pre>
+      </div>
+
+      <p>0.693 is the loss of a coin flip; this pair scores 0.68, barely better. Two things follow.
+      The rejected answer is still the more likely one in absolute terms, −9.0 against −12.0 — DPO
+      moves only the <em>gap</em>. And the loss falls slowly at first, because the sigmoid is flat
+      near zero. That is what "margins should grow" means.</p>
+
+      <div class="code">
+        <div class="code__head"><span>dpo.py</span><span class="lang">python</span></div>
+        <pre><code>from datasets import load_dataset
+from trl import DPOTrainer, DPOConfig
+
+trainer = DPOTrainer(
+    model="Qwen/Qwen3-0.6B",
+    args=DPOConfig(beta=0.1, learning_rate=1e-6, max_length=1024),
+    train_dataset=load_dataset("trl-lib/ultrafeedback_binarized", split="train"),
+)
+trainer.train()</code></pre>
+      </div>
+
+      <div class="callout callout--pitfall">
+        <span class="callout__label">Common trap</span>
+        <p class="mt-0">Look at the learning rate. <code>SFTConfig</code> defaults to
+        <code>2e-5</code>, <code>DPOConfig</code> to <code>1e-6</code> — twenty times smaller. Those
+        are the two full-fine-tuning rows of the 05 · 4 table. Copy an SFT rate into a DPO run and you
+        destroy the model in a few hundred steps.</p>
+        <p>TRL logs three numbers, all of them the implicit reward in disguise.
+        <code>rewards/accuracies</code> is the fraction of pairs where the chosen answer's implicit
+        reward is higher; it should rise above 0.5 and settle around 0.7 – 0.9.
+        <code>rewards/margins</code> is the average gap between the two — the 0.03 above — and it
+        should grow. <code>logps/chosen</code> is <code>log π(chosen)</code> itself. If that falls too,
+        DPO is suppressing <em>everything</em> instead of preferring the winner: lower the learning
+        rate or raise β.</p>
+      </div>
+
+      <p>When is DPO worth it? After SFT works, and when you have real pairs — user thumbs, an A/B
+      test, a bigger model judging two candidates. It is good at removing one persistent habit SFT
+      keeps reproducing. For most on-device models a better SFT dataset helps more. Two neighbours are
+      worth knowing. <strong>GRPO</strong> — Group Relative Policy Optimization — is the default when
+      you have a <em>verifiable</em> reward, such as a unit test that passes. <strong>APO</strong> —
+      Anchored Preference Optimization, the <code>apo_zero</code> and <code>apo_down</code> loss
+      types — is what SmolLM3-3B used for its final alignment stage.</p>
+
+      <div class="callout callout--note">
+        <span class="callout__label">Worth knowing</span>
+        <p class="mt-0">This section is context, not path. Nothing later needs DPO, and the project
+        below stops at SFT. It is here so you recognise the words on a model card.</p>
+      </div>
+
+      <h2 id="measuring"><span class="h-num">05 · 8</span>Measuring, forgetting, merging</h2>
+
+      <h3 id="eval">Why benchmark numbers mislead for small models</h3>
+
+      <p><span class="term" data-term="perplexity">Perplexity</span> is only comparable between models
+      that share a tokenizer and are measured on the same text. Across tokenizers, use
+      <strong>bits-per-byte</strong>: divide the model's total loss on a passage by the number of
+      <em>bytes</em> of that passage rather than by the number of tokens. Byte counts do not depend on
+      the tokenizer, so two models with different vocabularies become comparable. Public benchmarks
+      are worse, and under a billion parameters they are close to useless. Four mechanical
+      reasons:</p>
+
+      <ul>
+        <li><strong>Multiple choice is scored by log-likelihood ranking, not by generation.</strong>
+        The model never writes an answer; the harness scores each option and picks the highest. A small
+        model can beat chance on MMLU — Massive Multitask Language Understanding, a 57-subject
+        multiple-choice benchmark — while being unable to write one coherent sentence about the
+        question. Under 1 B, MMLU sits near its 25% chance floor and is mostly noise.</li>
+        <li><strong>Format sensitivity.</strong> Change <code>A)</code> to <code>(A)</code> and a
+        small model's score moves several points. Large models are barely affected. Small ones are.</li>
+        <li><strong>Contamination.</strong> Web corpora contain benchmark test sets, and
+        quality-filtering does not remove them.</li>
+        <li><strong>Aggregates hide what you care about.</strong> A 200 M model that summarises notes
+        is not measured by a maths benchmark.</li>
+      </ul>
+
+      <p>A large model as judge is the practical alternative, with three biases: position (it prefers
+      whichever answer came first), length (longer answers) and self-preference (its own family).
+      Mitigate all three: randomise the A/B order and average both directions, cap answer length, pick
+      a judge from another family.</p>
+
+      <div class="callout callout--key">
+        <span class="callout__label">Remember this</span>
+        <p class="mt-0">Build a task-specific evaluation set of 50 – 200 examples <strong>by hand,
+        before you train anything</strong>. For a device model it beats every public benchmark
+        combined. It is the only number that tells you whether today's run beat yesterday's.
+        When you do want the public suites, <code>lighteval</code> — Hugging Face's evaluation
+        harness — runs them for you.</p>
+      </div>
+
+      <h3 id="forgetting">Catastrophic forgetting</h3>
+
+      <figure class="scene" data-scene="lo-forget">
+        <div class="scene__head">
+          <span class="scene__badge">animation</span>
+          <span class="scene__title">One score goes up, and one you were not watching goes down</span>
+        </div>
+        <div class="scene__stage">
+          <svg viewBox="0 0 900 300" role="img" aria-label="Two score curves over training steps: the narrow task rising while general ability falls, and a second run with replay data where the fall is nearly flat">
+            <g id="fg-plot"></g>
+          </svg>
+        </div>
+      </figure>
+
+      <p>That is the picture above: fine-tuning on a narrow dataset moves the weights toward that
+      narrow distribution, and everything outside it gets worse.</p>
+
+      <p>The clearest reference is <em>LoRA Learns Less and Forgets Less</em> (Biderman and others,
+      TMLR 2024). Its finding is the trade promised in 05 · 4. At standard low ranks LoRA reaches a
+      slightly lower peak on the target task than full fine-tuning. But it preserves ability outside
+      that domain far better: the low-rank constraint is itself a regulariser.</p>
+
+      <p>Practical defences, cheapest first:</p>
+      <ol>
+        <li>Use LoRA rather than full fine-tuning.</li>
+        <li>Train for fewer epochs — one to three passes. Overfitting and forgetting arrive together,
+        and you can already spot overfitting from Lesson 01.</li>
+        <li><strong>Replay</strong>: mix 1 – 10% of general instruction data into your set.</li>
+        <li>Lower the learning rate, and leave the embeddings frozen.</li>
+        <li>Keep the adapter unmerged, so you can always go back to the base model.</li>
+      </ol>
+
+      <p>And measure it: three general prompts, before and after.</p>
+
+      <h3 id="merging">Merging the adapter back</h3>
+
+      <figure class="scene" data-scene="lo-merge">
+        <div class="scene__head">
+          <span class="scene__badge">animation</span>
+          <span class="scene__title">B times A, added into W, and the adapter disappears</span>
+        </div>
+        <div class="scene__stage">
+          <svg viewBox="0 0 900 300" role="img" aria-label="The product of B and A being scaled, added into the frozen weight matrix, and leaving one ordinary matrix with no extra inference cost">
+            <g id="mg-plot"></g>
+          </svg>
+        </div>
+      </figure>
+
+      <p>An attached adapter costs two extra matrix multiplies per targeted layer, on every token.
+      Small, not free, and it makes exporting harder. Merging computes <code>(alpha / r) · B · A</code>
+      once, adds it into <code>W</code>, and hands back an ordinary model with the base model's shape,
+      file size and speed.</p>
+
+      <div class="code">
+        <div class="code__head"><span>merge.py</span><span class="lang">python</span></div>
+        <pre><code>import torch
+from peft import PeftModel
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+base_id = "HuggingFaceTB/SmolLM2-360M-Instruct"
+base = AutoModelForCausalLM.from_pretrained(base_id, dtype=torch.bfloat16)
+model = PeftModel.from_pretrained(base, "smol-360m-mytask")
+
+merged = model.merge_and_unload()      # W becomes W + (alpha/r) B A, then the adapter is removed
+merged.save_pretrained("smol-360m-mytask-merged")
+AutoTokenizer.from_pretrained(base_id).save_pretrained("smol-360m-mytask-merged")</code></pre>
+      </div>
+
+      <div class="callout callout--note">
+        <span class="callout__label">Worth knowing</span>
+        <p class="mt-0">Merging is one-way, and costs two things: you can no longer swap adapters at
+        runtime, and merging into a <em>quantized</em> base loses precision, because the sum is rounded
+        back into 4 bits. So train with QLoRA, merge into the <strong>full-precision</strong> base,
+        and quantize afterwards.
+        <strong>Lesson 09 needs a single merged model</strong> — the export tools follow one graph of
+        ordinary weights, not a base model plus a separate adapter file. Save both: the adapter for
+        experiments, the merged model for shipping.</p>
+      </div>
+
+      <div class="project">
+        <span class="project__label">Project 05</span>
+        <h3>LoRA fine-tune a small open model</h3>
+        <p>Teach an open instruct model one narrow task you choose: classify support tickets, rewrite
+        text into a fixed JSON shape, answer in one style. The task matters less than the discipline —
+        build the evaluation set first, measure the base model, train, measure again, and measure what
+        was lost.</p>
+        <ol class="steps">
+          <li>Pick an <em>instruct</em> base: <code>HuggingFaceTB/SmolLM2-360M-Instruct</code> or
+              <code>Qwen/Qwen3-0.6B</code>. Both are Apache-2.0 and ungated; gated repos block you at
+              download time.</li>
+          <li><strong>Before anything else</strong>, write 100 evaluation examples by hand, and 3
+              general prompts that have nothing to do with your task. Record the base model's answers
+              to all of them.</li>
+          <li>Build 1,000 – 2,000 training examples as a <code>.jsonl</code> file, one object per
+              line, in the shape shown in 05 · 6. Generate them with a larger model if you like, then
+              read fifty yourself and fix what is broken.</li>
+          <li>Attach LoRA: <code>r=16</code>, <code>lora_alpha=32</code>,
+              <code>target_modules="all-linear"</code>. Run
+              <code>print_trainable_parameters()</code>: about 8.7 M on the 360 M base, the figure
+              in 05 · 4.</li>
+          <li>Build the <code>SFTTrainer</code> as in <code>sft.py</code>: learning rate
+              <code>1e-4</code>, 2 epochs, effective batch 16, <code>assistant_only_loss=True</code>.
+              Do not call <code>train()</code> yet.</li>
+          <li>Run <code>check_mask.py</code> on one batch of that trainer. If the user's words appear
+              in the decoded output, <code>assistant_only_loss</code> is doing nothing, and training
+              now would waste the run. Fix it first: rebuild the <code>.jsonl</code> with
+              <code>prompt</code> and <code>completion</code> columns, which mask correctly without
+              the template's generation markers. Re-run the check, then call
+              <code>trainer.train()</code> and watch <code>grad_norm</code> and
+              <code>mean_token_accuracy</code>.</li>
+          <li>Evaluate on your 100 held-out examples, then rerun the 3 general prompts and compare
+              with step 2. That difference is your forgetting.</li>
+          <li>Merge with <code>merge_and_unload()</code> and save. Keep this file — Lesson 09 exports it.</li>
+        </ol>
+        <p><strong>Then break it on purpose.</strong> Each of these fails quietly, which is why you
+        should see them once:</p>
+        <ul>
+          <li>Set <code>learning_rate=2e-5</code> — <code>SFTConfig</code>'s own default, and a
+              full-fine-tuning value. How far does the loss move over the same steps?</li>
+          <li>Turn <code>assistant_only_loss</code> off. Generate ten answers. How soon does the model
+              write a user turn of its own?</li>
+          <li>Target the four attention projections only, keeping <code>r=16</code>. Compare trainable
+              parameters and task score.</li>
+          <li>Train 10 epochs instead of 2, then rerun the 3 general prompts. That is catastrophic
+              forgetting, with your own eyes.</li>
+        </ul>
+        <dl class="project__grid">
+          <div class="project__stat"><dt>Data</dt><dd>1k–2k of your own examples</dd></div>
+          <div class="project__stat"><dt>Trainable</dt><dd>≈ 8.7 M, about 2.4%</dd></div>
+          <div class="project__stat"><dt>Time</dt><dd>≈ 10–25 min on a free T4 for 500 steps; a little slower on a 16 GB Mac</dd></div>
+          <div class="project__stat"><dt>Target</dt><dd>Beats the base model on your 100 held-out examples</dd></div>
+        </dl>
+      </div>
+
+      <h2 id="check">Check yourself</h2>
+
+      <div class="check">
+        <p class="check__q">You move a 3-billion-parameter model from full fine-tuning to LoRA with
+        <code>r = 16</code>, keeping the frozen base in bf16. Which part of the memory bill falls the
+        most?</p>
+        <div class="check__opts">
+          <button class="check__opt">The activations</button>
+          <button class="check__opt" data-right>The gradients and the AdamW state</button>
+          <button class="check__opt">The base weights</button>
+          <button class="check__opt">The key-value (KV) cache</button>
+        </div>
+        <p class="check__why">Gradients and optimizer state exist only for trained parameters, so they
+        fall from about 37 GB to half a gigabyte. The base weights only halve, and that is fp32 to
+        bf16, not LoRA.</p>
+      </div>
+
+      <div class="check">
+        <p class="check__q">You attach LoRA with <code>r = 32</code> to all linear layers of
+        SmolLM3-3B, which costs 1,889,280 parameters per unit of rank. How many trainable parameters
+        is that, and roughly how much memory do their gradients and AdamW state need?</p>
+        <div class="check__opts">
+          <button class="check__opt">30.2 M, about 0.5 GB</button>
+          <button class="check__opt" data-right>60.5 M, about 1.0 GB</button>
+          <button class="check__opt">60.5 M, about 0.12 GB</button>
+          <button class="check__opt">1.9 M, about 30 MB</button>
+        </div>
+        <p class="check__why">1,889,280 × 32 = 60,456,960, about 60.5 M. Each trainable parameter still
+        costs the 16 bytes of 05 · 2, so 60.5e6 × 16 ≈ 968 MB — call it 1 GB. Doubling the rank doubles
+        both numbers.</p>
+      </div>
+
+      <div class="check">
+        <p class="check__q">Training at <code>r = 256</code> costs far more memory than
+        <code>r = 16</code>. After merging, what happens to the cost of generating one token?</p>
+        <div class="check__opts">
+          <button class="check__opt">It rises with the rank, because the update has more patterns in it</button>
+          <button class="check__opt" data-right>Nothing changes — the merged model has the base model's shape at any rank</button>
+          <button class="check__opt">It falls below the base model's cost, because the update is low-rank</button>
+          <button class="check__opt">It depends on alpha rather than on the rank</button>
+        </div>
+        <p class="check__why">Merging computes <code>(alpha / r) · B A</code> once, and that product is
+        <code>d_out × d_in</code> whatever <code>r</code> was. It is added into <code>W</code> and
+        vanishes. Rank is a training-time bill, never an inference-time one.</p>
+      </div>
+
+      <div class="check">
+        <p class="check__q">Your fine-tuned model gives a good answer, then invents a new user question
+        and keeps writing until it hits the token limit. What do you check first?</p>
+        <div class="check__opts">
+          <button class="check__opt">The rank is too low for the task</button>
+          <button class="check__opt" data-right>The chat template and its end-of-sequence token, and whether the loss was masked to assistant turns</button>
+          <button class="check__opt">The effective batch size is above 32</button>
+          <button class="check__opt">Alpha is set too high relative to the rank</button>
+        </div>
+        <p class="check__why">A model that will not stop was either trained with a different
+        end-of-sequence token than generation stops on, or trained on every token, so writing the
+        user's turn is what it learned. Both live in the template, not the adapter.</p>
+      </div>
+
+      <div class="terms">
+        <span class="terms__label">Key words from this lesson</span>
+        <dl>
+          <dt>Adapter</dt>
+          <dd>The two thin matrices LoRA trains, saved as their own file beside the unchanged base model.</dd>
+
+          <dt>Rank <span class="en">written r</span></dt>
+          <dd>The width of the bottleneck between them, and so how much the adapter can change.</dd>
+
+          <dt>Alpha <span class="en">written lora_alpha</span></dt>
+          <dd>A fixed scale on the adapter's output, alpha divided by rank. Not extra capacity. Use 2r.</dd>
+
+          <dt>QLoRA</dt>
+          <dd>Quantized LoRA: the frozen base is stored in 4 bits, so the last big bar shrinks too.</dd>
+
+          <dt>Chat template</dt>
+          <dd>A small program on the tokenizer that turns a list of messages into one flat string of tokens.</dd>
+
+          <dt>Ignore index <span class="en">the value -100</span></dt>
+          <dd>The label value that tells the loss to skip a position, so it produces no gradient.</dd>
+
+          <dt>SFT <span class="en">supervised fine-tuning</span></dt>
+          <dd>Training on example conversations, to fix format and behaviour.</dd>
+
+          <dt>DPO <span class="en">direct preference optimization</span></dt>
+          <dd>Training on pairs of answers marked better and worse, with no reward model.</dd>
+
+          <dt>Catastrophic forgetting</dt>
+          <dd>The model gets better at your narrow task and quietly worse at everything else.</dd>
+
+          <dt>Merging</dt>
+          <dd>Adding the adapter's product into the base weights, leaving one ordinary model.</dd>
+        </dl>
+      </div>
+
+      <h2 id="resources">Go deeper</h2>
+
+      <div class="resources">
+        <a class="res" href="https://thinkingmachines.ai/blog/lora/" target="_blank" rel="noopener">
+          <span class="res__kind" data-kind="paper">paper</span>
+          <span class="res__body">
+            <span class="res__title">LoRA Without Regret — Thinking Machines, 2025</span>
+            <span class="res__why">The source for three claims in 05 · 4: target all linear layers, use about ten times the full fine-tuning learning rate, keep the effective batch under 32.</span>
+          </span>
+        </a>
+        <a class="res" href="https://huggingface.co/learn/smol-course" target="_blank" rel="noopener">
+          <span class="res__kind" data-kind="course">course</span>
+          <span class="res__body">
+            <span class="res__title">Hugging Face — smol-course</span>
+            <span class="res__why">Built around SmolLM3, for modest hardware. Unit 1 instruction tuning, Unit 2 evaluation, Unit 3 preference alignment. Its notebooks are the best reference for current TRL and PEFT argument names.</span>
+          </span>
+        </a>
+        <a class="res" href="https://huggingface.co/learn/llm-course/chapter1/1" target="_blank" rel="noopener">
+          <span class="res__kind" data-kind="course">course</span>
+          <span class="res__body">
+            <span class="res__title">Hugging Face — LLM Course</span>
+            <span class="res__why">Chapters 10 to 12: data curation, chat templates, SFTTrainer with LoRA, evaluation. Go there when a specific API confuses you.</span>
+          </span>
+        </a>
+        <a class="res" href="https://github.com/huggingface/transformers/blob/main/MIGRATION_GUIDE_V5.md" target="_blank" rel="noopener">
+          <span class="res__kind" data-kind="docs">docs</span>
+          <span class="res__body">
+            <span class="res__title">transformers v5 migration guide</span>
+            <span class="res__why">Open this when a copied snippet fails on <code>torch_dtype</code> or <code>load_in_4bit</code>. Half the tutorials online are still pre-v5.</span>
+          </span>
+        </a>
+        <a class="res" href="https://github.com/karpathy/nanochat" target="_blank" rel="noopener">
+          <span class="res__kind" data-kind="code">code</span>
+          <span class="res__body">
+            <span class="res__title">karpathy/nanochat</span>
+            <span class="res__why">Tokenizer, pretraining, SFT, optional RL and a web interface in dependency-light code. The whole pipeline written out once.</span>
+          </span>
+        </a>
+      </div>
+
+      <div class="callout callout--try">
+        <span class="callout__label">Next</span>
+        <p class="mt-0">You can now adapt a model without owning a data centre. But your merged model
+        is still the size the base model was. In <strong>Lesson 06</strong> we make it smaller:
+        distillation copies a large model's <em>confidence</em> — its full output distribution — into
+        a much smaller student.</p>
+      </div>
+
+    </article>
+  </main>
+
+  <aside class="toc-rail"></aside>
+</div>
+
+<script src="../assets/js/vendor/gsap.min.js"></script>
+<script src="../assets/js/scene.js"></script>
+<script src="../assets/js/svgkit.js"></script>
+<script src="../data/lessons.js"></script>
+<script src="../data/glossary.js"></script>
+<script src="../assets/js/course.js"></script>
+<script src="../data/narration/05.js"></script>
+<script src="../data/narration/05.timing.js" onerror="void 0"></script>
+<script src="../assets/js/scenes/05.js"></script>
+<script src="../assets/js/film.js"></script>
+</body>
+</html>

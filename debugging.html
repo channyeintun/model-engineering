@@ -1,0 +1,271 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>When it breaks — Model Engineering</title>
+<meta name="description" content="The order of checks when a model will not learn, why you ran out of memory, and how to survive a killed session.">
+<link rel="stylesheet" href="assets/css/course.css">
+</head>
+<body data-page="debugging">
+
+<div class="shell shell--wide">
+  <nav class="rail" aria-label="Lessons"></nav>
+
+  <main class="main">
+    <article class="prose">
+
+      <header class="lesson-head">
+        <span class="eyebrow">reference · keep this open while you train</span>
+        <h1>When it breaks</h1>
+        <p class="lead">Three things will cost you days in this course: a model that will not learn,
+        a machine that runs out of memory, and a session that dies after two hours of training.
+        None of them are interesting problems. This page makes all three short.</p>
+      </header>
+
+      <h2 id="ladder"><span class="h-num">fix · 1</span>The model will not learn</h2>
+
+      <p>The loss sits flat, or goes to <code>nan</code>, or falls but the output is nonsense.
+      There is a correct order to check things, and most people do it backwards — they start
+      tuning the learning rate, which is check number six.</p>
+
+      <p>Work down this list. <strong>Stop at the first check that fails.</strong></p>
+
+      <figure class="scene" data-scene="dbg-ladder">
+        <div class="scene__head">
+          <span class="scene__badge">animation</span>
+          <span class="scene__title">Seven checks, in the order that finds bugs fastest</span>
+        </div>
+        <div class="scene__stage">
+          <svg viewBox="0 0 900 320" role="img" aria-label="A ladder of seven debugging checks, each lighting up in turn, with most bugs found in the first three">
+            <g id="dl-plot"></g>
+          </svg>
+        </div>
+      </figure>
+
+      <ol class="steps">
+        <li><strong>Overfit ten examples.</strong> Take ten samples, turn off shuffling and any
+        augmentation, and train on only those. A correct training loop drives the loss to nearly
+        zero in under a minute. If it cannot, the bug is in your code and no hyper-parameter will
+        save you. This one check finds most bugs.</li>
+
+        <li><strong>Check the loss at step zero.</strong> Before any training, the loss should equal
+        the loss of pure guessing: <code>ln(number of classes)</code>. For 10 digits that is
+        <code>2.30</code>. For a language model with a 50,000-token vocabulary it is
+        <code>10.82</code>. If your first loss is far from that number, your labels, your shift or
+        your loss function is wrong — not your model.</li>
+
+        <li><strong>Decode one batch back into what it really is.</strong> Print the images, or
+        detokenize the <code>input_ids</code> and the <code>labels</code> side by side and read
+        them. For a language model, confirm the labels really are the inputs shifted by one, and
+        that padding is masked out with <code>-100</code>. Data bugs look exactly like model bugs
+        from a distance.</li>
+
+        <li><strong>Check that gradients exist.</strong> After <code>backward()</code>, print the
+        gradient norm. If it is <code>None</code> for a parameter, that parameter is not connected
+        to the loss. If it is <code>nan</code>, something divided by zero or overflowed — often a
+        <code>log(0)</code> or fp16 overflow inside attention.</li>
+
+        <li><strong>Check that the parameters actually change.</strong> Save a copy of one weight
+        tensor, run one step, compare. If nothing moved, you probably forgot
+        <code>optimizer.step()</code>, or the parameters were never handed to the optimizer, or
+        they are frozen with <code>requires_grad=False</code>.</li>
+
+        <li><strong>Now, and only now, the learning rate.</strong> Try a few values a factor of ten
+        apart and watch the first hundred steps. Loss exploding means it is too high; loss barely
+        moving means too low.</li>
+
+        <li><strong>Bisect the data.</strong> If ten examples train and the full dataset does not,
+        the problem is in the data you have not looked at. Halve it until the failure disappears.</li>
+      </ol>
+
+      <div class="code">
+        <div class="code__head"><span>sanity.py</span><span class="lang">python</span></div>
+        <pre><code>import math, torch
+
+# 2. is the starting loss what pure guessing looks like?
+with torch.no_grad():
+    logits = model(next(iter(loader))[0].to(device))
+print("step-0 loss", criterion(logits, labels).item(),
+      "expected", math.log(num_classes))
+
+# 4. do gradients exist, and are they finite?
+loss.backward()
+total = 0.0
+for name, p in model.named_parameters():
+    if p.grad is None:
+        print("NO GRADIENT:", name)          # not connected to the loss
+    elif not torch.isfinite(p.grad).all():
+        print("NAN/INF GRADIENT:", name)
+    else:
+        total += p.grad.norm().item() ** 2
+print("grad norm", total ** 0.5)             # healthy is roughly 0.1 to 10</code></pre>
+      </div>
+
+      <div class="callout callout--key">
+        <span class="callout__label">Remember this</span>
+        <p class="mt-0">If you learn one habit from this course, make it check number one.
+        <strong>A model that cannot overfit ten examples has a bug, not a tuning problem.</strong>
+        The test takes a minute and it is decisive.</p>
+      </div>
+
+      <h2 id="memory"><span class="h-num">fix · 2</span>You ran out of memory</h2>
+
+      <p>Training uses far more memory than inference, and the reason is not the weights. For every
+      parameter you also store a gradient, and AdamW stores two more numbers on top of that. In
+      Lesson 01 you saw the headline figure; here is where each byte goes.</p>
+
+      <figure class="scene" data-scene="dbg-mem">
+        <div class="scene__head">
+          <span class="scene__badge">animation</span>
+          <span class="scene__title">Where training memory goes, and what each fix removes</span>
+        </div>
+        <div class="scene__stage">
+          <svg viewBox="0 0 900 300" role="img" aria-label="A stacked memory bar for training, crossing the device limit, then shrinking as LoRA and gradient checkpointing are applied">
+            <g id="dm-plot"></g>
+          </svg>
+        </div>
+      </figure>
+
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>What is stored</th><th>Bytes per parameter</th><th>For 1B parameters</th><th>Can you avoid it?</th></tr></thead>
+          <tbody>
+            <tr><td>Weights (fp32)</td><td class="num">4</td><td class="num">4 GB</td><td>Use bf16, or freeze them</td></tr>
+            <tr><td>Gradients</td><td class="num">4</td><td class="num">4 GB</td><td>Only for trainable parameters</td></tr>
+            <tr><td>AdamW state (two moments)</td><td class="num">8</td><td class="num">8 GB</td><td>LoRA, or an 8-bit optimizer</td></tr>
+            <tr><td><strong>Subtotal</strong></td><td class="num">≈ 16</td><td class="num">≈ 16 GB</td><td></td></tr>
+            <tr><td>Activations</td><td>depends on batch and sequence length</td><td class="num">often 2–10 GB</td><td>Gradient checkpointing, smaller batch</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>Read the last row carefully, because it is the one people forget. <strong>LoRA removes the
+      gradient and optimizer rows, but not the activation row.</strong> If you switched to LoRA and
+      still ran out of memory, activations are what is left, and the fixes for those are different.</p>
+
+      <h3 id="activations">The activation problem, and gradient checkpointing</h3>
+
+      <p>The backward pass needs the values computed on the way forward. So by default every layer
+      keeps its output in memory until the backward pass reaches it. Activation memory grows with
+      batch size, sequence length, model width and depth — all four at once.</p>
+
+      <p><strong>Gradient checkpointing</strong> is the trade: throw most of them away, keep only a
+      few, and recompute the missing ones during the backward pass. You pay roughly 30% more time
+      and you get a large fraction of the memory back. On a laptop this is usually the difference
+      between running and not running.</p>
+
+      <figure class="scene" data-scene="dbg-ckpt">
+        <div class="scene__head">
+          <span class="scene__badge">animation</span>
+          <span class="scene__title">Gradient checkpointing: store less, compute twice</span>
+        </div>
+        <div class="scene__stage">
+          <svg viewBox="0 0 900 280" role="img" aria-label="Activations stored at every layer, then only at a few checkpoints, with the missing ones recomputed during the backward pass">
+            <g id="dc-plot"></g>
+          </svg>
+        </div>
+      </figure>
+
+      <div class="code">
+        <div class="code__head"><span>memory_fixes.py</span><span class="lang">python</span></div>
+        <pre><code># In the order you should try them.
+
+# 1. Smaller micro-batch, same effective batch (Lesson 01: gradients accumulate)
+accum = 4
+for i, (x, y) in enumerate(loader):
+    loss = criterion(model(x), y) / accum     # divide, because .grad sums
+    loss.backward()
+    if (i + 1) % accum == 0:
+        optimizer.step()
+        optimizer.zero_grad()
+
+# 2. Trade time for memory
+model.gradient_checkpointing_enable()          # transformers models
+# torch.utils.checkpoint.checkpoint(fn, x)     # anything else
+
+# 3. Shorter sequences. Activation memory grows with sequence length,
+#    and attention memory grows with its square.
+
+# 4. Train fewer parameters (Lesson 05).</code></pre>
+      </div>
+
+      <div class="callout callout--pitfall">
+        <span class="callout__label">Reading the error</span>
+        <p class="mt-0">On CUDA the message tells you how much it wanted and how much was free —
+        believe those numbers. On Apple Silicon the memory is shared with the whole system, so the
+        limit moves depending on what else is open. If a run fails at the same step every time it
+        is genuinely too big; if it fails at a random step, close your other applications and try
+        again before changing any code.</p>
+      </div>
+
+      <h2 id="survive"><span class="h-num">fix · 3</span>Your session died</h2>
+
+      <p>Free Colab sessions are killed when idle and capped weekly. Laptops go to sleep. Any run
+      longer than about twenty minutes needs to be resumable, and that is a property of what you
+      save, not of how often you save it.</p>
+
+      <p>A checkpoint that only contains the weights is <em>not</em> resumable. Restarting from it
+      resets the optimizer moments and the learning-rate schedule, which usually shows up as a
+      visible jump in the loss curve at exactly the point where you restarted.</p>
+
+      <div class="code">
+        <div class="code__head"><span>checkpoint.py</span><span class="lang">python</span></div>
+        <pre><code>def save(path, step):
+    torch.save({
+        "step": step,
+        "model": model.state_dict(),
+        "optimizer": optimizer.state_dict(),     # the Adam moments
+        "scheduler": scheduler.state_dict(),     # where the LR schedule was
+        "rng": torch.get_rng_state(),            # so the data order continues
+    }, path)
+
+def load(path):
+    ck = torch.load(path, map_location=device)
+    model.load_state_dict(ck["model"])
+    optimizer.load_state_dict(ck["optimizer"])
+    scheduler.load_state_dict(ck["scheduler"])
+    torch.set_rng_state(ck["rng"])
+    return ck["step"]                            # carry on from here</code></pre>
+      </div>
+
+      <ul>
+        <li>Save every N minutes, not every N steps — you care about wall-clock lost, not steps lost.</li>
+        <li>Keep the last checkpoint and the best one. Overwrite everything else; they are large.</li>
+        <li>On Colab, save to Google Drive. The session disk disappears with the session.</li>
+        <li>Write one line per evaluation to a CSV: step, train loss, validation loss, learning rate,
+        wall-clock. When you later ask "was run B actually better", this file is the only thing that
+        can answer.</li>
+      </ul>
+
+      <div class="callout callout--note">
+        <span class="callout__label">One change at a time</span>
+        <p class="mt-0">The temptation, when a run is disappointing, is to change the learning rate
+        and the batch size and the model width together. Then the next run is better and you have
+        learned nothing, because you cannot say which change did it. Give every run a name, change
+        one thing, and write down what you expected to happen before you start it.</p>
+      </div>
+
+      <div class="callout callout--try">
+        <span class="callout__label">Back to the course</span>
+        <p class="mt-0">Bookmark this page. You will need section 1 during
+        <a href="lessons/04.html">Lesson 04</a> and section 2 during
+        <a href="lessons/05.html">Lesson 05</a>, and by then the reason each check exists will be
+        obvious rather than abstract.</p>
+      </div>
+
+    </article>
+  </main>
+
+  <aside class="toc-rail"></aside>
+</div>
+
+<script src="assets/js/vendor/gsap.min.js"></script>
+<script src="assets/js/scene.js"></script>
+<script src="assets/js/svgkit.js"></script>
+<script src="data/lessons.js"></script>
+<script src="data/glossary.js"></script>
+<script src="assets/js/course.js"></script>
+<script src="assets/js/scenes/debugging.js"></script>
+</body>
+</html>

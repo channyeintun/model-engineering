@@ -1,0 +1,945 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>01 · Tensors and the training loop — Model Engineering</title>
+<meta name="description" content="What learning actually is: a number that measures wrongness, and a small step downhill.">
+<link rel="stylesheet" href="../assets/css/course.css">
+</head>
+<body data-lesson="01">
+
+<div class="shell shell--wide">
+  <nav class="rail" aria-label="Lessons"></nav>
+
+  <main class="main">
+    <article class="prose">
+
+      <header class="lesson-head">
+        <span class="lesson-head__num">01</span>
+        <h1>Tensors and the training loop</h1>
+        <p class="lead">A neural network is not magic and it is not a database. It is a big pile of
+        numbers, plus a rule for nudging those numbers in the direction that makes the model
+        less wrong. This lesson is that rule.</p>
+        <div class="lesson-head__meta">
+          <span class="chip"><b>Part I</b> · Foundations</span>
+          <span class="chip">≈ <b>100 min</b> reading</span>
+          <span class="chip">Project · <b>Classify handwritten digits</b></span>
+          <span class="chip">Needs · <b>Python, no ML</b></span>
+        </div>
+      </header>
+
+      <section class="outcomes">
+        <h2>By the end you can</h2>
+        <ul>
+          <li>Explain <strong>gradient descent</strong> to another engineer, with the right words.</li>
+          <li>Read a tensor <strong>shape</strong> and predict the shape at the next layer.</li>
+          <li>Write the five-line PyTorch <strong>training loop</strong> from memory, and say why each line is there.</li>
+          <li>Choose a <strong>loss function</strong> and an <strong>optimizer</strong> on purpose, not by copying.</li>
+          <li>Recognise <strong>overfitting</strong> from a loss curve.</li>
+        </ul>
+      </section>
+
+      <h2 id="the-one-idea"><span class="h-num">01 · 1</span>The one idea</h2>
+
+      <p>Every model in this course — a digit classifier, a tiny GPT (generative pre-trained
+      transformer), a speech recogniser — learns the same way. There are only three moving
+      parts:</p>
+
+      <ol>
+        <li>A pile of adjustable numbers, called <span class="term" data-term="parameters">parameters</span> or weights.</li>
+        <li>A single number that says how wrong the model currently is, called the <span class="term" data-term="loss">loss</span>.</li>
+        <li>A rule that changes every parameter a little, so that the loss goes down.</li>
+      </ol>
+
+      <p>That is the whole thing. Everything else — attention, convolutions, quantization — is
+      detail about the first item. The learning itself never changes.</p>
+
+      <p>It is worth knowing where this goes. The course ends with an offline voice assistant
+      that runs entirely on a phone, with a median voice-to-voice reply under 1.5 seconds. It
+      listens, understands, answers and speaks, with no server. Every model inside it was
+      trained by the rule in this lesson.</p>
+
+      <p>Start with the smallest possible version: <em>one</em> parameter. Call it <code>w</code>.
+      For each value of <code>w</code> the model makes some error, so we can draw a curve of loss
+      against <code>w</code>. We cannot see this curve — the model has millions of parameters and
+      we can only afford to look at one point at a time. But we can always ask one question:
+      <strong>which way is downhill from here?</strong></p>
+
+      <figure class="scene" data-scene="gd">
+        <div class="scene__head">
+          <span class="scene__badge">animation</span>
+          <span class="scene__title">Gradient descent: feel the slope, take a step</span>
+        </div>
+        <div class="scene__stage">
+          <svg viewBox="0 0 900 320" role="img" aria-label="A ball rolling down a loss curve in decreasing steps">
+            <!-- axes -->
+            <g class="dg-line" opacity="0.5">
+              <line x1="80" y1="285" x2="850" y2="285"/>
+              <line x1="80" y1="30" x2="80" y2="285"/>
+            </g>
+            <text class="dg-label dg-label--sm" x="850" y="303" text-anchor="end">weight w →</text>
+            <text class="dg-label dg-label--sm" x="72" y="36" text-anchor="end">loss</text>
+
+            <!-- the loss curve -->
+            <path id="gd-curve" d="M100,60 Q450,410 800,98" fill="none"
+                  stroke="var(--c-loss)" stroke-width="2.5" stroke-linecap="round" opacity="0"/>
+
+            <!-- minimum marker -->
+            <g id="gd-min" opacity="0">
+              <line x1="470" y1="245" x2="470" y2="285" class="dg-line" stroke-dasharray="3 4"/>
+              <text class="dg-mono dg-label--sm" x="470" y="303" text-anchor="middle" fill="var(--c-ok)">best w</text>
+            </g>
+
+            <!-- tangent / gradient arrow -->
+            <g id="gd-tan" opacity="0">
+              <line x1="-55" y1="0" x2="55" y2="0" stroke="var(--c-grad)" stroke-width="2" stroke-linecap="round"/>
+              <path d="M55,0 l-9,-4 l0,8 z" fill="var(--c-grad)"/>
+            </g>
+
+            <!-- the ball -->
+            <g id="gd-ball" opacity="0">
+              <circle r="9" fill="var(--c-data)"/>
+              <circle r="9" fill="none" stroke="var(--c-data)" stroke-width="2" opacity="0.35" id="gd-halo"/>
+            </g>
+
+            <!-- step arrows drawn as the ball moves -->
+            <g id="gd-steps" opacity="0.9"></g>
+
+            <!-- readout -->
+            <g id="gd-readout" opacity="0">
+              <rect x="368" y="26" width="214" height="64" rx="10" class="dg-box"/>
+              <text class="dg-mono dg-label--sm" x="386" y="49" fill="var(--text-dim)">loss</text>
+              <text class="dg-mono" x="564" y="49" text-anchor="end" fill="var(--c-loss)" id="gd-loss" font-size="15">2.94</text>
+              <text class="dg-mono dg-label--sm" x="386" y="74" fill="var(--text-dim)">step size</text>
+              <text class="dg-mono" x="564" y="74" text-anchor="end" fill="var(--c-grad)" id="gd-step" font-size="15">—</text>
+            </g>
+          </svg>
+        </div>
+      </figure>
+
+      <p>Two things in that animation are worth saying out loud, because they explain most
+      training problems you will ever have.</p>
+
+      <p><strong>The steps get smaller on their own.</strong> Near the bottom the curve is
+      almost flat, so the slope is small, so the step is small. Nobody programmed that. It is a
+      consequence of the rule itself.</p>
+
+      <p><strong>The step size is a choice, and it is the wrong choice by default.</strong>
+      We multiply the slope by a small number called the
+      <span class="term" data-term="learning rate">learning rate</span>. Too small and training
+      takes a week. Too large and the model jumps over the valley and the loss grows instead of
+      shrinking. Eventually the loss becomes <code>nan</code>.</p>
+
+      <p><code>nan</code> is short for <strong>not a number</strong>. It is a value that
+      floating-point arithmetic produces when a number grows past the largest one it can store,
+      or when zero is divided by zero. It is contagious: anything you add to a <code>nan</code>
+      or multiply by a <code>nan</code> becomes <code>nan</code> too. So one overflowing gradient
+      poisons every parameter it touches, usually within a single step. When you see it, check
+      the learning rate first.</p>
+
+      <div class="callout callout--key">
+        <span class="callout__label">Remember this</span>
+        <p class="mt-0">A <strong><span class="term" data-term="gradient">gradient</span></strong>
+        is not a mysterious object. It is the answer to
+        “if I increase this one number by a tiny amount, does the loss go up or down, and how
+        fast?” One number in, one number out, for every parameter.</p>
+      </div>
+
+      <h2 id="tensors"><span class="h-num">01 · 2</span>Tensors: shapes are the real API</h2>
+
+      <p>A <span class="term" data-term="tensor">tensor</span> is an array of numbers with a shape.
+      That is all. A single number is shape <code>()</code>. A list of 10 numbers is <code>(10,)</code>.
+      A greyscale image is <code>(28, 28)</code>. A batch of 32 such images is
+      <code>(32, 1, 28, 28)</code>: batch, channels, height, width.</p>
+
+      <p>Three of those four words are obvious. <strong>Channels</strong> is not. A channel is
+      one full-size grid of numbers per image. A grey picture needs only one, holding brightness,
+      which is the <code>1</code> in the shape above. A colour picture needs three — red, green
+      and blue — so the same picture in colour would be <code>(3, 28, 28)</code>, and a batch of
+      32 of them <code>(32, 3, 28, 28)</code>.</p>
+
+      <p>When you write model code, you spend maybe 10% of your attention on the maths and 90%
+      on shapes. Almost every error you will hit is a shape error. So build the habit now:
+      <strong>after every line, know the shape.</strong></p>
+
+      <figure class="scene" data-scene="shapes">
+        <div class="scene__head">
+          <span class="scene__badge">animation</span>
+          <span class="scene__title">One batch of images, four shapes</span>
+        </div>
+        <div class="scene__stage">
+          <svg viewBox="0 0 900 240" role="img" aria-label="A batch of images changing shape through the layers of a small network">
+            <g id="sh-stations"></g>
+            <g id="sh-flow"></g>
+          </svg>
+        </div>
+      </figure>
+
+      <p>The first dimension is nearly always the
+      <strong><span class="term" data-term="batch">batch</span></strong>: how many independent
+      examples travel through the network together. The network treats them in parallel and they
+      never mix. Batching exists mainly for speed: hardware is far faster on 32 rows at once
+      than on one row 32 times. It does have a small effect on the maths. A bigger batch averages
+      more examples, so its gradient is smoother and less noisy. Lesson 04 returns to how a
+      training batch size is really chosen — there the number that matters is tokens per step,
+      not the batch on its own.</p>
+
+      <div class="code">
+        <div class="code__head"><span>shapes.py</span><span class="lang">python</span></div>
+        <pre><code>import torch
+
+x = torch.randn(32, 1, 28, 28)      # 32 grey images, 28 x 28
+print(x.shape)                       # torch.Size([32, 1, 28, 28])
+
+flat = x.view(32, -1)                # -1 means "work it out": 1*28*28 = 784
+print(flat.shape)                    # torch.Size([32, 784])
+
+W = torch.randn(784, 128)
+h = flat @ W                         # (32, 784) @ (784, 128) -> (32, 128)
+print(h.shape)                       # torch.Size([32, 128])</code></pre>
+      </div>
+
+      <p>The rule for <code>@</code> (matrix multiply) is short: the last dimension of the left
+      side must equal the first dimension of the right side, and those two disappear.
+      <code>(32, 784) @ (784, 128)</code> becomes <code>(32, 128)</code>.</p>
+
+      <p>A network stacks these layers, but stacking alone buys nothing. Multiply by
+      <code>A</code>, then multiply by <code>B</code>, and the result is just a multiply by
+      <code>A @ B</code> — one single matrix. Two layers would have exactly the power of one.
+      Check it on the smallest case: with <code>A = [[1, 2], [0, 1]]</code> and
+      <code>B = [[1, 0], [3, 1]]</code>, the pair collapses to <code>A @ B = [[7, 2], [3, 1]]</code>.
+      One matrix, same answers.</p>
+
+      <p>So we put a <strong>non-linear</strong> function between the layers. The simplest one is
+      <strong>ReLU</strong>, the rectified linear unit: negative values become 0, positive values
+      pass through unchanged. That single bend is enough to stop the collapse, because you cannot
+      write "multiply, bend, multiply" as one matrix. Everything a network can express beyond a
+      straight line comes from these bends. Lesson 02 builds one from scratch and shows the
+      difference on real data.</p>
+
+      <div class="callout callout--pitfall">
+        <span class="callout__label">Common trap</span>
+        <p class="mt-0"><code>view</code> and <code>reshape</code> do not move data, they only
+        re-label it. <code>view(32, -1)</code> on a <code>(32, 1, 28, 28)</code> tensor gives you
+        the pixels in memory order. If you had transposed the tensor first, memory order is not
+        what you think, and <code>view</code> will either fail or silently scramble your image.
+        Use <code>reshape</code> when unsure; use <code>permute</code> when you actually mean to
+        reorder dimensions.</p>
+      </div>
+
+      <h2 id="autograd"><span class="h-num">01 · 3</span>Autograd: the tape that remembers</h2>
+
+      <p>We need the gradient of the loss with respect to every parameter. Doing that by hand for
+      a million parameters is not possible. PyTorch does it for you, with a mechanism called
+      <strong>autograd</strong> — short for automatic differentiation.</p>
+
+      <p>While you compute the forward pass, PyTorch <strong>writes down every operation you
+      performed</strong>, in order, in a graph. When you then call <code>loss.backward()</code>,
+      it walks that list backwards. Each operation knows its own local derivative, and the
+      <span class="term" data-term="chain rule">chain rule</span> multiplies them together on the
+      way back.</p>
+
+      <figure class="scene" data-scene="autograd">
+        <div class="scene__head">
+          <span class="scene__badge">animation</span>
+          <span class="scene__title">Forward records, backward replays</span>
+        </div>
+        <div class="scene__stage">
+          <svg viewBox="0 0 900 260" role="img" aria-label="Data flowing forward through a graph, then gradients flowing backward">
+            <g id="ag-graph"></g>
+          </svg>
+        </div>
+      </figure>
+
+      <p>Notice the direction of the colours. The data colour moves <strong>forward</strong>, left
+      to right. The gradient colour moves <strong>backward</strong>, right to left. Six colours
+      carry meaning across all thirteen lessons, and this legend is the authority on them. In
+      Parts IV and V nothing is being trained, so there the loss colour reads more broadly as
+      "cost or mistake".</p>
+
+      <div class="legend">
+        <span class="legend__item"><span class="legend__swatch" style="background:var(--c-data)"></span> data / activations</span>
+        <span class="legend__item"><span class="legend__swatch" style="background:var(--c-param)"></span> weights</span>
+        <span class="legend__item"><span class="legend__swatch" style="background:var(--c-grad)"></span> gradients</span>
+        <span class="legend__item"><span class="legend__swatch" style="background:var(--c-loss)"></span> loss / cost</span>
+        <span class="legend__item"><span class="legend__swatch" style="background:var(--c-ok)"></span> output / correct</span>
+        <span class="legend__item"><span class="legend__swatch" style="background:var(--c-frozen)"></span> frozen / not trained</span>
+      </div>
+
+      <p><strong><span class="term" data-term="activation">Activations</span></strong> share the
+      data colour, because they are data: the
+      intermediate tensors each layer produces on the way forward. They are not free. PyTorch has
+      to keep them in memory until <code>backward()</code> has used them, which is why the memory
+      cost of training depends on batch size and depth, not only on parameter count.</p>
+
+      <div class="code">
+        <div class="code__head"><span>autograd.py</span><span class="lang">python</span></div>
+        <pre><code>import torch
+
+w = torch.tensor(3.0, requires_grad=True)   # a parameter we want to learn
+x = torch.tensor(2.0)                       # data: no gradient needed
+
+y = w * x          # 6.0     ... and PyTorch remembers "this was a multiply"
+loss = (y - 10) ** 2   # 16.0 ... and "this was a subtract, then a square"
+
+loss.backward()    # walk the tape backwards
+
+print(w.grad)      # tensor(-16.)   dL/dw = 2*(y-10)*x = 2*(-4)*2 = -16</code></pre>
+      </div>
+
+      <p>Where does <code>-16</code> come from? The chain rule is three small numbers multiplied
+      together, and this example is small enough to do in your head. Give the error its own name
+      first: <code>u = y - 10</code>, which is <code>6 - 10 = -4</code>. The loss <code>L</code>
+      is then <code>u²</code>, which is 16. Now walk backwards, one operation at a time.</p>
+
+      <ol>
+        <li>The last operation was squaring: <code>L = u²</code>. Nudge <code>u</code> up a little
+            and <code>L</code> changes about <code>2u</code> times as much. With
+            <code>u = -4</code>, that local derivative is <code>2 × (-4) = -8</code>.</li>
+        <li>Before that we subtracted 10: <code>u = y - 10</code>. Subtracting a constant does not
+            change how fast things move, so its local derivative is 1, and
+            <code>∂L/∂y = -8 × 1 = -8</code>.</li>
+        <li>Before that we multiplied: <code>y = w × x</code>, with <code>x = 2</code>. Nudge
+            <code>w</code> by a little and <code>y</code> moves twice as much, so multiply once
+            more: <code>-8 × 2 = -16</code>.</li>
+      </ol>
+
+      <p>That is the whole chain rule. Each operation knows only its own local derivative, and
+      the answer is the product of them along the path. The gradient is <code>-16</code>:
+      negative, so increasing <code>w</code> would <em>decrease</em> the loss. Gradient descent
+      therefore moves <code>w</code> in the opposite direction of the gradient — that is where
+      the minus sign in the update rule comes from.</p>
+
+      <div class="callout callout--math">
+        <span class="callout__label">The update rule, once</span>
+        <div class="eq">w  ←  w  −  lr × <u>∂L/∂w</u>
+
+     <b>w</b>       the parameter          <i>lr</i>   the learning rate (e.g. 0.001)
+     <u>∂L/∂w</u>   the gradient           ←    "becomes"</div>
+        <p>Every optimizer in this course is a variation on this one line. Adam, AdamW, momentum:
+        they all change <em>how</em> the gradient is turned into a step, never the shape of the idea.</p>
+      </div>
+
+      <p>Now use it. Take <code>lr = 0.1</code> and the gradient we just computed, and turn one
+      step of the handle. You can check every line of this on a phone calculator.</p>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th></th><th>Before the step</th><th>After the step</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>weight <code>w</code></td><td class="num">3.00</td><td class="num">3 − 0.1 × (−16) = 4.60</td></tr>
+            <tr><td>output <code>y = w × 2</code></td><td class="num">6.00</td><td class="num">9.20</td></tr>
+            <tr><td>loss <code>(y − 10)²</code></td><td class="num">16.00</td><td class="num">0.64</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>One step, and the loss fell from 16.00 to 0.64. That is training. Everything that
+      follows in this course is this same step, repeated a few million times, on a few million
+      parameters at once.</p>
+
+      <p>One more thing is visible in those numbers. The best <code>w</code> here is 5, and one
+      step took us from 3 to 4.60 — most of the way, but not all of it. That undershoot is what a
+      safe learning rate looks like. Each step with <code>lr = 0.1</code> removes 80% of whatever
+      error is left, so <code>w</code> creeps up on 5 and never jumps past it. Now push the rate
+      up. At <code>lr = 0.125</code> the step lands exactly on 5. At <code>lr = 0.5</code> the
+      same step sends <code>w</code> to 11, which is further from 5 than we started, and the loss
+      rises from 16 to 144. That is the animation in section 1, in arithmetic.</p>
+
+      <h2 id="loss"><span class="h-num">01 · 4</span>Loss: turning "wrong" into one number</h2>
+
+      <p>The loss must be a single number, because we can only walk downhill on a single surface.
+      Which number you choose defines what the model actually learns.</p>
+
+      <div class="compare">
+        <div class="compare__col compare__col--a">
+          <h4>Predicting a quantity</h4>
+          <ul>
+            <li>Price, duration, a pixel value, an audio sample.</li>
+            <li>Use <strong>mean squared error</strong>: average of <code>(prediction − target)²</code>.</li>
+            <li>Squaring punishes big misses hard, and makes the gradient simple.</li>
+          </ul>
+        </div>
+        <div class="compare__col compare__col--b">
+          <h4>Predicting a category</h4>
+          <ul>
+            <li>Which digit, which word, which phoneme.</li>
+            <li>Use <strong>cross-entropy</strong> on the raw scores.</li>
+            <li>It asks: what probability did you give to the correct answer?</li>
+          </ul>
+        </div>
+      </div>
+
+      <p>Cross-entropy is the one that matters for the rest of this course, because language
+      models and speech models are both category predictors. A language model predicts
+      “which token comes next” out of ~50,000 options, thousands of times per sentence.</p>
+
+      <p>It works in two moves. First <span class="term" data-term="softmax">softmax</span> turns
+      raw scores (called <span class="term" data-term="logits">logits</span>) into probabilities
+      that add up to 1. Then the loss is simply <code>−log(probability of the correct class)</code>.</p>
+
+      <figure class="scene" data-scene="ce">
+        <div class="scene__head">
+          <span class="scene__badge">animation</span>
+          <span class="scene__title">Cross-entropy: only the correct bar is graded</span>
+        </div>
+        <div class="scene__stage">
+          <svg viewBox="0 0 900 290" role="img" aria-label="Raw scores becoming probabilities, and the loss falling as the correct bar grows">
+            <g id="ce-plot"></g>
+          </svg>
+        </div>
+      </figure>
+
+      <p>One detail decides whether you can check the numbers: <code>log</code> here is the
+      <strong>natural</strong> logarithm, base <em>e</em>, written <code>ln</code> on most
+      calculators. Every deep learning framework means this one when it writes <code>log</code>.
+      So −ln(0.10) = 2.30, not the 1.00 you would get from the base-10 button.</p>
+
+      <p>Read the loss values in that animation and the intuition comes with no extra work:</p>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>Probability on the correct class</th><th>Loss</th><th>What it means</th></tr>
+          </thead>
+          <tbody>
+            <tr><td class="num">1.00</td><td class="num">0.00</td><td>Certain and right. No gradient, nothing to learn.</td></tr>
+            <tr><td class="num">0.50</td><td class="num">0.69</td><td>A coin flip between two options.</td></tr>
+            <tr><td class="num">0.10</td><td class="num">2.30</td><td>Random guessing over 10 classes.</td></tr>
+            <tr><td class="num">0.01</td><td class="num">4.61</td><td>Confident and wrong. Huge gradient.</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>That last row is the important one. Cross-entropy punishes <em>confident mistakes</em>
+      far more than uncertain ones. It also tells you where a language model's loss curve starts.
+      A fresh model spreads its probability evenly over all <code>V</code> tokens in its
+      vocabulary — <code>V</code> is the vocabulary size — so the loss begins at
+      <code>ln(V)</code>. That is about 10.8 for a production-size vocabulary of 50,000 tokens.
+      The tiny GPT you train in Lesson 04 uses a smaller vocabulary of 4,096, so its curve starts
+      near ln(4096) = 8.32 and falls from there.</p>
+
+      <div class="callout callout--pitfall">
+        <span class="callout__label">Common trap</span>
+        <p class="mt-0">In PyTorch, <code>nn.CrossEntropyLoss</code> applies softmax
+        <strong>itself</strong>. If you add a softmax at the end of your model as well, you soften
+        the scores twice, gradients shrink, and the model learns slowly for no visible reason.
+        Feed it raw logits.</p>
+      </div>
+
+      <h2 id="optimizers"><span class="h-num">01 · 5</span>Optimizers: better steps, same idea</h2>
+
+      <p>Plain gradient descent has a well-known weakness. Real loss surfaces are not round
+      bowls; they are long narrow valleys. The gradient points mostly across the valley, not
+      along it, so the parameters cross the valley again and again and creep forward slowly.</p>
+
+      <p>The plain rule from section 1 has a name: <strong>SGD</strong>, stochastic gradient
+      descent. "Stochastic" means each step is measured on one random batch rather than on all
+      the data, so every gradient is a noisy estimate of the true one. It is the baseline in the
+      figure below, and everything else on this page is an improvement on it.</p>
+
+      <p>The figure needs one word of warning, because the picture changes. Up to now the loss
+      has been a <em>curve</em>, because there was one parameter. With two parameters the loss is
+      a <em>landscape</em>. The usual way to draw a landscape flat is to look down on it from
+      above, joining every point of equal height with a ring. That is exactly a hiking map of a
+      hill. So the rings below are lines of equal loss, and the centre of the rings is the bottom
+      of the valley.</p>
+
+      <figure class="scene" data-scene="optim">
+        <div class="scene__head">
+          <span class="scene__badge">animation</span>
+          <span class="scene__title">Three ways down the same valley</span>
+        </div>
+        <div class="scene__stage">
+          <svg viewBox="0 0 900 300" role="img" aria-label="SGD zig-zagging, momentum smoothing, and Adam taking a direct path down a narrow valley">
+            <g id="op-plot"></g>
+          </svg>
+        </div>
+      </figure>
+
+      <p><strong>Momentum</strong> keeps a running average of past gradients. The side-to-side
+      parts cancel out and the forward part adds up, like a heavy ball that does not react to
+      every bump.</p>
+
+      <p><strong>Adam</strong> adds a second idea. It tracks how big each parameter's recent
+      gradients have been — their typical size, ignoring the sign — and divides the step by that.
+      Parameters with tiny gradients get bigger steps; parameters with wild gradients get smaller
+      ones. This is why Adam works with almost no tuning, and why it costs memory: it stores two
+      extra numbers per parameter.</p>
+
+      <p>Those two extra numbers are not a small detail, and this is a good moment to see how
+      quickly model memory adds up. To count bytes you need one table, which the rest of the
+      course will lean on constantly.</p>
+
+      <div class="callout callout--note">
+        <span class="callout__label">How many bytes is one number?</span>
+        <div class="table-wrap mt-0">
+          <table>
+            <thead><tr><th>Format</th><th>Bytes per number</th><th>1 billion parameters</th></tr></thead>
+            <tbody>
+              <tr><td>FP32</td><td class="num">4</td><td class="num">4 GB</td></tr>
+              <tr><td>FP16 / BF16</td><td class="num">2</td><td class="num">2 GB</td></tr>
+              <tr><td>INT8</td><td class="num">1</td><td class="num">1 GB</td></tr>
+              <tr><td>INT4</td><td class="num">0.5</td><td class="num">0.5 GB</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>FP32 means each number is stored in 32 bits, and 32 bits is 4 bytes. FP16 and BF16 both
+        use 16 bits, so 2 bytes each; they differ in <em>how</em> they spend those bits, which
+        Lesson 07 explains. INT8 and INT4 are whole numbers in 8 and 4 bits. For now you only
+        need the byte counts, because they turn parameter counts into gigabytes.</p>
+      </div>
+
+      <div class="callout callout--note">
+        <span class="callout__label">Memory, already relevant</span>
+        <p class="mt-0">Now do the arithmetic for training a 1-billion-parameter model in FP32.
+        The weights are 1,000,000,000 × 4 bytes = <strong>4 GB</strong>. Every weight needs a
+        gradient beside it, which is another <strong>4 GB</strong>. Adam keeps two extra numbers
+        per weight, so 2 × 4 bytes × 1e9 = <strong>8 GB</strong> more. That is
+        <strong>16 GB before a single activation</strong>, and activations often add several GB on
+        top. This one calculation explains most of Part III of this course, and it is why
+        <span class="term" data-term="lora">LoRA</span> — low-rank adaptation — exists in
+        Lesson 05.</p>
+      </div>
+
+      <p>Use <strong>AdamW</strong> as your default. It is Adam with weight decay applied
+      correctly, and it is what nearly every model in this course was trained with. Weight decay
+      is defined in section 7, with the other names for pulling a model back from memorising.</p>
+
+      <h2 id="loop"><span class="h-num">01 · 6</span>The training loop</h2>
+
+      <p>Here it is. Five lines, and you will write them hundreds of times. One word first:
+      one <span class="term" data-term="epoch">epoch</span> is one complete pass over the
+      training data. Three epochs means the model has seen every training image three times.</p>
+
+      <figure class="scene" data-scene="loop">
+        <div class="scene__head">
+          <span class="scene__badge">animation</span>
+          <span class="scene__title">The loop, and what happens when you forget a line</span>
+        </div>
+        <div class="scene__stage">
+          <svg viewBox="0 0 900 330" role="img" aria-label="The five stages of the training loop arranged in a circle, lighting up in order">
+            <g id="lp-plot"></g>
+          </svg>
+        </div>
+      </figure>
+
+      <div class="code">
+        <div class="code__head"><span>train.py</span><span class="lang">python</span></div>
+        <pre><code>import torch
+from torch import nn
+from torch.utils.data import DataLoader
+from torchvision import datasets, transforms
+
+device = ("cuda" if torch.cuda.is_available()
+          else "mps" if torch.backends.mps.is_available()
+          else "cpu")                    # section 8 explains this line
+
+train_set = datasets.MNIST("data", train=True, download=True,
+                           transform=transforms.ToTensor())
+train_loader = DataLoader(train_set, batch_size=64, shuffle=True)
+
+model = nn.Sequential(
+    nn.Flatten(),                # (64, 1, 28, 28) -> (64, 784)
+    nn.Linear(784, 128),
+    nn.ReLU(),
+    nn.Linear(128, 10),          # ten scores, one per digit
+).to(device)
+
+criterion = nn.CrossEntropyLoss()
+optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+epochs = 3
+
+for epoch in range(epochs):
+    model.train()
+    for images, labels in train_loader:
+        images, labels = images.to(device), labels.to(device)
+
+        optimizer.zero_grad()            # 1. forget last batch's gradients
+        logits = model(images)           # 2. forward: build the tape
+        loss = criterion(logits, labels) # 3. one number that says "how wrong"
+        loss.backward()                  # 4. walk the tape back, fill .grad
+        optimizer.step()                 # 5. nudge every parameter downhill</code></pre>
+      </div>
+
+      <p>The line that ties it all together is <code>model.parameters()</code>. That call hands
+      the optimizer a list of exactly the tensors that <code>backward()</code> will fill with
+      <code>.grad</code>. From then on the optimizer holds those same tensors. That is why
+      <code>step()</code> needs no arguments: it already knows every parameter it may move, and
+      where to read each gradient. Get this handover wrong — build the optimizer from a different
+      model — and training will run happily and change nothing.</p>
+
+      <p>The order of the five lines is not a style choice. <code>backward()</code> needs the
+      graph that <code>model(images)</code> built. <code>step()</code> needs the
+      <code>.grad</code> values that <code>backward()</code> filled in.</p>
+
+      <p>And <code>zero_grad()</code> is first for a reason that surprises everyone:
+      <strong>PyTorch adds gradients instead of replacing them.</strong> If you forget the line,
+      batch 2 is trained on the sum of batches 1 and 2, batch 3 on the sum of 1, 2 and 3, and your
+      effective learning rate grows without limit. Training does not crash. It just quietly gets
+      worse, which is much harder to debug.</p>
+
+      <div class="callout callout--note">
+        <span class="callout__label">The feature hidden in the bug</span>
+        <p class="mt-0">That accumulating behaviour is deliberate. It gives you
+        <strong>gradient accumulation</strong>: run four small batches, call
+        <code>backward()</code> on each, then <code>step()</code> once. You get the gradient of a
+        batch four times larger than your memory allows. You will need this in Lesson 04 and
+        Lesson 05 on a laptop.</p>
+      </div>
+
+      <h3 id="eval">Evaluation is a different mode</h3>
+
+      <div class="code">
+        <div class="code__head"><span>evaluate.py</span><span class="lang">python</span></div>
+        <pre><code>val_set = datasets.MNIST("data", train=False, download=True,
+                         transform=transforms.ToTensor())
+val_loader = DataLoader(val_set, batch_size=64)
+
+model.eval()                       # layers that act differently in training switch over
+correct = 0
+with torch.no_grad():              # do not build the tape: less memory, faster
+    for images, labels in val_loader:
+        preds = model(images.to(device)).argmax(dim=1)
+        correct += (preds == labels.to(device)).sum().item()
+print(correct / len(val_loader.dataset))</code></pre>
+      </div>
+
+      <p>Two separate switches, and people mix them up. <code>model.eval()</code> changes the
+      behaviour of the few layer types that deliberately act differently while training. The one
+      you will meet in this course is <strong>dropout</strong>, defined in section 7: it switches
+      off random values while training, and it has to be off when you measure. The model above
+      has no dropout, so the call changes nothing yet. Write it anyway, so that the line is
+      already there on the day you add some. <code>torch.no_grad()</code> stops recording the tape.
+      You almost always want both when measuring, and neither when training.</p>
+
+      <p>One line in there is the moment the model finally answers a question, and it is easy to
+      read past. <code>argmax(dim=1)</code> says: along dimension 1 — the ten class scores, since
+      dimension 0 is the batch — give me the <em>position</em> of the largest value. On a
+      <code>(64, 10)</code> tensor that returns 64 numbers, each between 0 and 9, and that is the
+      predicted digit. No softmax is needed here: softmax never changes which score is largest,
+      so the biggest logit is always the biggest probability.</p>
+
+      <h2 id="overfitting"><span class="h-num">01 · 7</span>Reading a loss curve</h2>
+
+      <p>Training loss going down means the model is memorising the training data. It does not
+      mean the model is any good. That is why you always hold out data the model never trains on.</p>
+
+      <p>Held-out data comes in two roles, and the names matter. <strong>Validation</strong> data
+      is held out so you can decide things: when to stop, which learning rate, how many layers.
+      You look at it often. <strong>Test</strong> data is held out and looked at once, at the very
+      end, so that the number you report has not been tuned against. Every time you use a split
+      to make a decision, it stops being a test set and becomes a validation set.</p>
+
+      <figure class="scene" data-scene="fit">
+        <div class="scene__head">
+          <span class="scene__badge">animation</span>
+          <span class="scene__title">Where the two curves separate</span>
+        </div>
+        <div class="scene__stage">
+          <svg viewBox="0 0 900 280" role="img" aria-label="Training loss falling steadily while validation loss falls then rises">
+            <g id="ft-plot"></g>
+          </svg>
+        </div>
+      </figure>
+
+      <p>Four shapes, four diagnoses. Learn these and you will save yourself days:</p>
+
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>What you see</th><th>What it is</th><th>What to do</th></tr></thead>
+          <tbody>
+            <tr><td>Both curves fall together and flatten</td><td>Healthy</td><td>Train longer, or make the model bigger</td></tr>
+            <tr><td>Training falls, validation turns upward</td><td><span class="term" data-term="overfitting">Overfitting</span></td><td>Stop early, more data, augmentation, dropout, weight decay</td></tr>
+            <tr><td>Both stay high and flat</td><td>Underfitting or a bug</td><td>Check the data pipeline first, then raise capacity or learning rate</td></tr>
+            <tr><td>Loss becomes <code>nan</code></td><td>Numbers exploded</td><td>Lower the learning rate, clip gradients, check for a divide by zero</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>That last column is full of words this course has not used yet. Here is what each one
+      means, in one line, so you can act and not only diagnose:</p>
+
+      <ul>
+        <li><strong>Stop early</strong> — keep the weights from before the validation curve
+            turned upward, and throw away the later ones.</li>
+        <li><strong>Augmentation</strong> — make new training examples out of old ones by
+            shifting, rotating or cropping them, so memorising gets harder.</li>
+        <li><strong>Dropout</strong> — during training, switch off a random fraction of the
+            values inside the network on every batch. No single unit can be relied on, so the
+            model has to spread the work out.</li>
+        <li><strong>Weight decay</strong> — pull every weight slightly toward zero on every step.
+            Large weights have to earn their size.</li>
+        <li><strong>Clip gradients</strong> — cap the size of a gradient before the step, so one
+            bad batch cannot throw the weights across the map.</li>
+        <li><strong>Capacity</strong> — how much the model is able to represent, which in
+            practice means how many parameters it has. Raising capacity means a wider or deeper
+            network.</li>
+      </ul>
+
+      <p>You already used weight decay in this lesson without noticing: it is the W in AdamW.
+      Dropout returns in Lesson 05, where the fine-tuning config sets
+      <code>lora_dropout=0.05</code>. For now, recognising the names on the shelf is enough.</p>
+
+      <div class="callout callout--pitfall">
+        <span class="callout__label">Check the data first</span>
+        <p class="mt-0">When a model will not learn, the cause is a data bug far more often than a
+        maths bug. Before you touch the architecture, print one batch. Look at the shapes, the
+        value range, and the labels. Then try to <strong>overfit deliberately</strong> on ten
+        examples: a correct training loop should drive the loss on ten samples to nearly zero
+        within a minute. If it cannot, the bug is in your code, not in your
+        <strong>hyper-parameters</strong>. Hyper-parameters are the numbers you choose by hand
+        rather than learn: learning rate, batch size, how many layers, how wide each one is.</p>
+      </div>
+
+      <h2 id="hardware"><span class="h-num">01 · 8</span>Your machine</h2>
+
+      <p>You do not need a data-centre GPU for this course. You need a device string that is
+      chosen at runtime, so the same code runs on your laptop and on a rented GPU.</p>
+
+      <div class="code">
+        <div class="code__head"><span>device.py</span><span class="lang">python</span></div>
+        <pre><code>import torch
+
+device = (
+    "cuda" if torch.cuda.is_available()          # NVIDIA GPU
+    else "mps" if torch.backends.mps.is_available()  # Apple Silicon
+    else "cpu"
+)
+print(device)
+
+torch.manual_seed(0)          # same random numbers every run
+model = MyModel().to(device)  # move parameters to the device
+</code></pre>
+      </div>
+
+      <p><code>mps</code> is Apple's GPU backend. On an M-series Mac it is typically several times
+      faster than the CPU for the models in this course, and everything in Lessons 01 to 07 will
+      run on it. A few operations still fall back to the CPU; set
+      <code>PYTORCH_ENABLE_MPS_FALLBACK=1</code> if you hit one.</p>
+
+      <p>Both the data and the model must be on the same device. Half of all beginner PyTorch
+      errors are a variant of "expected all tensors to be on the same device".</p>
+
+      <div class="project">
+        <span class="project__label">Project 01</span>
+        <h3>Classify handwritten digits</h3>
+        <p><strong>MNIST</strong> is the standard beginner dataset: 70,000 greyscale pictures of
+        single handwritten digits, each 28 × 28 pixels, labelled 0 to 9. Sixty thousand are for
+        training and ten thousand are held out. It is exactly the pipeline from section 2 — a
+        <code>(32, 1, 28, 28)</code> batch in, ten scores out — and those ten scores are its ten
+        classes.</p>
+        <p>Train a small network on it until it is above <strong>97%</strong> accuracy on the
+        held-out split. This is the traditional first exercise in model training, and it is worth
+        doing properly because every later project reuses this skeleton.</p>
+        <p>MNIST ships with only one held-out split. We check it after every epoch to decide when
+        to stop, so we are using it as <strong>validation</strong> data, and the 97% is therefore
+        a slightly optimistic number. On a real project you would hold out a third split and look
+        at it once.</p>
+        <ol class="steps">
+          <li>Load MNIST with <code>torchvision.datasets.MNIST</code> and wrap it in a
+              <code>DataLoader</code> with <code>batch_size=64</code>.</li>
+          <li>Build a model with two <code>nn.Linear</code> layers and a <code>nn.ReLU</code>
+              between them: 784 → 128 → 10.</li>
+          <li>Use <code>nn.CrossEntropyLoss</code> and
+              <code>torch.optim.AdamW(model.parameters(), lr=1e-3)</code>.</li>
+          <li>Write the five-line loop. Print the training loss every 100 batches.</li>
+          <li>Evaluate on the validation split after each epoch. Three epochs is enough.</li>
+        </ol>
+        <p><strong>Then break it on purpose</strong>, and watch what each failure looks like.
+        This is the real lesson:</p>
+        <ul>
+          <li>Delete <code>optimizer.zero_grad()</code>. How does the loss behave?</li>
+          <li>Set the learning rate to <code>10.0</code>. How many steps before <code>nan</code>?</li>
+          <li>Set it to <code>1e-6</code>. Is it learning at all, or just very slowly?</li>
+          <li>Remove the <code>ReLU</code>, so the two linear layers collapse into one, as
+              section 2 showed. You are now asking one matrix to separate ten digits. What
+              accuracy ceiling do you hit?</li>
+        </ul>
+        <dl class="project__grid">
+          <div class="project__stat"><dt>Data</dt><dd>MNIST, 60k train</dd></div>
+          <div class="project__stat"><dt>Size</dt><dd>~101k parameters</dd></div>
+          <div class="project__stat"><dt>Time</dt><dd>≈ 2 min on a laptop</dd></div>
+          <div class="project__stat"><dt>Target</dt><dd>&gt; 97% validation accuracy</dd></div>
+        </dl>
+      </div>
+
+      <h2 id="check">Check yourself</h2>
+
+      <div class="check">
+        <p class="check__q">You saved a checkpoint after every epoch and measured both losses.
+        Epoch 1: train 0.42, validation 0.39. Epoch 2: train 0.21, validation 0.25. Epoch 3:
+        train 0.11, validation 0.22. Epoch 4: train 0.05, validation 0.31. Which checkpoint do
+        you ship?</p>
+        <div class="check__opts">
+          <button class="check__opt">Epoch 1 — the two losses are closest together</button>
+          <button class="check__opt">Epoch 2 — the last epoch where training loss halved</button>
+          <button class="check__opt" data-right>Epoch 3 — the lowest validation loss</button>
+          <button class="check__opt">Epoch 4 — the lowest training loss</button>
+        </div>
+        <p class="check__why">You ship the epoch with the best score on data the model has never
+        trained on, and here that is epoch 3 at 0.22. Training loss keeps falling to epoch 4, but
+        validation loss turns upward there, so the extra epoch bought memorising and not learning.
+        Epoch 1 has a small gap only because the model has barely learnt anything yet — a small
+        gap is not the goal, a low validation number is.</p>
+      </div>
+
+      <div class="check">
+        <p class="check__q">You call <code>loss.backward()</code> twice without calling
+        <code>optimizer.zero_grad()</code> in between, then call <code>optimizer.step()</code> once.
+        What did the optimizer use?</p>
+        <div class="check__opts">
+          <button class="check__opt">Only the second gradient</button>
+          <button class="check__opt">Only the first gradient</button>
+          <button class="check__opt" data-right>The sum of both gradients</button>
+          <button class="check__opt">The average of both gradients</button>
+        </div>
+        <p class="check__why">PyTorch <em>accumulates</em> into <code>.grad</code>. It is a sum,
+        not an average — which is why gradient accumulation code usually divides the loss by the
+        number of accumulation steps before calling <code>backward()</code>.</p>
+      </div>
+
+      <div class="check">
+        <p class="check__q">A tensor of shape <code>(8, 3, 64, 64)</code> goes through
+        <code>x.view(8, -1)</code>. What is the new shape?</p>
+        <div class="check__opts">
+          <button class="check__opt">(8, 64)</button>
+          <button class="check__opt" data-right>(8, 12288)</button>
+          <button class="check__opt">(8, 3, 4096)</button>
+          <button class="check__opt">(24, 4096)</button>
+        </div>
+        <p class="check__why">3 × 64 × 64 = 12288. The 3 is the channel count — these are colour
+        images, with a red, a green and a blue grid each. The batch dimension is kept and
+        everything else is flattened into one long vector per example.</p>
+      </div>
+
+      <div class="check">
+        <p class="check__q">You are predicting how many milliseconds a request will take. The
+        model outputs one number per request. Which loss?</p>
+        <div class="check__opts">
+          <button class="check__opt">Cross-entropy, with one class per millisecond</button>
+          <button class="check__opt" data-right>Mean squared error</button>
+          <button class="check__opt">Cross-entropy, after a softmax over the output</button>
+          <button class="check__opt">Either one works, it only changes the speed</button>
+        </div>
+        <p class="check__why">The give-away is that you are predicting a <em>quantity</em>, not a
+        <em>category</em>. Mean squared error asks "how far off is this number", so 41 ms counts
+        as nearly right when the answer is 40 ms. Cross-entropy asks a different question: "what
+        probability did you give the correct class?" It has no idea that class "41" sits next to
+        class "40". Being one millisecond out would be punished exactly as hard as being one
+        second out.</p>
+      </div>
+
+      <div class="terms">
+        <span class="terms__label">Key words from this lesson</span>
+        <dl>
+          <dt>Tensor <span class="en">/ˈtensə/</span></dt>
+          <dd>An array of numbers with a shape. The only data type you will pass around.</dd>
+
+          <dt>Parameter <span class="en">also: weight</span></dt>
+          <dd>A number inside the model that training is allowed to change.</dd>
+
+          <dt>Gradient <span class="en">/ˈɡreɪdiənt/</span></dt>
+          <dd>For one parameter: how much the loss would change if you nudged it. Direction and steepness in one number.</dd>
+
+          <dt>Loss <span class="en">also: cost, objective</span></dt>
+          <dd>One number that measures how wrong the model is right now. Lower is better.</dd>
+
+          <dt>Learning rate <span class="en">often written lr</span></dt>
+          <dd>How big a step to take. The most important number you choose by hand.</dd>
+
+          <dt>Epoch <span class="en">/ˈiːpɒk/</span></dt>
+          <dd>One complete pass over the training data.</dd>
+
+          <dt>Batch</dt>
+          <dd>A group of examples processed together, for speed. The first dimension of nearly every tensor.</dd>
+
+          <dt>Channel</dt>
+          <dd>One full-size grid of numbers per image. Grey needs one, colour needs three.</dd>
+
+          <dt>Activation <span class="en">/ˌæktɪˈveɪʃn/</span></dt>
+          <dd>An intermediate tensor produced inside the network on the way forward. Kept in memory until backward has used it.</dd>
+
+          <dt>ReLU <span class="en">/ˈreluː/ rectified linear unit</span></dt>
+          <dd>Negative in, zero out; positive in, unchanged out. The bend that stops stacked layers collapsing into one.</dd>
+
+          <dt>Hyper-parameter</dt>
+          <dd>A number you choose by hand rather than learn: learning rate, batch size, depth, width.</dd>
+
+          <dt>Validation set <span class="en">vs. test set</span></dt>
+          <dd>Held-out data you look at often, to decide when to stop. A test set is held out and looked at once, at the end.</dd>
+
+          <dt>Overfitting</dt>
+          <dd>The model memorises the training data and gets worse on new data.</dd>
+
+          <dt>Logits <span class="en">/ˈloʊdʒɪts/</span></dt>
+          <dd>The raw, unnormalised scores a classifier produces, before softmax.</dd>
+        </dl>
+      </div>
+
+      <h2 id="resources">Go deeper</h2>
+
+      <div class="resources">
+        <a class="res" href="https://docs.pytorch.org/tutorials/beginner/basics/intro.html" target="_blank" rel="noopener">
+          <span class="res__kind" data-kind="docs">docs</span>
+          <span class="res__body">
+            <span class="res__title">PyTorch — Learn the Basics</span>
+            <span class="res__why">The official eight-part tutorial. Do it in one sitting; it is the same loop as above.</span>
+          </span>
+        </a>
+        <a class="res" href="https://www.youtube.com/watch?v=VMj-3S1tku0" target="_blank" rel="noopener">
+          <span class="res__kind" data-kind="video">video</span>
+          <span class="res__body">
+            <span class="res__title">Karpathy — The spelled-out intro to neural networks and backpropagation</span>
+            <span class="res__why">Two and a half hours building autograd from nothing. The best single explanation of Lesson 01 and 02 that exists.</span>
+          </span>
+        </a>
+        <a class="res" href="https://docs.pytorch.org/docs/stable/notes/autograd.html" target="_blank" rel="noopener">
+          <span class="res__kind" data-kind="docs">docs</span>
+          <span class="res__body">
+            <span class="res__title">Autograd mechanics</span>
+            <span class="res__why">Read this once you are comfortable. It explains exactly what the tape stores and when it is freed.</span>
+          </span>
+        </a>
+        <a class="res" href="https://d2l.ai/chapter_linear-regression/index.html" target="_blank" rel="noopener">
+          <span class="res__kind" data-kind="course">course</span>
+          <span class="res__body">
+            <span class="res__title">Dive into Deep Learning — Linear regression from scratch</span>
+            <span class="res__why">If you want the maths written out properly, with runnable code beside it.</span>
+          </span>
+        </a>
+      </div>
+
+      <div class="callout callout--try">
+        <span class="callout__label">Next</span>
+        <p class="mt-0">You can now train a model, but <code>nn.Linear</code> is still a black box.
+        In <strong>Lesson 02</strong> we open it: backpropagation on real numbers you can check by
+        hand. Then an <span class="term" data-term="mlp">MLP</span> (multi-layer perceptron) and a
+        <span class="term" data-term="cnn">CNN</span> (convolutional neural network), both built
+        without any <code>nn</code> layers at all. The convolution you write there is the same kind of
+        layer that reads a speech spectrogram in Lesson 11, on the way to the offline
+        assistant.</p>
+      </div>
+
+    </article>
+  </main>
+
+  <aside class="toc-rail"></aside>
+</div>
+
+<script src="../assets/js/vendor/gsap.min.js"></script>
+<script src="../assets/js/vendor/MotionPathPlugin.min.js"></script>
+<script src="../assets/js/scene.js"></script>
+<script src="../assets/js/svgkit.js"></script>
+<script src="../data/lessons.js"></script>
+<script src="../data/glossary.js"></script>
+<script src="../assets/js/course.js"></script>
+<script src="../data/narration/01.js"></script>
+<script src="../data/narration/01.timing.js" onerror="void 0"></script>
+<script src="../assets/js/scenes/01.js"></script>
+<script src="../assets/js/film.js"></script>
+</body>
+</html>

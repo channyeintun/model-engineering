@@ -1,0 +1,150 @@
+WEBVTT
+
+a01
+00:00:00.000 --> 00:00:12.970
+So. Last lesson you turned sound into letters. Now we run that arrow backwards. By the end of this you can name every stage of a text-to-speech pipeline, say what a vocoder actually invents, and get the first sound out fast.
+
+a02
+00:00:13.920 --> 00:00:27.370
+Here is the whole machine. It starts with a sentence you typed. Seventy-eight characters, and no sound anywhere. Recognition compresses. Synthesis expands. That one difference decides everything that follows.
+
+a35
+00:00:27.720 --> 00:00:35.640
+First, text normalisation rewrites your sentence into what a voice must say out loud. Still text, just a different string.
+
+a03
+00:00:35.990 --> 00:00:51.200
+Two text stages later — a normaliser, then grapheme-to-phoneme — and we are down to sixty-two sound symbols. About sixty of these cover all of English. That small alphabet is why a fifteen million parameter voice is possible at all.
+
+a04
+00:00:51.550 --> 00:01:01.000
+Now watch the bar at the bottom. The acoustic model turns those sixty-two symbols into five hundred frames of a mel spectrogram. Forty thousand numbers, out of almost nothing.
+
+a05
+00:01:01.350 --> 00:01:14.880
+And the vocoder turns those frames into 128,000 samples at 24 kHz. Lesson 11 ran at 16 kHz. A voice needs more than that, so a resample between the two is a real step you have to build.
+
+a06
+00:01:15.230 --> 00:01:28.520
+Right. Now read that bar from the left. The three text stages produce almost nothing. Sixty-two symbols became a hundred and twenty-eight thousand samples — two thousand times bigger — and nearly all of it happens after the phonemes.
+
+a07
+00:01:29.170 --> 00:01:38.930
+And yet the bugs your users report all live on the left, in the part that produces nothing. Six written words here. Three of them are not what a voice has to say.
+
+a08
+00:01:39.280 --> 00:01:50.650
+Take the first one. Here it is a title, so the voice says Doctor. But in "12 Oak Dr." those same three characters mean Drive. A rule decides — and the rule needs the words around it.
+
+a09
+00:01:51.000 --> 00:02:02.130
+Now the price. The currency symbol is written before the number and spoken after it. Four dollars fifty cents. Nothing in the characters tells you to move it. Somebody has to write that down.
+
+a10
+00:02:02.480 --> 00:02:14.570
+And this date has no single correct reading. 3/4/26 is March the fourth in America, and the third of April in Britain. Same six characters. Your locale setting is part of the model.
+
+a11
+00:02:14.920 --> 00:02:27.970
+This expanded string is the real input to everything downstream. And normalisation is regular expressions and a locale setting, not a network. So when a small voice sounds broken, print this string first.
+
+a12
+00:02:28.620 --> 00:02:41.750
+So. Phonemes carry no time. The word "model" is five symbols whether you say it slowly or quickly. The encoder hands us one vector each, and right now every one of them is exactly the same width.
+
+a13
+00:02:42.100 --> 00:02:56.910
+A small duration predictor says how many frames each sound gets. Its targets come from a forced aligner, run over the recordings before training. And the loss lives in log space, so a four-frame schwa is not drowned out by a forty-frame vowel.
+
+a14
+00:02:57.260 --> 00:03:07.510
+Watch the boxes stretch. The length regulator just repeats each vector that many times. One call to repeat_interleave, and not a single learned parameter. That is the whole thing.
+
+a15
+00:03:07.860 --> 00:03:22.270
+Five, fourteen, six, four, twelve. Forty-one frames. At 93.75 frames a second that is 437 milliseconds of audio. The rhythm of the word is that list of integers. Nothing else decides it.
+
+a16
+00:03:22.620 --> 00:03:35.110
+And here is why this family runs on a phone. The total length is known before a single frame exists, so all forty-one come out of one forward pass. An autoregressive decoder would need forty-one steps, one after another.
+
+a17
+00:03:35.460 --> 00:03:51.390
+Now multiply every duration by zero point eight. Same words, spoken faster, nothing retrained. Piper hands you exactly this knob as length_scale. And Piper is a VITS model, which learns its own alignment — so it needs no forced aligner at all.
+
+a18
+00:03:52.040 --> 00:04:08.210
+So. The last stage, and the strangest one. A mel spectrogram is just a table of magnitudes: how much energy each band holds in each frame. And the scale is compressed — 4000 Hz sits only about twice as far up as 1000 Hz.
+
+a19
+00:04:08.560 --> 00:04:19.610
+But the transform that made it also produced a phase for every bin — where each wave sits in time. Taking the magnitude threw it away. That empty panel is what is not in your file.
+
+a36
+00:04:19.960 --> 00:04:28.600
+So the transform cannot run backwards. Something has to invent a phase consistent between overlapping frames. That is the vocoder's whole job.
+
+a20
+00:04:28.950 --> 00:04:43.520
+So something has to invent it. Griffin-Lim invents it by iteration: go to audio, come back, keep the magnitude you were given and keep the phase you just got. Thirty-two to sixty rounds. No training — and listen, it sounds metallic.
+
+a21
+00:04:43.870 --> 00:04:57.960
+A neural vocoder learns the mapping instead, trained against a discriminator — a second network whose only job is to say whether a clip sounds real. Why not squared error? Because two waves can sound identical and still disagree at every sample.
+
+a22
+00:04:58.310 --> 00:05:16.480
+HiFi-GAN reported 167.9 times real time on a V100, and a light variant 13.4 times on a CPU. Still the slowest stage on a phone. And do not quantize it first — those errors arrive as an audible buzz, not a slightly lower score.
+
+a37
+00:05:17.130 --> 00:05:28.330
+Now the number everybody quotes. One model, one machine. Its real-time factor is 0.2: compute time divided by audio length. Five times faster than real time.
+
+a23
+00:05:28.680 --> 00:05:34.600
+Give it a twenty-second paragraph in one call, and it works for 4000 milliseconds before the last frame exists.
+
+a24
+00:05:34.950 --> 00:05:47.200
+Only then can playback start. Four seconds of silence, and the person heard nothing at all. Notice what just happened. The real-time factor was excellent the whole time — it is simply not the number a user feels.
+
+a25
+00:05:47.550 --> 00:05:57.310
+So split the text at sentence boundaries and synthesise only the first phrase. One second of audio, two hundred milliseconds of work. Look where the marker has moved.
+
+a26
+00:05:57.660 --> 00:06:11.750
+Play it at once, and build phrase two while phrase one is still in the ears. Time to first audio drops from 4000 milliseconds to 200. Same model. Same real-time factor. Only the order of the work changed.
+
+a27
+00:06:12.100 --> 00:06:28.190
+Two things break here. Pitch resets at every boundary, so long text can sound like glued clips. And if the instantaneous factor ever crosses 1.0, the buffer empties and the audio stutters. Keep 200 to 400 milliseconds in reserve.
+
+a28
+00:06:28.840 --> 00:06:46.780
+Last question. What actually fits? File size, on a logarithmic axis — each step right is ten times bigger. The 4 GB model out there predicts audio as tokens, and a token voice needs about 84 a second. NeuTTS Air managed 20 on a Galaxy A25.
+
+a29
+00:06:47.130 --> 00:06:57.060
+Below 30 MB the speech is correct and clearly synthetic. Flat rhythm, the occasional wrong word. Fine for navigation prompts. Not fine for an audiobook.
+
+a30
+00:06:57.410 --> 00:07:15.100
+Between 50 and 100 MB is the 2026 sweet spot. Piper is the fast, boring, safe choice — but it is GPL-3.0, so check that before you ship. Kokoro sounds more natural: 54 voices, 8 languages, and no cloning at all.
+
+a31
+00:07:15.450 --> 00:07:28.980
+If 100 MB is not enough, the next band is 250 to 350 MB. Near-commercial quality on short sentences. Supertonic 3 reports a real-time factor of 0.3 — on a Raspberry Pi.
+
+a32
+00:07:29.330 --> 00:07:42.620
+Above half a gigabyte you buy voice cloning and expressive rhythm, and you pay for both in latency. But stop here. Three seconds of someone speaking is enough to copy them — so decide your consent rules before you write a line of code.
+
+a33
+00:07:42.970 --> 00:07:56.100
+The dashed line is the budget for your project. Everything to the left of it fits. But size on disk does not predict latency: one benchmark measured Piper at a 61 MB file and 2.6 GB of peak memory.
+
+a34
+00:07:57.050 --> 00:08:14.580
+So go and build one. A front end you wrote, a model you chose on purpose, a streaming loop — all inside 100 MB — and measure your own time to first audio. Then in Lesson 13 listening and speaking finally run at the same time, under one and a half seconds from question to answer.
+

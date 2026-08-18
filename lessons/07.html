@@ -1,0 +1,905 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>07 · Quantization: fewer bits — Model Engineering</title>
+<meta name="description" content="Scale, zero point, group size and outliers: how to store a model in 4 bits per weight and prove that it still works.">
+<link rel="stylesheet" href="../assets/css/course.css">
+</head>
+<body data-lesson="07">
+
+<div class="shell shell--wide">
+  <nav class="rail" aria-label="Lessons"></nav>
+
+  <main class="main">
+    <article class="prose">
+
+      <header class="lesson-head">
+        <span class="lesson-head__num">07</span>
+        <h1>Quantization: fewer bits</h1>
+        <p class="lead">A model is a pile of numbers. Quantization puts those numbers in a smaller
+        container. The architecture does not change, no training is repeated, and the file gets four
+        to eight times smaller. This lesson is the arithmetic behind that, and the honest way to
+        check what it cost.</p>
+        <div class="lesson-head__meta">
+          <span class="chip"><b>Part III</b> · Make it small</span>
+          <span class="chip">≈ <b>105 min</b> reading</span>
+          <span class="chip">Project · <b>FP32 to INT4, measured honestly</b></span>
+          <span class="chip">Needs · <b>Lessons 04, 05</b></span>
+        </div>
+      </header>
+
+      <section class="outcomes">
+        <h2>By the end you can</h2>
+        <ul>
+          <li>Compute a model's real size in any format, <strong>metadata included</strong>.</li>
+          <li>Write the <strong>quantize / dequantize</strong> round trip from memory, name every symbol, bound its error.</li>
+          <li>Cost <strong>per-tensor, per-channel and per-group</strong> scales.</li>
+          <li>Explain why <strong>activations</strong> are harder to quantize than weights.</li>
+          <li>Read a filename such as <code>Q4_K_M</code> and know what is inside it.</li>
+          <li>Measure the damage with a <strong>perplexity delta and a task score</strong>, not a feeling.</li>
+        </ul>
+      </section>
+
+      <h2 id="the-container"><span class="h-num">07 · 1</span>The container, not the model</h2>
+
+      <p>Lesson 01 gave you the arithmetic: a 1-billion-parameter model in FP32 is 4 GB of weights.
+      Lesson 06 made a model smaller by removing capacity, a small student learning from a large
+      teacher. <span class="term" data-term="quantization">Quantization</span> removes no capacity
+      at all. Every weight survives, stored with fewer bits.</p>
+
+      <p>Why this matters on a phone is not arithmetic speed. Generating one token reads
+      <em>every weight once</em> and does very little maths per weight. So the limit is how many
+      bytes per second the memory can deliver. That is what
+      <span class="term" data-term="memory bound">memory-bound</span> means, and it makes fewer
+      bytes per weight your biggest lever. How much of that saving becomes a faster token is a
+      separate question, measured in Lesson 08.</p>
+
+      <p>So quantization is a <strong>storage</strong> decision, not an architecture decision.
+      Everything difficult about it comes from one fact: a small integer cannot represent every real
+      number, so it takes the nearest it can and throws the difference away.</p>
+
+      <h2 id="formats"><span class="h-num">07 · 2</span>The formats, and what each one costs</h2>
+
+      <p>Every download page throws format names at you: BF16, FP8, INT4, NF4. The prefixes are the
+      easy part. <strong>FP</strong> is floating point, <strong>INT</strong> integer,
+      <strong>BF</strong> bfloat — the "brain float" from Google Brain — and <strong>NF</strong>
+      NormalFloat. The number after is the total bit width.</p>
+
+      <p>A floating point number is three fields: a sign bit, exponent bits, mantissa bits. The
+      exponent decides the <strong>range</strong>, how large and small a number can be. The mantissa
+      decides the <strong>precision</strong>, how many values sit between two powers of two. An
+      integer format has neither. It is an evenly spaced counter, meaningless until you attach a
+      scale.</p>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>Format</th><th>Bits</th><th>Sign / exp / mantissa</th><th>Range or levels</th><th>What it is for</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>FP32</td><td class="num">32</td><td>1 / 8 / 23</td><td class="num">≈ 3.4e38</td><td>The old training default. "Full precision."</td></tr>
+            <tr><td>FP16</td><td class="num">16</td><td>1 / 5 / 10</td><td class="num">65504</td><td>Good precision, small range, so overflow is a risk.</td></tr>
+            <tr><td>BF16</td><td class="num">16</td><td>1 / 8 / 7</td><td class="num">≈ 3.4e38</td><td>Same range as FP32, less precision. Now the usual training dtype.</td></tr>
+            <tr><td>FP8 E4M3</td><td class="num">8</td><td>1 / 4 / 3</td><td class="num">448</td><td>Weights and activations on hardware that supports it.</td></tr>
+            <tr><td>INT8</td><td class="num">8</td><td>—</td><td class="num">−128 … 127</td><td>Evenly spaced. Needs a scale to mean anything.</td></tr>
+            <tr><td>FP4 E2M1</td><td class="num">4</td><td>1 / 2 / 1</td><td class="num">16 values</td><td>Fine near zero, coarse far away. Always used with a block scale.</td></tr>
+            <tr><td>INT4</td><td class="num">4</td><td>—</td><td class="num">16 levels</td><td>−8 … 7 signed, or 0 … 15 unsigned.</td></tr>
+            <tr><td>NF4</td><td class="num">4</td><td>—</td><td class="num">16 levels</td><td>Levels placed at quantiles of a normal distribution. The QLoRA format from Lesson 05.</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>Read <code>E4M3</code> as the field split: <strong>E</strong> is exponent bits,
+      <strong>M</strong> mantissa bits. So FP8 E4M3 is 1, 4 and 3 — exactly the third column — and
+      FP4 E2M1 is 1, 2 and 1.</p>
+
+      <p>The contrast to hold on to: <strong>integer levels are evenly spaced, floating point
+      levels are not</strong>. FP4 is fine near zero, coarse far from it — a reasonable match for
+      weight distributions, which are bell-shaped and centred on zero. NF4 pushes the idea further,
+      placing its 16 levels at the quantiles of a normal distribution.</p>
+
+      <figure class="scene" data-scene="q-levels">
+        <div class="scene__head">
+          <span class="scene__badge">animation</span>
+          <span class="scene__title">Why four bits is coarse: the same range, 256 levels or 16</span>
+        </div>
+        <div class="scene__stage">
+          <svg viewBox="0 0 900 300" role="img" aria-label="Three number lines over the same range: continuous FP32, 256 evenly spaced INT8 levels, and only 16 INT4 levels, with one value snapping onto each grid">
+            <g id="ql-plot"></g>
+          </svg>
+        </div>
+      </figure>
+
+      <p>Now the question that decides everything: what does each format cost in megabytes? Take the
+      360-million-parameter model you fine-tuned in Lesson 05, counting weights only. One megabyte
+      is 10<sup>6</sup> bytes here.</p>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>Precision</th><th>Bits / weight</th><th>360 M weights</th><th>Versus FP32</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>FP32</td><td class="num">32</td><td class="num">1440 MB</td><td class="num">1×</td></tr>
+            <tr><td>FP16 or BF16</td><td class="num">16</td><td class="num">720 MB</td><td class="num">2×</td></tr>
+            <tr><td>INT8, one scale per row</td><td class="num">8</td><td class="num">360 MB</td><td class="num">4×</td></tr>
+            <tr><td>INT4, ideal, no scales</td><td class="num">4</td><td class="num">180 MB</td><td class="num">8×</td></tr>
+            <tr><td>INT4, group 128, FP16 scale + zero</td><td class="num">4.25</td><td class="num">191 MB</td><td class="num">7.5×</td></tr>
+            <tr><td>INT4, group 32</td><td class="num">5.0</td><td class="num">225 MB</td><td class="num">6.4×</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <figure class="scene" data-scene="q-memory">
+        <div class="scene__head">
+          <span class="scene__badge">animation</span>
+          <span class="scene__title">The same 360 million weights in four containers</span>
+        </div>
+        <div class="scene__stage">
+          <svg viewBox="0 0 900 300" role="img" aria-label="Four horizontal bars showing model size falling from 1440 MB at FP32 to 191 MB at INT4 with group scales">
+            <g id="qm-plot"></g>
+          </svg>
+        </div>
+      </figure>
+
+      <div class="callout callout--pitfall">
+        <span class="callout__label">Common trap</span>
+        <p class="mt-0">"Four-bit" is never four bits. Every group carries a scale, usually a zero
+        point too. Group 128 with an FP16 scale and zero point is 32 extra bits per 128 weights:
+        <strong>4.25 bits per weight</strong>. At group 32 it is 5.0. Divide a file size by the
+        parameter count, get 4.5 instead of 4.0, and the file is not lying. You forgot the
+        metadata.</p>
+      </div>
+
+      <p>That 191 MB is not an abstract target. It is the brain the offline voice assistant of
+      Lesson 13 carries, on a model budget of about 200 MB.</p>
+
+      <p>An anchor at the other end. OpenAI's gpt-oss models ship natively in MXFP4 — a 4.25-bit
+      format explained in section 7 — for their <strong>mixture-of-experts</strong> weights. Such a
+      model replaces each block's feed-forward network, the multi-layer perceptron
+      or <span class="term" data-term="mlp">MLP</span>, with many parallel copies called
+      <em>experts</em>. A small network, the <strong>router</strong>, sends each token to two or
+      three of them. Two facts matter here: the expert weights are over 90% of the parameters, and
+      the router is tiny and must stay accurate. At 4.25 bits the 117-billion-parameter gpt-oss-120b
+      fits on one 80 GB GPU, against roughly 240 GB at BF16.</p>
+
+      <h2 id="scale-and-zero-point"><span class="h-num">07 · 3</span>Scale and zero point</h2>
+
+      <p>An INT8 value of <code>73</code> is meaningless alone. Turning integers back into real
+      numbers needs a <strong>scale</strong>, the size of one step, and optionally a
+      <strong>zero point</strong>, the integer mapping to exactly 0.0.</p>
+
+      <div class="callout callout--math">
+        <span class="callout__label">The maths, once</span>
+        <p class="mt-0"><b>The legend first.</b> <code>w</code> is one real weight.
+        <code>min</code> and <code>max</code> are the smallest and largest real value <em>in the
+        group being quantized</em>. <code>qmin</code> and <code>qmax</code> are the smallest and
+        largest integer the format holds: 0 and 15 for unsigned INT4, −8 and 7 for signed INT4,
+        −128 and 127 for signed INT8. <code>clamp(v, a, b)</code> keeps <code>v</code> inside a…b.
+        <code>q</code> is the integer you store; <code>ŵ</code>, said "w-hat", is what you get
+        back.</p>
+        <div class="eq">s  =  (max − min) / (qmax − qmin)          the scale
+z  =  qmin − round(min / s)                the zero point
+q  =  clamp(round(w/s) + z, qmin, qmax)      quantize
+ŵ  =  s × (q − z)                          dequantize</div>
+        <p>This is <strong>affine</strong>, or asymmetric, quantization. It fits the integer range
+        to whatever real range your numbers occupy. The zero point slides the grid onto the data.
+        When the group's range contains zero — that is, when <code>min ≤ 0 ≤ max</code> — it also
+        puts real 0.0 exactly on the grid. That matters, because padding and ReLU produce a great
+        many exact zeros.</p>
+      </div>
+
+      <p>Work it once, on four numbers you can check on a calculator. Take one group of positive
+      values: <code>[0.6, 1.1, 1.7, 2.1]</code>. Store them in unsigned INT4,
+      <code>qmin = 0</code> and <code>qmax = 15</code>.</p>
+
+      <div class="eq">s  =  (2.1 − 0.6) / (15 − 0)  =  0.1
+z  =  0 − round(0.6 / 0.1)  =  −6
+q  =  0,  5,  11,  15
+ŵ  =  0.1 × (q + 6)  =  0.6,  1.1,  1.7,  2.1</div>
+
+      <p>Every value came back exactly, because the grid was fitted to the data. But watch the
+      condition above. This group's minimum is 0.6, so 0.0 is <em>not</em> on this grid. Push it
+      through: <code>q = clamp(round(0/0.1) − 6, 0, 15) = 0</code>, and that reads back as 0.6. Exact
+      zeros survive only when the group's range reaches down to zero.</p>
+
+      <p>Force <code>z = 0</code> instead and you get <strong>symmetric</strong> quantization, where
+      the grid is centred on zero and you store one number per group:</p>
+
+      <div class="eq">s  =  max|<b>w</b>| / qmax        qmax = 127 for INT8, 7 for signed INT4
+
+q  =  clamp(round(<b>w</b>/s), −qmax, qmax)        ŵ  =  s × q</div>
+
+      <p>Run the same four numbers through that. The scale becomes 2.1 / 7 = 0.3, three times
+      coarser, because the seven negative levels go to numbers that never occur. You get back
+      0.6, 1.2, 1.8, 2.1 — two of the four have moved. That is what a zero point buys: it slides the
+      grid onto the data.</p>
+
+      <p>Reconcile that with the format table, which says INT4 spans −8 to 7. Symmetric INT4 uses
+      <strong>−7 to 7</strong> and never emits −8, because zero must sit exactly in the middle. The
+      same reasoning gives symmetric INT8 the range −127 to 127. That dropped level
+      causes "my reimplementation is slightly wrong and I cannot find why". Write a kernel with 128
+      and compare it against a library that used 127. The outputs differ by a fraction of a percent,
+      and no error is raised.</p>
+
+      <p>Symmetric is cheaper at inference time — the <code>−z</code> cross terms disappear from the
+      matrix multiply — and almost all weight quantization uses it. Asymmetric is better when the
+      distribution is one-sided, as activations after ReLU or GELU are.</p>
+
+      <figure class="scene" data-scene="q-roundtrip">
+        <div class="scene__head">
+          <span class="scene__badge">animation</span>
+          <span class="scene__title">One weight, all the way there and back</span>
+        </div>
+        <div class="scene__stage">
+          <svg viewBox="0 0 900 340" role="img" aria-label="A weight of 0.55 divided by a scale of 0.25, rounded to the integer 2, stored in four bits, and multiplied back to 0.50 with the leftover error shown">
+            <g id="qr-plot"></g>
+          </svg>
+        </div>
+      </figure>
+
+      <p>The round trip loses something, and the loss is bounded. The stored value is on the grid;
+      the true value is at most half a step away:</p>
+
+      <div class="eq">|ŵ − <b>w</b>|  ≤  s / 2</div>
+
+      <p>That is the worst case; the typical case is more useful. Treat the rounding error as spread
+      evenly over that interval and its <strong>mean squared error</strong> — the average of the
+      squared error — is <code>s² / 12</code>. With s = 0.25 that is 0.0625 / 12 = 0.0052, so a
+      typical error is √0.0052 ≈ 0.072, neatly inside the 0.00 to 0.12 that
+      <code>roundtrip.py</code> prints below. Halve the scale to 0.125 and it falls to 0.0013, four
+      times smaller. <strong>Halving the scale quarters the squared error.</strong> And the scale is
+      set by the largest magnitude in the group — the next two sections follow from that.</p>
+
+      <div class="code">
+        <div class="code__head"><span>roundtrip.py</span><span class="lang">python</span></div>
+        <pre><code>import torch
+
+w = torch.tensor([-0.42, 0.13, 1.75, -0.08, 0.55, -1.20, 0.31, 0.02])
+
+qmax = 7                                  # signed INT4, symmetric
+s = w.abs().max() / qmax                  # 1.75 / 7 = 0.25
+q = torch.clamp(torch.round(w / s), -qmax, qmax).to(torch.int8)
+w_hat = q.to(w.dtype) * s                 # dequantize
+
+print(q)              # the codes:  -2, 1, 7, 0, 2, -5, 1, 0
+print(w_hat)          # what you get back: -0.50, 0.25, 1.75, 0.00, 0.50, -1.25, 0.25, 0.00
+print((w_hat - w).abs().max().item())     # about 0.12, and s/2 = 0.125</code></pre>
+      </div>
+
+      <h2 id="granularity"><span class="h-num">07 · 4</span>Granularity: how many scales do you keep?</h2>
+
+      <p>One scale for a whole 4096 × 4096 matrix means 16.7 million weights sharing a single step
+      size, chosen by whichever single weight happens to be largest. That is the cheapest option and
+      the worst. The alternatives cost metadata, and the metadata is small:</p>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>Granularity</th><th>Scales for a 4096 × 4096 layer</th><th>Extra bits / weight</th><th>Robustness</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>Per-tensor</td><td class="num">1</td><td class="num">≈ 0</td><td>Worst. One outlier anywhere sets the scale.</td></tr>
+            <tr><td>Per-channel (per row)</td><td class="num">4 096</td><td class="num">0.004</td><td>Good for weights. The standard for INT8.</td></tr>
+            <tr><td>Per-group, group = 128</td><td class="num">131 072</td><td class="num">0.25</td><td>The standard for INT4.</td></tr>
+            <tr><td>Per-group, group = 32</td><td class="num">524 288</td><td class="num">1.0</td><td>Best accuracy, biggest overhead.</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>Check the second row yourself; the project asks for it. One FP16 scale per row
+      is 4 096 × 16 = 65 536 bits over 16.8 million weights: 0.004 extra bits per weight. Group 128
+      is larger only because there are far more groups — 131 072 × 32 bits, a scale and a zero
+      point, ÷ 16.8 million = 0.25.</p>
+
+      <figure class="scene" data-scene="q-grain">
+        <div class="scene__head">
+          <span class="scene__badge">animation</span>
+          <span class="scene__title">One scale, one per row, one per group of weights</span>
+        </div>
+        <div class="scene__stage">
+          <svg viewBox="0 0 900 320" role="img" aria-label="A weight matrix gaining more and more scale factors, from one for the whole tensor to one per group, while an error meter falls">
+            <g id="qg-plot"></g>
+          </svg>
+        </div>
+      </figure>
+
+      <p>For <strong>activations</strong> the natural axis differs. An activation tensor is
+      <code>[batch, sequence, features]</code>, and the useful choice is one scale per <em>token</em>,
+      computed on the fly. One rule decides all of it:</p>
+
+      <div class="callout callout--key">
+        <span class="callout__label">Remember this</span>
+        <p class="mt-0">Put your scales on an axis the matrix multiply does <strong>not</strong> sum
+        over. Two terms of a dot product show why:
+        <code>s·q₁·x₁ + s·q₂·x₂ = s·(q₁x₁ + q₂x₂)</code>. You can lift <code>s</code> out only
+        because it is the same in both terms. Give them different scales and there is nothing to
+        lift out, so the integer matrix multiply stops being an integer matrix multiply.</p>
+      </div>
+
+      <p>Group-wise quantization looks like a violation of that rule. It is not. Group-128 scales
+      <em>do</em> split the reduction axis, and the kernel copes by accumulating one integer partial
+      sum per group, rescaling each, then adding them. The rule holds inside each group; the kernel
+      just pays for more rescales.</p>
+
+      <p>That is also the practical warning about group size. A group of 32 is more accurate than 128,
+      but may land on a slower code path, because the kernel reloads a scale four times more often.
+      Accuracy and speed do not always move together, so measure both — Lesson 08 teaches how.</p>
+
+      <h2 id="outliers"><span class="h-num">07 · 5</span>Outliers, and why activations are harder</h2>
+
+      <p>Weights are well behaved: roughly bell-shaped, centred on zero, no extreme values.
+      Activations inside a large language model are not. Lesson 06 met these outliers already — they
+      are why Wanda scores a weight by |w| × ‖x‖ rather than |w| alone. Here is what one does. Take
+      the eight-weight group above and change one value from 1.75 to 17.50.</p>
+
+      <figure class="scene" data-scene="q-outlier">
+        <div class="scene__head">
+          <span class="scene__badge">animation</span>
+          <span class="scene__title">One huge value, and the other seven collapse</span>
+        </div>
+        <div class="scene__stage">
+          <svg viewBox="0 0 900 330" role="img" aria-label="Eight values on a grid of quantization levels; one value becomes ten times larger, the grid becomes ten times coarser, and seven of the eight values round to zero">
+            <g id="qo-plot"></g>
+          </svg>
+        </div>
+      </figure>
+
+      <p>The scale went from 0.25 to 2.50, and seven of the eight weights now round to exactly zero.
+      One outlier destroyed the group. That picture justifies group-wise quantization and every
+      method named below.</p>
+
+      <p>Now the part that makes activation quantization genuinely hard. The LLM.int8() work
+      measured transformers as they grow. Above about 6.7 billion parameters the behaviour changes
+      suddenly and stays changed: the same outlier appears in <em>all</em> layers, in the
+      <em>same</em> feature dimension, for about 75% of sequence positions. Roughly 150 000 outlier
+      values per sequence, in only 6 feature dimensions, about 20 times larger than every other
+      channel. Set that 0.1% of features to zero and validation perplexity degrades by 600% or
+      more.</p>
+
+      <p>So the outliers are enormous, rare and essential. Three responses exist, and you meet all
+      three in tool names:</p>
+
+      <ol>
+        <li><strong>Mixed-precision decomposition</strong> (LLM.int8()): send the ~0.1% outlier
+        columns through FP16, the rest through INT8. Correct, but it breaks the single clean matmul,
+        so it is slow.</li>
+        <li><strong>Migrate the difficulty</strong> (SmoothQuant): divide the activations by a
+        per-channel factor and multiply the weights by the same factor. Two numbers show the output
+        does not change. An activation of 8 times a weight of 0.1 is 0.8. Divide the activation by 4
+        and multiply the weight by 4: 2 × 0.4 is still 0.8. The outlier shrank fourfold and nothing
+        else moved. Weights tolerate being larger; activations could not. The knob is the
+        <strong>migration strength</strong>, from 0 to 1: the factor is the channel's largest
+        activation raised to that power, divided by its largest weight raised to one minus it. At 0
+        the activations are untouched, at 1 all the difficulty lands on the weights, and 0.5 splits
+        it.</li>
+        <li><strong>Protect the weight channels that matter most</strong> (AWQ, activation-aware
+        weight quantization): about 1% of weight channels matter, and you find them by
+        <em>activation</em> magnitude, not weight magnitude. Scale those channels up before
+        quantizing, which cuts their relative error. AWQ needs <strong>calibration data</strong>: a
+        few hundred sample sequences pushed through the model, to record the ranges its activations
+        reach. There is no backward pass, so it cannot overfit that data.</li>
+      </ol>
+
+      <p>That splits the field in two. Decode the shorthand once: <strong>W</strong> is weight bits,
+      <strong>A</strong> is activation bits. W4A16 is 4-bit weights multiplied in 16-bit arithmetic;
+      W8A8 is both sides in 8 bits.</p>
+
+      <div class="compare">
+        <div class="compare__col compare__col--a">
+          <h4>Weight-only — W4A16, W8A16</h4>
+          <ul>
+            <li>INT4 weights, dequantized to BF16 inside the kernel, matmul in BF16.</li>
+            <li>Wins on <strong>memory bandwidth</strong>, the limit on one-user generation.</li>
+            <li><strong>GPTQ</strong> — one column at a time, adjusting the columns not yet done to
+            compensate the error already made. Needs calibration data.</li>
+            <li><strong>AWQ</strong> — protects the 1% of channels the activations say matter.</li>
+            <li><strong>HQQ</strong> — no calibration data; fits the scale with a loss that refuses
+            to chase outliers.</li>
+            <li><strong>bitsandbytes</strong> — the NF4 and INT8 backend from Lesson 05.</li>
+            <li><strong>GGUF k-quants</strong> (section 7) and <strong>MLX 4-bit</strong>, Apple
+            Silicon's group-wise format.</li>
+          </ul>
+        </div>
+        <div class="compare__col compare__col--b">
+          <h4>Weight and activation — W8A8, W4A4</h4>
+          <ul>
+            <li>Both operands low precision, so the matmul runs on integer or FP4 units.</li>
+            <li>Wins on <strong>compute</strong>, the limit on prefill and large-batch serving.</li>
+            <li>Needs outlier handling, often specific hardware.</li>
+            <li>SmoothQuant, FP8, MXFP4, NVFP4.</li>
+          </ul>
+        </div>
+      </div>
+
+      <p>On your own device, serving one user, weight-only is almost always right: you are
+      memory-bound, not compute-bound.</p>
+
+      <h2 id="ptq-qat"><span class="h-num">07 · 6</span>PTQ, QAT, and the straight-through estimator</h2>
+
+      <p>So far you quantize a finished model and accept what the rounding costs. Usually that is
+      fine. When it is not, one move remains: let the model keep training while it can feel the
+      rounding. Two regimes, and the second costs far more.</p>
+
+      <p><span class="term" data-term="ptq">PTQ</span> — post-training quantization — takes a
+      trained model, computes the scales, writes out integers. Minutes to hours, no gradients.
+      Almost all on-device deployment uses it, and so will your project.</p>
+
+      <p><strong>Calibration</strong> — the sample-sequence pass from section 5 — is needed when
+      activation scales are baked into the file rather than computed at runtime. Two flavours, and
+      the difference matters:</p>
+
+      <ul>
+        <li><strong>Dynamic</strong>: the scale is computed at runtime, per token, from the tensor
+        in front of you. No calibration, robust, tiny cost. The default for decoding.</li>
+        <li><strong>Static</strong>: the scale is fixed at calibration time. Faster, no extra
+        reduction pass, but fragile — activations outside the calibrated range get clipped. Common on
+        neural processing units (NPUs) and in vision.</li>
+      </ul>
+
+      <p>Calibration data leaks into behaviour, and this surprises people. Scales computed on
+      English web text measurably underperform on code — a distribution shift baked into the file,
+      not a rounding detail. If your model answers support tickets, calibrate on support
+      tickets.</p>
+
+      <p><span class="term" data-term="qat">QAT</span> — quantization-aware training — inserts
+      <em>fake quantize</em> nodes into the forward pass during a short fine-tune. Fake quantize
+      means quantize, then immediately dequantize, staying in floating point. The model feels the
+      rounding error while it can still move in response.</p>
+
+      <p>There is one obstacle. <code>round()</code> has a derivative of exactly zero almost
+      everywhere, and none at all at the steps. Differentiate the fake-quantize node honestly and
+      every gradient is zero, so nothing trains.</p>
+
+      <figure class="scene" data-scene="q-ste">
+        <div class="scene__head">
+          <span class="scene__badge">animation</span>
+          <span class="scene__title">Rounding in the forward pass, identity in the backward pass</span>
+        </div>
+        <div class="scene__stage">
+          <svg viewBox="0 0 900 320" role="img" aria-label="A forward pass through a fake-quantize node into a loss, and a gradient flowing backward straight through the rounding as if it were the identity function">
+            <g id="qs-plot"></g>
+          </svg>
+        </div>
+      </figure>
+
+      <p>The <strong>straight-through estimator</strong> is the fix, and it is a deliberate lie about
+      the backward pass:</p>
+
+      <div class="callout callout--math">
+        <span class="callout__label">The maths, once</span>
+        <div class="eq">forward:    ŵ  =  s × clamp(round(<b>w</b>/s), qmin, qmax)
+
+backward:   <u>∂L/∂w</u>  :=  <u>∂L/∂ŵ</u>  ×  1[ qmin ≤ <b>w</b>/s ≤ qmax ]</div>
+        <p>The gradient is passed through unchanged inside the clipping range and set to zero
+        outside it. In PyTorch you write this in one line, using the fact that
+        <code>detach()</code> removes a term from the graph without changing its value:</p>
+      </div>
+
+      <div class="code">
+        <div class="code__head"><span>ste.py</span><span class="lang">python</span></div>
+        <pre><code>def fake_quantize(w, s, qmax=7):
+    q = torch.clamp(torch.round(w / s), -qmax, qmax)
+    w_q = q * s                                   # the rounded value
+    return w + (w_q - w).detach()                 # value of w_q, gradient of w</code></pre>
+      </div>
+
+      <p>The forward value is <code>w_q</code>, because <code>w + (w_q − w) = w_q</code>. The
+      backward pass sees only <code>w</code>, because the bracket was detached. One line, and the
+      staircase is differentiable enough.</p>
+
+      <p>QAT is real but not magic. torchao reports how much of the BF16-to-INT4 gap its weight-only
+      QAT recovers: for Llama3.2-3B, 38.4% on held-out WikiText and 40.1% on a multi-step reasoning
+      benchmark; for Gemma3, 33.7% and 66.9%. Expect a third to two thirds of the loss back, for the
+      price of a training run.</p>
+
+      <div class="compare">
+        <div class="compare__col compare__col--a">
+          <h4>PTQ — do this first</h4>
+          <ul>
+            <li>Minutes. No gradients, no dataset for weight-only.</li>
+            <li>8-bit weight-only: assume no loss.</li>
+            <li>4-bit with a good method: usually enough.</li>
+            <li>Good enough? Stop. It usually is.</li>
+          </ul>
+        </div>
+        <div class="compare__col compare__col--b">
+          <h4>QAT — when PTQ is not enough</h4>
+          <ul>
+            <li>A full fine-tuning run, with data and a loss curve.</li>
+            <li>Recovers a third to two thirds of what PTQ lost.</li>
+            <li>Worth it below 4 bits, or when one task broke.</li>
+            <li>Combines with LoRA (low-rank adaptation), so few parameters train.</li>
+          </ul>
+        </div>
+      </div>
+
+      <div class="code">
+        <div class="code__head"><span>quantize.py</span><span class="lang">python</span></div>
+        <pre><code>import torch
+from torchao.quantization import quantize_, Int8WeightOnlyConfig, Int4WeightOnlyConfig
+from torchao.quantization.granularity import PerGroup
+
+# 8-bit weight-only. The safe first step: expect no measurable loss.
+quantize_(model, Int8WeightOnlyConfig(granularity=PerGroup(128)))
+
+# 4-bit weight-only, group 128 -> 4.25 bits per weight. quantize_ works in place.
+quantize_(model, Int4WeightOnlyConfig(group_size=128))
+
+# CPU and mobile path: int8 activations, int4 weights, group 32.
+from torchao.quantization import Int8DynamicActivationIntxWeightConfig
+quantize_(model, Int8DynamicActivationIntxWeightConfig(
+    weight_dtype=torch.int4, weight_granularity=PerGroup(32)))</code></pre>
+      </div>
+
+      <p>Note the API shape: <code>quantize_(model, ConfigObject)</code>, in place, with config
+      dataclasses. Older tutorials pass strings or call <code>int4_weight_only()</code>; the current
+      documentation does not. These libraries are renamed and moved often — AutoGPTQ became
+      GPTQModel, HQQ changed repositories. Check every import path against the current docs.</p>
+
+      <div class="code">
+        <div class="code__head"><span>qat.py</span><span class="lang">python</span></div>
+        <pre><code>from torchao.quantization import quantize_, Int4WeightOnlyConfig
+from torchao.quantization.qat import QATConfig
+
+base_config = Int4WeightOnlyConfig(group_size=32)
+
+quantize_(model, QATConfig(base_config, step="prepare"))   # nn.Linear -> FakeQuantizedLinear
+train_loop(model)                                          # your normal loop from Lesson 01
+quantize_(model, QATConfig(base_config, step="convert"))   # -> real quantized Linear</code></pre>
+      </div>
+
+      <h2 id="names"><span class="h-num">07 · 7</span>Reading a quantization name</h2>
+
+      <p>Download a model to run locally and you meet filenames such as
+      <code>model-Q4_K_M.gguf</code>. The
+      <span class="term" data-term="gguf">GPT-Generated Unified Format (GGUF)</span> is llama.cpp's
+      single-file format; the suffix says exactly how the weights were stored. Take it apart:</p>
+
+      <ul>
+        <li><code>Q</code> — quantized to integers.</li>
+        <li><code>4</code> — the nominal bit width of the weights.</li>
+        <li><code>K</code> — a <strong>k-quant</strong>: a super-block scheme where the per-sub-block
+        scales and minimums are themselves quantized, rather than stored as FP16. The same trick as
+        <code>bnb_4bit_use_double_quant</code>, which you switched on in Lesson 05.</li>
+        <li><code>M</code> — the size variant, S / M / L. Larger variants keep some tensors at
+        higher precision, usually the attention value and feed-forward down projections, which is
+        why <code>Q4_K_M</code> is bigger than <code>Q4_K_S</code> at the same nominal width.</li>
+      </ul>
+
+      <p>Do the arithmetic inside <code>Q4_K</code> once; it makes metadata concrete. A
+      super-block holds 256 weights as 8 sub-blocks of 32. It stores a 2-byte FP16 super-scale and a
+      2-byte minimum. Then one scale and one minimum per sub-block, 6 bits each:
+      8 × 2 × 6 = 96 bits = 12 bytes. Then the weights: 256 × 4 bits = 128 bytes. Add them.
+      2 + 2 + 12 + 128 = 144 bytes for 256 weights, and 144 × 8 ÷ 256 =
+      <strong>4.50 bits per weight</strong>.</p>
+
+      <p>That is plain <code>Q4_K</code>. The <code>_M</code> variant's protected tensors lift the
+      whole-file average to about <strong>4.89 bits per weight</strong>. That is the number Lessons
+      08 and 09 use, and why a <code>Q4_K_M</code> file is larger than 4.50 predicts.</p>
+
+      <p>The llama.cpp repo publishes the whole ladder on LLaMA-7B as perplexity added over FP16:
+      Q2_K +0.87, labelled extreme loss; Q3_K_M +0.24; Q4_K_M +0.054, recommended; Q6_K +0.0044;
+      Q8_0 +0.0004, wasteful. Q4_K_M is the default for a reason.</p>
+
+      <p>Two more naming families. <strong>I-quants</strong> — <code>IQ2_XS</code>,
+      <code>IQ3_S</code>, <code>IQ4_XS</code> — are codebook based rather than uniform, reach lower
+      effective bits per weight than the same k-quant, and need an <strong>imatrix</strong>. An
+      importance matrix comes from running calibration text through the model and recording the
+      energy — the sum of squares — each activation column carries. The quantizer weights its
+      objective by that, changing which rounding is chosen, not the bit width.</p>
+
+      <p>Then two microscaling standards, because hardware is moving this way.
+      <strong>MXFP4</strong> uses E2M1 elements in blocks of 32 with one shared 8-bit power-of-two
+      scale: 4.25 bits per weight. <strong>NVFP4</strong> uses blocks of 16 with an FP8 E4M3 scale
+      plus a per-tensor FP32 scale: 4.5 bits, finer blocks and a scale with a mantissa at twice the
+      overhead. NVIDIA reports a 4-bit DeepSeek-R1 within 1% of its 8-bit scores on two hard
+      reasoning benchmarks — but only on hardware running the format natively.</p>
+
+      <p>Otherwise you get the memory saving and no speed-up at all. Without native 4-bit units the
+      kernel dequantizes to BF16 and multiplies in BF16: you keep the memory win, the main one when
+      serving a single user, and gain nothing in arithmetic. Quantized does not mean faster. Lesson
+      08 shows how to time it, so you know instead of assuming.</p>
+
+      <h2 id="measuring"><span class="h-num">07 · 8</span>Measuring the damage</h2>
+
+      <p>This is the part most tutorials skip. Quantization fails silently: the model loads, writes
+      fluent text, and is a little worse. You need numbers.</p>
+
+      <p><strong>First, perplexity.</strong> From Lesson 04,
+      <span class="term" data-term="perplexity">perplexity</span> is the exponential of the
+      cross-entropy loss. Run both models over the same held-out text with the same tokenizer and
+      compare. Cheap, sensitive to broad damage, and the first thing to check.</p>
+
+      <div class="code">
+        <div class="code__head"><span>measure.py</span><span class="lang">python</span></div>
+        <pre><code>import math, torch
+
+@torch.no_grad()
+def perplexity(model, ids, window=1024):
+    model.eval()
+    total, count = 0.0, 0
+    for i in range(0, ids.size(1) - window, window):
+        chunk = ids[:, i:i + window]
+        out = model(chunk, labels=chunk)        # HF models return a mean CE loss
+        total += out.loss.item() * (window - 1)
+        count += window - 1
+    return math.exp(total / count)
+
+ppl_fp = perplexity(base_model, ids)
+ppl_q4 = perplexity(quant_model, ids)
+print(f"{ppl_fp:.3f} -> {ppl_q4:.3f}   delta {ppl_q4 - ppl_fp:+.3f}")</code></pre>
+      </div>
+
+      <p><strong>Second, at least one task score.</strong> Perplexity is dominated by frequent, easy
+      tokens. One evaluation of llama.cpp formats on Llama-3.1-8B-Instruct shows how that hides
+      damage:</p>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>Format</th><th>Size (GB)</th><th>WikiText-2 PPL</th><th>GSM8K</th><th>MMLU</th><th>HellaSwag</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>FP16</td><td class="num">14.96</td><td class="num">7.32</td><td class="num">77.6</td><td class="num">63.5</td><td class="num">72.5</td></tr>
+            <tr><td>Q8_0</td><td class="num">7.96</td><td class="num">7.33</td><td class="num">77.5</td><td class="num">63.4</td><td class="num">72.5</td></tr>
+            <tr><td>Q5_0</td><td class="num">5.21</td><td class="num">7.43</td><td class="num">79.1</td><td class="num">63.2</td><td class="num">72.6</td></tr>
+            <tr><td>Q4_K_S</td><td class="num">4.36</td><td class="num">—</td><td class="num">77.3</td><td class="num">62.1</td><td class="num">72.8</td></tr>
+            <tr><td>Q3_K_S</td><td class="num">3.39</td><td class="num">8.96</td><td class="num">68.3</td><td class="num">59.3</td><td class="num">71.9</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p><b>What those columns measure.</b> <strong>WikiText-2</strong> is held-out encyclopedia
+      text, used here for perplexity (PPL). <strong>GSM8K</strong> is grade-school word problems
+      needing several arithmetic steps in a row. <strong>MMLU</strong>, massive multitask language
+      understanding, is multiple-choice knowledge questions. <strong>HellaSwag</strong> is
+      common-sense sentence completion. One needs a chain of reasoning, the other a stored fact.</p>
+
+      <p>Read the bottom row carefully. At Q3_K_S, GSM8K falls 9.3 points while HellaSwag moves 0.6.
+      <strong>Reasoning degrades first; recall and common sense last.</strong> Look only at
+      perplexity and you see 7.32 become 8.96, with no idea which ability you spent.</p>
+
+      <p>Now the Q5_0 row: GSM8K is 79.1 against FP16's 77.6. The quantized model scored
+      <em>higher</em>. That is benchmark noise, and it is the most useful row here, because it sizes
+      the measurement error you are working inside.</p>
+
+      <figure class="scene" data-scene="q-damage">
+        <div class="scene__head">
+          <span class="scene__badge">animation</span>
+          <span class="scene__title">Where the damage lands, format by format</span>
+        </div>
+        <div class="scene__stage">
+          <svg viewBox="0 0 900 330" role="img" aria-label="Three meters falling row by row through the quantization formats: perplexity creeping up, the reasoning score collapsing at three bits, the common-sense score staying flat, and the noisy Q5_0 row highlighted">
+            <g id="qd-plot"></g>
+          </svg>
+        </div>
+      </figure>
+
+      <p><strong>Third, read the outputs.</strong> Fix ten prompts, set temperature to zero, generate
+      before and after. Numbers cannot see a model that repeats itself, loses a language or drops its
+      chat format. Your eyes can.</p>
+
+      <div class="callout callout--key">
+        <span class="callout__label">How much loss is acceptable</span>
+        <ul class="mt-0">
+          <li><strong>8-bit weight-only</strong>: free. Assume no loss.</li>
+          <li><strong>4-bit weight-only, group 128, good method</strong>: 1–2% relative loss. Fine
+          for nearly anything you ship.</li>
+          <li><strong>3-bit</strong>: visible. Maths and multi-step reasoning suffer first.</li>
+          <li><strong>2-bit</strong>: only with i-quants and an imatrix, on large models. At equal
+          file size a 2-bit large model usually beats a 4-bit small one.</li>
+        </ul>
+      </div>
+
+      <div class="callout callout--pitfall">
+        <span class="callout__label">Two ways to fool yourself</span>
+        <p class="mt-0">Never compare your quantized score to a number from a paper. Prompt
+        template, temperature and harness version move scores more than 4-bit quantization does, so
+        run your own FP16 baseline in your own harness. And the
+        <span class="term" data-term="kv cache">key-value (KV) cache</span> is a separate decision: at long
+        context it, not the weights, dominates memory. A 4-bit model with an FP16 cache leaves most
+        of your memory problem unsolved.</p>
+      </div>
+
+      <p>One last check before you blame the bit width: <strong>not every tensor gets
+      quantized</strong>. Embeddings, the output head, the normalisation layers and the
+      mixture-of-experts router are usually kept at higher precision — gpt-oss excludes all four from
+      its 4-bit conversion. They are a small share of the parameters and a large share of the damage.
+      If your model collapsed, check whether your tool converted something it should have left
+      alone.</p>
+
+      <div class="project">
+        <span class="project__label">Project 07</span>
+        <h3>FP32 to INT4, measured honestly</h3>
+        <p>Take the model you fine-tuned in Lesson 05, adapter merged into the base weights, and
+        produce one table at four precisions: bits per weight, megabytes on disk, perplexity, one
+        task score, tokens per second. That table is the deliverable. Anyone can call
+        <code>quantize_</code>; the skill is knowing the cost.</p>
+        <ol class="steps">
+          <li><strong>Baseline.</strong> The checkpoint ships in BF16, so upcast it once: load with
+              <code>dtype=torch.float32</code> and save it. That file is the 1440 MB FP32 reference
+              every row below is measured against. Record size on disk, perplexity on a held-out
+              slice, one task score, and ten fixed prompts generated at temperature 0.</li>
+          <li><strong>INT8 weight-only.</strong> <code>quantize_(model, Int8WeightOnlyConfig())</code>.
+              Re-measure. Size should fall and metrics should not move.</li>
+          <li><strong>INT4 weight-only</strong> at group 128, then 64, then 32. On a Mac use
+              <code>Int8DynamicActivationIntxWeightConfig(weight_dtype=torch.int4, ...)</code>.</li>
+          <li><strong>Count the bits yourself.</strong> File size in bits ÷ parameter count. Confirm
+              4.25, not 4.00, for group 128, and explain the difference.</li>
+          <li><strong>Write the table.</strong> Include the delta column. A result without a delta is
+              not a result.</li>
+        </ol>
+        <p><strong>Then break it on purpose.</strong> Each of these fails quietly, which is the
+        point:</p>
+        <ul>
+          <li>Quantize one linear layer <strong>per-tensor</strong>. What does one scale for the
+              whole matrix cost in perplexity?</li>
+          <li>Multiply one weight in a row by 20, quantize that row symmetrically, print it back.
+              Count how many weights became exactly zero.</li>
+          <li>Quantize the <strong>embedding and output head</strong> too, and go to 3 bits if your
+              backend allows. Watch arithmetic prompts break while story prompts read fine.</li>
+          <li><em>Optional:</em> one epoch of QAT with <code>QATConfig</code>. How much of the 4-bit
+              gap comes back?</li>
+        </ul>
+        <dl class="project__grid">
+          <div class="project__stat"><dt>Data</dt><dd>Held-out text + 10 fixed prompts</dd></div>
+          <div class="project__stat"><dt>Size</dt><dd>1440 MB → ≈ 191 MB</dd></div>
+          <div class="project__stat"><dt>Time</dt><dd>≈ 40 min, no training</dd></div>
+          <div class="project__stat"><dt>Target</dt><dd>INT4 within 2% relative on your task score</dd></div>
+        </dl>
+      </div>
+
+      <h2 id="check">Check yourself</h2>
+
+      <div class="check">
+        <p class="check__q">You store a model in INT4 at group size <strong>64</strong>, keeping one
+        FP16 scale and one <strong>INT8</strong> zero point per group. What is the true bits per
+        weight?</p>
+        <div class="check__opts">
+          <button class="check__opt">4.00 — metadata is negligible</button>
+          <button class="check__opt">4.25</button>
+          <button class="check__opt" data-right>4.375</button>
+          <button class="check__opt">4.50</button>
+        </div>
+        <p class="check__why">Metadata is 16 + 8 = 24 bits per group of 64 weights, so
+        24 ÷ 64 = 0.375 extra bits per weight, and 4 + 0.375 = 4.375. This configuration appears
+        nowhere in the lesson: you can now cost any of them.</p>
+      </div>
+
+      <div class="check">
+        <p class="check__q">Your INT4 model has almost the same perplexity as the BF16 original, but
+        now fails multi-step arithmetic it used to answer. Most likely explanation?</p>
+        <div class="check__opts">
+          <button class="check__opt">The perplexity measurement is wrong; recompute it</button>
+          <button class="check__opt">Quantization cannot affect reasoning, so this is a prompt bug</button>
+          <button class="check__opt" data-right>Perplexity is dominated by frequent, easy tokens, and reasoning is the ability that degrades first</button>
+          <button class="check__opt">The tokenizer changed during quantization</button>
+        </div>
+        <p class="check__why">Perplexity averages over every token, most of them easy. At Q3_K_S
+        GSM8K fell 9.3 points while HellaSwag moved 0.6. Always evaluate one reasoning task.</p>
+      </div>
+
+      <div class="check">
+        <p class="check__q">You write fake quantize as <code>w_q = q * s</code> and return
+        <code>w_q</code> directly, without <code>detach()</code>. You run a few training steps. What
+        do you see?</p>
+        <div class="check__opts">
+          <button class="check__opt">The loss falls faster, because the gradients are now exact</button>
+          <button class="check__opt" data-right>The loss curve is flat, <code>w.grad</code> is all zeros, and the weights never move</button>
+          <button class="check__opt">The loss becomes NaN on the first backward pass</button>
+          <button class="check__opt">Training works, but the weights are stuck in FP32</button>
+        </div>
+        <p class="check__why">The chain rule multiplies everything upstream by the derivative of
+        <code>round()</code>, which is 0 between the steps. So every gradient reaching <code>w</code>
+        is zero and the optimizer has nothing to apply. The straight-through estimator replaces that
+        derivative with 1 inside the clipping range: <code>w + (w_q - w).detach()</code>.</p>
+      </div>
+
+      <div class="terms">
+        <span class="terms__label">Key words from this lesson</span>
+        <dl>
+          <dt>Scale <span class="en">often written s</span></dt>
+          <dd>The size of one step on the integer grid. It turns a stored integer back into a real value.</dd>
+
+          <dt>Zero point <span class="en">also: offset</span></dt>
+          <dd>The integer that maps to exactly 0.0. Symmetric quantization forces it to 0 and stores nothing.</dd>
+
+          <dt>Symmetric quantization</dt>
+          <dd>The grid is centred on zero; the scale comes from the largest magnitude in the group.</dd>
+
+          <dt>Group size</dt>
+          <dd>How many weights share one scale. Smaller groups cost more metadata, lose less accuracy.</dd>
+
+          <dt>Outlier channel</dt>
+          <dd>A feature dimension whose activations dwarf every other dimension, in every layer.</dd>
+
+          <dt>Weight-only quantization <span class="en">written W4A16</span></dt>
+          <dd>Weights stored small, expanded in the kernel; arithmetic still in 16 bits. W is weight bits, A is activation bits.</dd>
+
+          <dt>Mixture of experts <span class="en">MoE</span></dt>
+          <dd>Many parallel copies of a block's feed-forward network, plus a router sending each token to two or three.</dd>
+
+          <dt>Calibration data</dt>
+          <dd>A few hundred sample sequences pushed through the model, recording the activation ranges reached.</dd>
+
+          <dt>Straight-through estimator <span class="en">STE</span></dt>
+          <dd>Round in the forward pass; pretend in the backward pass that the rounding was the identity.</dd>
+
+          <dt>imatrix <span class="en">importance matrix</span></dt>
+          <dd>A record of which columns matter most, used to choose better rounding at the same bit width.</dd>
+
+          <dt>Perplexity delta</dt>
+          <dd>Quantized perplexity minus original, on the same text.</dd>
+        </dl>
+      </div>
+
+      <h2 id="resources">Go deeper</h2>
+
+      <div class="resources">
+        <a class="res" href="https://docs.pytorch.org/ao/stable/" target="_blank" rel="noopener">
+          <span class="res__kind" data-kind="docs">docs</span>
+          <span class="res__body">
+            <span class="res__title">torchao documentation</span>
+            <span class="res__why">Every config object used here, plus the QAT workflow. Read before copying older code.</span>
+          </span>
+        </a>
+        <a class="res" href="https://huggingface.co/docs/transformers/main/en/quantization/overview" target="_blank" rel="noopener">
+          <span class="res__kind" data-kind="docs">docs</span>
+          <span class="res__body">
+            <span class="res__title">Transformers — quantization backends overview</span>
+            <span class="res__why">Every backend and the hardware it needs. Read it when choosing between AWQ, GPTQ and bitsandbytes.</span>
+          </span>
+        </a>
+        <a class="res" href="https://arxiv.org/html/2601.14277v1" target="_blank" rel="noopener">
+          <span class="res__kind" data-kind="paper">paper</span>
+          <span class="res__body">
+            <span class="res__title">Which Quantization Should I Use?</span>
+            <span class="res__why">The source of the table above, and a model for your own write-up.</span>
+          </span>
+        </a>
+        <a class="res" href="https://arxiv.org/abs/2208.07339" target="_blank" rel="noopener">
+          <span class="res__kind" data-kind="paper">paper</span>
+          <span class="res__body">
+            <span class="res__title">LLM.int8() — outlier features in large transformers</span>
+            <span class="res__why">Where section 5's outlier numbers come from, and why W8A8 is unsolved.</span>
+          </span>
+        </a>
+        <a class="res" href="https://github.com/ggml-org/llama.cpp/blob/master/tools/quantize/README.md" target="_blank" rel="noopener">
+          <span class="res__kind" data-kind="code">code</span>
+          <span class="res__body">
+            <span class="res__title">llama.cpp — the quantize tool</span>
+            <span class="res__why">The command line, imatrix flags and per-tensor overrides: checkpoint to runnable GGUF.</span>
+          </span>
+        </a>
+      </div>
+
+      <div class="callout callout--try">
+        <span class="callout__label">Next</span>
+        <p class="mt-0">Your model is four to eight times smaller and you can prove what that cost.
+        But smaller is not faster, and you have assumed a speed-up rather than measured one. In
+        <strong>Lesson 08</strong> we time it: where the milliseconds go, why synchronisation is what
+        everybody gets wrong first, and how memory bandwidth sets a ceiling you can compute up
+        front.</p>
+      </div>
+
+    </article>
+  </main>
+
+  <aside class="toc-rail"></aside>
+</div>
+
+<script src="../assets/js/vendor/gsap.min.js"></script>
+<script src="../assets/js/scene.js"></script>
+<script src="../assets/js/svgkit.js"></script>
+<script src="../data/lessons.js"></script>
+<script src="../data/glossary.js"></script>
+<script src="../assets/js/course.js"></script>
+<script src="../data/narration/07.js"></script>
+<script src="../data/narration/07.timing.js" onerror="void 0"></script>
+<script src="../assets/js/scenes/07.js"></script>
+<script src="../assets/js/film.js"></script>
+</body>
+</html>

@@ -1,0 +1,1016 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>09 · Export: leaving PyTorch — Model Engineering</title>
+<meta name="description" content="Capture your model as a graph, then send that graph to ExecuTorch, ONNX, Core ML or GGUF — and check that it still gives the same answers.">
+<link rel="stylesheet" href="../assets/css/course.css">
+</head>
+<body data-lesson="09">
+
+<div class="shell shell--wide">
+  <nav class="rail" aria-label="Lessons"></nav>
+
+  <main class="main">
+    <article class="prose">
+
+      <header class="lesson-head">
+        <span class="lesson-head__num">09</span>
+        <h1>Export: leaving PyTorch</h1>
+        <p class="lead">A trained model is a Python object. A phone is not a Python interpreter.
+        This lesson is about the file you hand over at the border. How it is made, which four
+        borders you can cross, and how to prove the model still works on the other side.</p>
+        <div class="lesson-head__meta">
+          <span class="chip"><b>Part IV</b> · Ship it</span>
+          <span class="chip">≈ <b>130 min</b> reading</span>
+          <span class="chip">Project · <b>The same model, four formats</b></span>
+          <span class="chip">Needs · <b>Lessons 04, 05, 07, 08</b></span>
+        </div>
+      </header>
+
+      <section class="outcomes">
+        <h2>By the end you can</h2>
+        <ul>
+          <li>Say what <strong>torch.export</strong> produces, and how it differs from the older
+              tracing and scripting.</li>
+          <li>Choose between <strong>ExecuTorch</strong>, the Open Neural Network Exchange
+              (<strong>ONNX</strong>), <strong>Core ML</strong> and the GPT-Generated Unified Format
+              (<strong>GGUF</strong>) for a given target, and name the cost of each.</li>
+          <li>Declare <strong>dynamic shapes</strong> so an export does not break on the second input
+              you give it.</li>
+          <li>Read a <strong>partition report</strong> and say which part of your graph really runs on
+              the accelerator.</li>
+          <li>Verify an export <strong>numerically</strong> against PyTorch, with a tolerance you can
+              defend.</li>
+        </ul>
+      </section>
+
+      <h2 id="why"><span class="h-num">09 · 1</span>Why you cannot ship Python</h2>
+
+      <p>Everything you have built so far lives inside a Python process. A
+      <code>nn.Module</code> is a Python class. Its <code>forward</code> method is Python code that
+      calls into the PyTorch C++ library, one operator at a time, deciding what to do next while it
+      runs.</p>
+
+      <p>That mode — one operator, then a decision, then the next operator — is called
+      <strong>eager</strong> execution. Eager means the Python is still in charge. The word turns up
+      in export error messages and throughout this lesson, so attach it now. The design is excellent
+      for research. It is unusable as a product for three separate reasons.</p>
+
+      <p><strong>Size.</strong> To run your model, a device would need a Python interpreter plus the
+      full PyTorch library. That is hundreds of megabytes before your weights. App stores limit what
+      you may download; browsers have no Python at all.</p>
+
+      <p><strong>Speed.</strong> Every operator costs a trip through the Python interpreter. On a
+      server with large batches that overhead disappears into the arithmetic. On a phone generating
+      one token at a time it does not.</p>
+
+      <p><strong>Platform.</strong> An iOS app cannot ship a general Python runtime. A web page
+      cannot import <code>torch</code>. An embedded board has no filesystem to install packages
+      into. These are not performance problems; they are hard walls.</p>
+
+      <p>So you stop shipping a program and start shipping <em>data</em>: a frozen description of the
+      computation, plus the numbers, in one file. A small C++ runtime — a few megabytes, not a few
+      hundred — reads that file and executes it. The word for making that file is
+      <strong>export</strong>.</p>
+
+      <div class="callout callout--key">
+        <span class="callout__label">Remember this</span>
+        <p class="mt-0">Export is not one action. It is three, and they fail in different ways.
+        <strong>Capture</strong> turns Python into a graph. <strong>Lowering</strong> rewrites the
+        graph's operators into what a backend understands. <strong>Partitioning</strong> decides
+        which piece of the graph each accelerator gets. When people say "the export failed", ask
+        which of the three.</p>
+      </div>
+
+      <p>Two models travel with you through this lesson, and they have different jobs. The tiny GPT
+      you trained in Lesson 04 is the <strong>warm-up</strong>. It is small, it is yours, and you
+      understand every line of it, so when an export fails you can go and look. The model you
+      fine-tuned in Lesson 05 is the <strong>one you ship</strong>. That is the file Lesson 10 runs
+      on a device and Lesson 13 loads as the assistant's brain.</p>
+
+      <p>For the model you ship, three steps happen in a fixed order, and it is the order of this
+      course. First, merge your <span class="term" data-term="lora">LoRA</span> — low-rank
+      adaptation — adapter into the base weights (Lesson 05). A graph of frozen weights plus a side
+      branch is harder for every backend than one plain weight matrix. Second,
+      <span class="term" data-term="quantization">quantize</span> (Lesson 07), because the target
+      toolchain expects to see the low-precision weights it will store. Export last.</p>
+
+      <p>Exporting an FP32 model and hoping the runtime will shrink it later is how people end up
+      with a 1.4 GB artefact they cannot ship. That is the same 1440 MB you measured in Lesson 07,
+      and the same model, at INT4, was 191 MB.</p>
+
+      <h2 id="capture"><span class="h-num">09 · 2</span>What torch.export actually produces</h2>
+
+      <p><code>torch.export.export()</code> runs your model <strong>once</strong>, with example
+      inputs you provide, and writes down every tensor operation it sees. It does not write down the
+      Python around those operations. That single sentence explains nearly every export problem in
+      this lesson.</p>
+
+      <figure class="scene" data-scene="ex-capture">
+        <div class="scene__head">
+          <span class="scene__badge">animation</span>
+          <span class="scene__title">Python goes in; a flat graph comes out, and some lines do not survive</span>
+        </div>
+        <div class="scene__stage">
+          <svg viewBox="0 0 900 340" role="img" aria-label="Python source on the left with the branch and loop marked in red, and the captured operator graph on the right">
+            <g id="exc-plot"></g>
+          </svg>
+        </div>
+      </figure>
+
+      <p>The result is an <strong>ExportedProgram</strong>. It holds four things:</p>
+
+      <ul>
+        <li>A single, flat graph of <strong>ATen operators</strong> — PyTorch's small, fixed
+            vocabulary of primitive tensor operations. No Python, no classes, no method calls.</li>
+        <li>The <strong>weights</strong>, kept in a separate state dictionary rather than baked into
+            the graph.</li>
+        <li>A <strong>graph signature</strong> that says which graph inputs are parameters, which are
+            buffers, and which are the arguments a caller passes.</li>
+        <li><strong>Shape constraints</strong>: which dimensions are fixed numbers, which are symbols,
+            and what range each symbol may take.</li>
+      </ul>
+
+      <div class="code">
+        <div class="code__head"><span>export_graph.py</span><span class="lang">python</span></div>
+        <pre><code>import torch
+from torch.export import export, Dim
+
+model = TinyGPT().eval()                 # your model from Lesson 04
+ids = torch.randint(0, 4096, (1, 128))   # one example input
+
+ep = export(model, (ids,), dynamic_shapes={"ids": {1: Dim.DYNAMIC}})
+
+print(ep.graph_module)        # the flat ATen graph
+print(ep.graph_signature)     # parameters vs buffers vs user inputs
+print(ep.range_constraints)   # e.g. s0 in [1, inf)
+
+torch.export.save(ep, "gpt.pt2")</code></pre>
+      </div>
+
+      <p>Ignore <code>dynamic_shapes</code> and <code>s0</code> for one more section. §4 is entirely
+      about them. For now, <code>s0</code> is simply the name export gave to a dimension it agreed
+      to leave open, and <code>[1, inf)</code> is the range it will accept.</p>
+
+      <p>The keys in <code>dynamic_shapes</code> are the <em>argument names</em> of your
+      <code>forward</code> method. If <code>forward(self, ids)</code> becomes
+      <code>forward(self, tokens)</code>, the key must change too.</p>
+
+      <p>You will meet two older tools in old code. <code>torch.jit.trace</code> also ran the model
+      once, but it folded the weights into the graph and recorded nothing about which shapes could
+      change. <code>torch.jit.script</code> parsed a subset of Python, so it could keep an
+      <code>if</code> statement, but the subset was small and its errors were hard to act on.
+      <code>torch.export</code> replaces both.</p>
+
+      <div class="callout callout--pitfall">
+        <span class="callout__label">Common trap</span>
+        <p class="mt-0">In current PyTorch (2.13.0), <code>export</code> takes
+        <code>strict=False</code> by default. Non-strict capture traces through the normal Python
+        runtime. Passing <code>strict=True</code> captures through <strong>TorchDynamo</strong>
+        instead. TorchDynamo is PyTorch's bytecode-level tracer: rather than running your Python and
+        watching the tensors go by, it reads the Python itself and refuses anything it cannot prove.
+        It is stricter, and it rejects assumptions that non-strict capture accepts in silence. This is the
+        <em>reverse</em> of the original default, so any tutorial written before this change tells
+        you the wrong thing. When an export succeeds but the graph looks too simple, re-run it with
+        <code>strict=True</code> and read the complaints.</p>
+      </div>
+
+      <p>The saved <code>.pt2</code> archive is a portable intermediate, not a device format. No
+      phone runtime loads it. It is the hand-off point: the artefact you keep in version control and
+      feed to each of the four converters below.</p>
+
+      <h2 id="destinations"><span class="h-num">09 · 3</span>The four destinations</h2>
+
+      <p>An <code>ExportedProgram</code> is still not a file a phone can run. Four tools can turn it
+      into one, and each answers the same two questions differently: <strong>which runtime will read
+      this file, and who maintains that runtime?</strong> Three of the four start from the
+      <code>ExportedProgram</code> you just made. The fourth ignores capture and reads your
+      checkpoint instead. Read this section for what each one costs; <a href="#decide">§8</a> turns
+      the same four into a table you can decide from.</p>
+
+      <figure class="scene" data-scene="ex-fanout">
+        <div class="scene__head">
+          <span class="scene__badge">animation</span>
+          <span class="scene__title">One captured graph, three converters — and a fourth path that starts somewhere else</span>
+        </div>
+        <div class="scene__stage">
+          <svg viewBox="0 0 900 330" role="img" aria-label="An exported program fanning out to a .pte, .onnx and .mlpackage file, with GGUF drawn on a separate grey path from the checkpoint">
+            <g id="exf-plot"></g>
+          </svg>
+        </div>
+      </figure>
+
+      <h3 id="executorch">ExecuTorch — staying inside PyTorch</h3>
+
+      <p><span class="term" data-term="executorch">ExecuTorch</span> is PyTorch's own on-device
+      runtime. It reached 1.0 on 17 October 2025, and the release you install today is 1.4.1. Its
+      <em>wheel</em> — the pre-built package <code>pip</code> downloads — supports Python 3.10 to
+      3.14.</p>
+
+      <p>The artefact is a <strong><code>.pte</code></strong> file. It is a <em>flatbuffer</em>: a
+      binary layout you read straight from disk, with no parsing step first. Inside are the lowered
+      program, any compiled backend blobs, and normally the weights. The layout is what lets the
+      runtime <code>mmap</code> the file — map it into memory and read pages on demand, instead of
+      loading all of it up front.</p>
+
+      <div class="code">
+        <div class="code__head"><span>to_pte.py</span><span class="lang">python</span></div>
+        <pre><code>from executorch.exir import to_edge_transform_and_lower
+from executorch.backends.xnnpack.partition.xnnpack_partitioner import XnnpackPartitioner
+
+et = to_edge_transform_and_lower(
+    ep,                                    # the ExportedProgram from above
+    partitioner=[XnnpackPartitioner()],    # CPU backend, works everywhere
+).to_executorch()
+
+with open("gpt.pte", "wb") as f:
+    f.write(et.buffer)</code></pre>
+      </div>
+
+      <p>The list you pass to <code>partitioner=</code> is the whole story of ExecuTorch. Three
+      words get confused constantly, and the rest of this lesson depends on keeping them apart:</p>
+
+      <ul>
+        <li>A <strong>backend</strong> is the hardware target, plus the code that runs on it — CPU
+            kernels, GPU shaders, an accelerator compiler.</li>
+        <li>A <strong>partitioner</strong> is the Python object you pass at export time. It walks
+            the graph on one backend's behalf and claims the nodes that backend can run.</li>
+        <li>A <strong>delegate call</strong> is the single graph node that replaces each claimed run
+            of operators. One call in, one call out, the backend's business in between.</li>
+      </ul>
+
+      <p>Whatever no partitioner claims stays as a portable CPU kernel. That is why a single
+      <code>.pte</code> can target very different hardware. Several rows below name an
+      <span class="term" data-term="npu">NPU</span> — a <strong>neural processing unit</strong>, a
+      fixed-function accelerator built only for neural-network arithmetic. It sits beside the CPU
+      and the GPU on most recent phone chips. Apple's version is called the Neural Engine.</p>
+
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Backend</th><th>Hardware</th><th>Platform</th><th>Maturity at 1.0</th></tr></thead>
+          <tbody>
+            <tr><td>XNNPACK</td><td>CPU</td><td>all</td><td>production</td></tr>
+            <tr><td>Core ML</td><td>Neural Engine / GPU / CPU</td><td>iOS, macOS</td><td>production</td></tr>
+            <tr><td>Qualcomm AI Engine</td><td>Hexagon NPU</td><td>Android</td><td>production</td></tr>
+            <tr><td>Arm Ethos-U</td><td>NPU</td><td>embedded</td><td>production</td></tr>
+            <tr><td>Vulkan</td><td>GPU</td><td>Android</td><td>production</td></tr>
+            <tr><td>MPS (Metal Performance Shaders)</td><td>GPU</td><td>iOS, macOS</td><td>beta</td></tr>
+            <tr><td>MediaTek</td><td>NPU</td><td>Android</td><td>beta</td></tr>
+            <tr><td>Cadence DSP (digital signal processor), Arm Cortex-M</td><td>DSP / microcontroller</td><td>embedded</td><td>alpha / beta</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>On the device side, C++ loads the file with a <code>Module</code> object, Kotlin uses
+      <code>org.pytorch.executorch.Module.load(...)</code>, and iOS pulls the runtime in through
+      Swift Package Manager. Meta runs ExecuTorch in production inside Instagram, WhatsApp and the
+      Ray-Ban Display glasses, so the runtime itself is not the risky part.</p>
+
+      <h3 id="onnx">ONNX — the widest reach</h3>
+
+      <p><span class="term" data-term="onnx">ONNX</span> — Open Neural Network Exchange — is a
+      format defined by a committee rather than by one framework, which is both its strength and its
+      cost. The graph is written in an
+      <strong>opset</strong>: a numbered version of the operator vocabulary. <code>onnx</code>
+      1.22.0 introduces opset 27. You pick the opset your runtime supports — a newer opset has more
+      operators and fewer awkward rewrites, an older opset runs in more places.</p>
+
+      <div class="code">
+        <div class="code__head"><span>to_onnx.py</span><span class="lang">python</span></div>
+        <pre><code>import numpy as np, onnxruntime as ort
+import torch
+from torch.export import Dim
+
+torch.onnx.export(model, (ids,), "gpt.onnx", dynamo=True,
+                  dynamic_shapes={"ids": {1: Dim.DYNAMIC}})
+
+sess = ort.InferenceSession("gpt.onnx", providers=["CPUExecutionProvider"])
+out = sess.run(None, {"ids": np.random.randint(0, 4096, (1, 200)).astype("int64")})
+print(out[0].shape)</code></pre>
+      </div>
+
+      <p><code>dynamo=True</code> is the current path. It goes through the same
+      <code>torch.export</code> capture described above, driven by the same TorchDynamo tracer, in
+      place of the older direct tracer. That is why the ONNX path and the ExecuTorch path now fail
+      in the same ways. ONNX
+      Runtime's word for a backend is an <strong>execution provider</strong>. You pass a priority
+      list: <code>CoreMLExecutionProvider</code>, <code>QNNExecutionProvider</code> for Qualcomm's
+      Hexagon NPU, <code>XNNPACK</code>, <code>OpenVINO</code> for Intel CPUs and their integrated
+      accelerators, <code>WebGPU</code>, <code>CPUExecutionProvider</code>. The runtime then
+      partitions your graph across them, exactly like ExecuTorch's partitioners.</p>
+
+      <p>Two ONNX facts matter for devices. For phones there is <strong>ORT Mobile</strong> — ORT
+      is the usual short form of ONNX Runtime. You convert <code>.onnx</code> to <code>.ort</code>,
+      which bakes the runtime optimisations into the
+      file, then compile ONNX Runtime with only the operator kernels your models actually use. That
+      "reduced operator kernel build" is what takes the binary from tens of megabytes to a few. For
+      browsers there is <code>onnxruntime-web</code>, at 1.27.0 on npm — the JavaScript package
+      registry — which runs your graph on
+      <span class="term" data-term="webgpu">WebGPU</span> or on WebAssembly. You will use it in
+      Lesson 10.</p>
+
+      <h3 id="coreml">Core ML — the Apple path</h3>
+
+      <p><span class="term" data-term="core ml">Core ML</span> is Apple's own format and runtime, and
+      the only supported way to reach the Neural Engine. You convert with <code>coremltools</code>,
+      currently 9.0, and get an <code>.mlpackage</code>.</p>
+
+      <div class="code">
+        <div class="code__head"><span>to_coreml.py</span><span class="lang">python</span></div>
+        <pre><code>import coremltools as ct
+
+mlmodel = ct.convert(
+    ep,                                              # or a torch.jit.trace result
+    minimum_deployment_target=ct.target.iOS26,
+    compute_units=ct.ComputeUnit.CPU_AND_NE,         # ask for the Neural Engine
+)
+mlmodel.save("Gpt.mlpackage")</code></pre>
+      </div>
+
+      <p>Two constraints of the Neural Engine decide what your <em>conversion</em> produces, and
+      they explain most disappointing Core ML benchmarks:</p>
+
+      <ul>
+        <li>It is built for <strong>FP16</strong>. Any operator that forces FP32 falls back to the
+            GPU or the CPU.</li>
+        <li>It prefers four-dimensional tensors laid out as <code>(B, C, 1, S)</code> — batch,
+            channels, a dummy dimension of 1, and sequence length. Unusual ranks and permutes push
+            work off the Neural Engine, with no error and no warning.</li>
+      </ul>
+
+      <p>Two more constraints are about run time rather than conversion. You never <em>ask</em> for
+      the Neural Engine: you request <code>CPU_AND_NE</code> and Core ML decides per operator. And
+      the <code>.mlpackage</code> is compiled on the device into <code>.mlmodelc</code> the first
+      time it loads, which becomes your cold start. Lesson 10 measures both on a real device.</p>
+
+      <div class="callout callout--note">
+        <span class="callout__label">Worth knowing</span>
+        <p class="mt-0">coremltools 9.0 documents support for PyTorch 2.7, while this course pins
+        torch 2.13.0. With 2.13 installed you should expect converter warnings, and sometimes a hard
+        failure. Keep a second virtual environment with torch 2.7 only for the Core ML step. This is
+        normal: converters always trail the framework they read.</p>
+      </div>
+
+      <h3 id="gguf">GGUF — a separate world</h3>
+
+      <p><span class="term" data-term="gguf">GGUF</span> — GPT-Generated Unified Format — is the
+      file format used by llama.cpp. It
+      is the one destination on this page that is <strong>not</strong> a <code>torch.export</code>
+      backend. There is no partitioner, no opset, no lowering pass. llama.cpp ships a Python
+      conversion script that reads a Hugging Face checkpoint. That checkpoint is a
+      <code>safetensors</code> file — a plain container that stores raw tensors and nothing
+      executable — plus the config plus the tokenizer. The script writes a GGUF file directly. A second tool then rewrites the
+      tensors into a quantized form such as <code>Q4_K_M</code>.</p>
+
+      <p>Two numbers get quoted for that format, and they are not in conflict. Lesson 07 derived
+      4.50 bits per weight by hand, for one plain <code>Q4_K</code> block. The <code>_M</code>
+      variant keeps some tensors wider than that. Across a whole file the measured average comes out
+      near <strong>4.89 bits per weight</strong>, which is the figure Lesson 08 built its bandwidth
+      table on.</p>
+
+      <p>What you get in return is a single self-contained file. The GGUF header is a typed
+      key-value block: <code>general.architecture</code>, <code>llama.context_length</code>,
+      <code>tokenizer.ggml.tokens</code>, the chat template, the RoPE (rotary position embedding) settings. <strong>The tokenizer
+      lives inside the weights file.</strong> There is no <code>tokenizer.json</code> to lose and no
+      Python at run time. The tensor data is padded to an alignment boundary, so the whole file can
+      be <code>mmap</code>-ed straight from the page cache.</p>
+
+      <p>The price is architectural. llama.cpp must already implement your architecture in C++. The
+      transformer you invented in Lesson 04 will not convert, however small it is. The model you
+      fine-tuned in Lesson 05 will, because it is a standard Llama-shaped model that llama.cpp
+      already knows. GGUF is the right answer when you want to run a <em>known</em> architecture on a
+      laptop, a desktop CLI or a server. It is the wrong answer when you need your own graph on a
+      phone NPU.</p>
+
+      <h2 id="dynamic"><span class="h-num">09 · 4</span>Dynamic shapes: the first thing that breaks</h2>
+
+      <p>Drop the <code>dynamic_shapes</code> argument from §2's script for a moment, and watch what
+      happens. Capture runs your model once, with your example input. Every shape it observes becomes
+      a constant in the graph. This is the single most common beginner export bug, and it is
+      invisible until the second call.</p>
+
+      <figure class="scene" data-scene="ex-dynamic">
+        <div class="scene__head">
+          <span class="scene__badge">animation</span>
+          <span class="scene__title">A fixed-shape export refuses the second input, until you declare the dimension</span>
+        </div>
+        <div class="scene__stage">
+          <svg viewBox="0 0 900 300" role="img" aria-label="A short input passing an exported graph, a longer input rejected by a shape guard, then the same input accepted after the dimension is declared dynamic">
+            <g id="exd-plot"></g>
+          </svg>
+        </div>
+      </figure>
+
+      <p>You control this with the <code>dynamic_shapes</code> argument. It mirrors the structure of
+      your inputs: for each argument, a dictionary from dimension index to a specification.</p>
+
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Specification</th><th>Meaning</th><th>Use it when</th></tr></thead>
+          <tbody>
+            <tr><td><code>None</code></td><td>Static. The number from your example is baked in.</td><td>The dimension genuinely never changes — channels, hidden width.</td></tr>
+            <tr><td><code>Dim.DYNAMIC</code></td><td>Dynamic, range inferred by export. If export finds it <em>must</em> pin this dimension down, it raises an error and names the guard that forced it.</td><td>The normal choice for batch and sequence length.</td></tr>
+            <tr><td><code>Dim.AUTO</code></td><td>Dynamic if export can manage it. In the same situation it silently makes the dimension static instead, so the export succeeds with the bug still inside.</td><td>You are exploring an unfamiliar model and want no errors yet.</td></tr>
+            <tr><td><code>Dim("T", min=1, max=512)</code></td><td>A named symbol with an explicit range.</td><td>A backend needs an upper bound to plan memory ahead of time.</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>Every dynamic dimension becomes a symbol: <code>s0</code>, <code>s1</code>, and so on.
+      Every comparison your model makes against that dimension becomes a <strong>guard</strong>. A
+      guard is a condition recorded at capture time and checked on every call.</p>
+
+      <p>Guards are why an export can accept 200 tokens and reject 201. Here is the whole mechanism
+      in one line. Suppose your attention block splits the sequence into blocks of 8:</p>
+
+      <div class="code">
+        <div class="code__head"><span>where a guard comes from</span><span class="lang">python</span></div>
+        <pre><code>x = x.view(B, T // 8, 8, d)      # B batch, T sequence length, d model width
+
+# export records the guard:  T % 8 == 0
+#   T = 200  ->  200 % 8 == 0   ->  runs
+#   T = 201  ->  201 % 8 == 1   ->  refused</code></pre>
+      </div>
+
+      <p>Nothing is wrong with the model. The reshape needs the length to divide evenly, so export
+      wrote that requirement down. Attention implementations that block or tile the sequence are the
+      usual source of these guards, and so is anything that pads to a multiple.</p>
+
+      <p>Whichever guard fires — the modulo above, or the plain equality you get from exporting with
+      no <code>dynamic_shapes</code> at all — the error names the offending dimension by position. It
+      looks like this, and the number in it is the number you exported with:</p>
+
+      <div class="code">
+        <div class="code__head"><span>a real shape-guard failure</span><span class="lang">text</span></div>
+        <pre><code>RuntimeError: Expected input at *args[0].shape[1] to be equal to 128,
+but got 200.  If you meant this dimension to be dynamic, pass
+dynamic_shapes={"ids": {1: Dim.DYNAMIC}} to torch.export.export().</code></pre>
+      </div>
+
+      <p>Read it as three facts. <code>*args[0]</code> is the first argument. <code>.shape[1]</code>
+      is its second dimension. <code>equal to 128</code> is the guard, and 128 came from the example
+      input you captured with.</p>
+
+      <div class="callout callout--pitfall">
+        <span class="callout__label">Common trap</span>
+        <p class="mt-0">Marking <em>everything</em> dynamic is not the safe option. Each symbol is
+        knowledge the compiler no longer has, so it cannot fold constants, cannot pick a specialised
+        kernel, and on some backends cannot plan memory at all. Mark the dimensions that really vary
+        — batch and sequence length — and leave the rest as <code>None</code>.</p>
+      </div>
+
+      <h2 id="uncapturable"><span class="h-num">09 · 5</span>What cannot be captured, and partial delegation</h2>
+
+      <p>Capture records tensor operations. Anything that asks Python a question about a tensor's
+      <em>values</em> forces the answer to be decided once, at capture time, and then frozen. The
+      list is short and worth memorising:</p>
+
+      <ul>
+        <li><code>if x.sum() &gt; 0:</code> — a branch on data. One side is captured; the other
+            disappears.</li>
+        <li><code>while not done:</code> — a loop whose length depends on data. It is unrolled to
+            whatever length it happened to run.</li>
+        <li><code>.item()</code>, <code>.tolist()</code>, <code>int(x)</code>, a NumPy call — each
+            pulls a tensor value into Python and turns it into a constant.</li>
+        <li><code>print()</code> and Python <code>assert</code> statements on tensor values — they
+            vanish, so a "safety check" in your forward pass is not in the shipped model.</li>
+      </ul>
+
+      <p>For real data-dependent control flow there are graph-level replacements:
+      <code>torch.cond</code> for a branch and <code>torch.while_loop</code> for a loop. Both take
+      the branches as functions and become real nodes in the graph, so the decision happens on the
+      device. ExecuTorch has executed them at run time since version 1.1.0. They cost you: both
+      branches must have the same output shapes and dtypes, and both are compiled into the artefact.</p>
+
+      <p>The second obstacle is operators the backend does not implement. Here the toolchains are
+      generous, and that generosity hides a cost. The unit of that generosity is the
+      <strong>island</strong>: a maximal run of neighbouring operators that one backend agreed to
+      take. The whole run is then replaced by a single opaque delegate call into that backend.</p>
+
+      <figure class="scene" data-scene="ex-partition">
+        <div class="scene__head">
+          <span class="scene__badge">animation</span>
+          <span class="scene__title">The backend claims what it can; the rest stays on CPU, and every border costs a copy</span>
+        </div>
+        <div class="scene__stage">
+          <svg viewBox="0 0 900 320" role="img" aria-label="A chain of nine operators, two green regions claimed by an accelerator backend, two grey nodes left on CPU, and four boundary copies counted">
+            <g id="exp-plot"></g>
+          </svg>
+        </div>
+      </figure>
+
+      <p>A model that "runs on the NPU" is usually three to ten islands with CPU glue between them.
+      Each island boundary moves a tensor between memory the accelerator can address and memory the
+      CPU can address. For a small tensor that copy is nothing.</p>
+
+      <p>For an activation of several megabytes it is not nothing. That copy happens at every
+      boundary, on every token, and it can cancel the whole speed-up. This is the
+      <span class="term" data-term="memory bound">memory-bound</span> arithmetic from Lesson 08
+      again: the time goes into moving bytes, not into doing maths. Only now the bytes are
+      activations crossing a border, rather than weights being read.</p>
+
+      <p>When an operator is refused, the toolchain usually says so in a line you can act on. Two
+      forms are common, and both name the operator:</p>
+
+      <div class="code">
+        <div class="code__head"><span>what a refusal looks like</span><span class="lang">text</span></div>
+        <pre><code>[XnnpackPartitioner] node aten.topk.default not supported, left on CPU
+[coremltools] Op "aten::sort" not implemented for target iOS26</code></pre>
+      </div>
+
+      <h3 id="report">Reading the partition report</h3>
+
+      <p>Everything above is invisible unless you go and look. So look. ExecuTorch will tell you, in
+      one function call, exactly which nodes the backend took:</p>
+
+      <div class="code">
+        <div class="code__head"><span>partition_report.py</span><span class="lang">python</span></div>
+        <pre><code>from executorch.devtools.backend_debug import get_delegation_info
+
+info = get_delegation_info(et.exported_program().graph_module)
+print(info.get_summary())
+print(info.get_operator_delegation_dataframe())</code></pre>
+      </div>
+
+      <div class="code">
+        <div class="code__head"><span>output</span><span class="lang">text</span></div>
+        <pre><code>num_delegated_subgraphs : 2
+num_delegated_nodes     : 7
+num_non_delegated_nodes : 2
+total_nodes             : 9
+
+op_type          occurrences  delegated  non_delegated
+aten.mm             4             4            0
+aten.add            1             1            0
+aten.native_layer_norm  1         1            0
+aten.gelu           1             1            0
+aten.sort           1             0            1
+aten.topk           1             0            1</code></pre>
+      </div>
+
+      <p>Read three numbers, in this order. <strong>The delegated fraction</strong>: 7 of 9 nodes,
+      so 78% of the graph reached the backend. <strong>The subgraph count</strong>: 2, which is two
+      islands, which is four boundary crossings on every call. <strong>The leftovers</strong>:
+      <code>sort</code> and <code>topk</code>, where you would start if you wanted 78% to be higher.</p>
+
+      <p>A good report has a high fraction and <em>few</em> subgraphs. 90% delegated across eleven
+      islands pays twenty-two copies per token, and is often slower than plain CPU. Fraction alone
+      is not the answer.</p>
+
+      <div class="callout callout--pitfall">
+        <span class="callout__label">Common trap</span>
+        <p class="mt-0">Passing a partitioner is not evidence that the delegate ran. The export
+        succeeds either way, because unclaimed nodes fall back to CPU kernels. Two exports of the
+        same model can both "succeed" while one runs 95% of the graph in two islands and the other
+        runs 40% of it in nine. Print the report and read the numbers.</p>
+      </div>
+
+      <h2 id="state"><span class="h-num">09 · 6</span>State: the KV cache crosses the border</h2>
+
+      <p>A vision model is a pure function: pixels in, scores out. A language model in generation
+      mode is not. It carries a <span class="term" data-term="kv cache">key-value (KV) cache</span> from
+      one call to the next, so that producing token 501 does not recompute tokens 1 to 500. You met that cache
+      in Lesson 04. It is the single hardest part of exporting a language model, because a graph, by
+      construction, has no memory.</p>
+
+      <figure class="scene" data-scene="ex-kv">
+        <div class="scene__head">
+          <span class="scene__badge">animation</span>
+          <span class="scene__title">Two ways to carry the cache across the boundary, and what each costs per token</span>
+        </div>
+        <div class="scene__stage">
+          <svg viewBox="0 0 900 340" role="img" aria-label="The KV cache passed in and out as tensors with a full copy per token, compared with the cache held as model state and updated one slice at a time">
+            <g id="exk-plot"></g>
+          </svg>
+        </div>
+      </figure>
+
+      <p>There are two designs, and the difference is arithmetic, not taste. The symbols are the
+      course's usual ones, from Lesson 03:</p>
+
+      <ul>
+        <li><i>n_layers</i> — the number of layers.</li>
+        <li><i>G</i> — the number of key-value heads per layer.</li>
+        <li><i>d_h</i> — the head dimension, the width of one head.</li>
+        <li><i>T</i> — the number of cached positions so far.</li>
+        <li><i>b</i> — bytes per element. FP16 gives <i>b</i> = 2.</li>
+      </ul>
+
+      <div class="callout callout--math">
+        <span class="callout__label">The maths, once</span>
+        <div class="eq">cache in and out :  2 · <i>n_layers</i> · <i>G</i> · <i>T</i> · <i>d_h</i> · <i>b</i>    bytes moved per token
+cache as state   :  2 · <i>n_layers</i> · <i>G</i> · <i>d_h</i> · <i>b</i>        bytes moved per token</div>
+        <p>The 2 is keys and values. It is the same line Lesson 03 asked you to memorise, minus the
+        <i>T</i> in the second row. And <i>T</i> grows with every token you generate.</p>
+      </div>
+
+      <p>Put the Lesson 04 model in and the difference stops being abstract. That model has 8
+      layers, 6 key-value heads, head dimension 64, at FP16, so <i>b</i> = 2:</p>
+
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Design</th><th>Arithmetic</th><th>Bytes moved per token</th></tr></thead>
+          <tbody>
+            <tr><td>Cache as state</td><td>2 × 8 × 6 × 64 × 2</td><td class="num">12,288 B = 12 KiB</td></tr>
+            <tr><td>Cache in and out, at <i>T</i> = 200</td><td>12,288 × 200</td><td class="num">2,457,600 B = 2.34 MiB</td></tr>
+            <tr><td>Cache in and out, at <i>T</i> = 1000</td><td>12,288 × 1000</td><td class="num">12,288,000 B = 11.7 MiB</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>Twelve kibibytes against nearly twelve mebibytes, for the same token. And the state row
+      never grows: 12 KiB at position 10, 12 KiB at position 4000. That is what the missing <i>T</i>
+      buys you.</p>
+
+      <p>The first design keeps the graph pure. The cache is an extra input and an extra output, and
+      the caller passes the new one back in. Every runtime supports it, and ONNX language models
+      conventionally do exactly this. The second gives the model a mutable buffer it owns.
+      coremltools 9.0 added <code>ct.StateType</code> for it. You declare one state tensor of shape
+      <code>(2, n_layers, B, G, T_max, d_h)</code>, where <code>B</code> is the batch and the
+      leading 2 is again keys and values. Then you write one slice per step. ExecuTorch calls the
+      same idea a mutable buffer.</p>
+
+      <p>Whichever you choose, the position dimension is dynamic and it has a maximum. That maximum
+      is your context limit, and you choose it at export time rather than at run time. Pick it
+      deliberately, because the cache is allocated for the maximum on the first call, not for the
+      length you happen to use.</p>
+
+      <p>Count that allocation, and be careful which context you count. First the weights, so there
+      is something to compare against: 15,735,168 parameters at 2 bytes each is 31,470,336 bytes, or
+      30 MiB. That is Lesson 04's 31 MB, in the binary units this section uses throughout.</p>
+
+      <p>Lesson 04 trained this model with a 256-token block. At that limit the cache is
+      2 × 8 × 6 × 64 × 256 × 2 = 3,145,728 bytes, or 3 MiB. That is a tenth of the weights, exactly
+      as Lesson 04 says. Now export the same model with a 4096-token context, which is what a chat
+      prompt asks for. 2 × 8 × 6 × 64 × 4096 × 2 is 50,331,648 bytes, or <strong>48 MiB</strong>.
+      <em>At that context the cache is larger than the weights.</em> The limit you choose at export
+      time is memory you pay for on every run. On a phone it is usually the cache, not the weight
+      file, that decides whether your app survives.</p>
+
+      <h2 id="verify"><span class="h-num">09 · 7</span>Verify it, or you have not exported it</h2>
+
+      <p>An export that loads is not an export that is correct. Silent wrongness is the normal
+      failure mode here: a branch captured on the wrong side, a permute the converter reordered, a
+      quantized operator the backend implemented differently. The model still returns tensors of the
+      right shape. It just returns the wrong numbers.</p>
+
+      <figure class="scene" data-scene="ex-verify">
+        <div class="scene__head">
+          <span class="scene__badge">animation</span>
+          <span class="scene__title">The same input through both paths, and the difference measured against a line you chose</span>
+        </div>
+        <div class="scene__stage">
+          <svg viewBox="0 0 900 340" role="img" aria-label="One input running through PyTorch and through the exported graph, with per-element absolute differences plotted on a log scale against a tolerance line">
+            <g id="exv-plot"></g>
+          </svg>
+        </div>
+      </figure>
+
+      <div class="code">
+        <div class="code__head"><span>verify_export.py</span><span class="lang">python</span></div>
+        <pre><code>import torch
+
+exported = ep.module()          # run the captured graph in Python
+model.eval()
+
+for T in (1, 7, 128, 200, 511):                 # several shapes, not one
+    ids = torch.randint(0, 4096, (1, T))
+    with torch.no_grad():
+        ref = model(ids)
+        got = exported(ids)
+    print(T, (ref - got).abs().max().item())
+    torch.testing.assert_close(got, ref, atol=1e-5, rtol=1e-5)</code></pre>
+      </div>
+
+      <p>That last line hides two different ideas behind two identical-looking numbers.
+      <code>atol</code> is an <strong>absolute</strong> tolerance: how much raw difference you allow
+      outright. <code>rtol</code> is <strong>relative</strong>: what fraction of the reference value
+      you allow. The check that runs is:</p>
+
+      <div class="callout callout--math">
+        <span class="callout__label">What assert_close actually tests</span>
+        <div class="eq">| got − ref |  ≤  atol  +  rtol · | ref |</div>
+        <p>Work one element. Say <code>ref = 12.0</code>, <code>got = 12.00008</code>, with
+        <code>atol = 1e-5</code> and <code>rtol = 1e-5</code>. The budget is
+        1e-5 + 1e-5 × 12 = 0.00013. The difference is 0.00008, which is smaller, so it passes. Note
+        what happened: on a logit of size 12, the relative term contributed more than ten times what
+        the absolute term did. On large logits <code>rtol</code> is doing all the work, and on values
+        near zero <code>atol</code> is.</p>
+      </div>
+
+      <p>Three rules make this test useful instead of decorative.</p>
+
+      <p><strong>Compare against the right reference.</strong> An INT4 export compared against an
+      FP32 eager model will always fail, and the failure tells you nothing. Quantize in PyTorch
+      first, then compare the export against <em>that</em> model. Only then is a difference a bug in
+      the export rather than a known cost of Lesson 07.</p>
+
+      <p><strong>Test several shapes.</strong> One shape only proves that the shape you exported with
+      works. Include the boundaries of your declared range and a length that is not a round number.</p>
+
+      <p><strong>When the tolerance stops being meaningful, change the measurement.</strong> For a
+      language model, small logit differences are expected and harmless; what matters is whether the
+      generated text is the same, or whether perplexity on a held-out set moved. Compare the argmax
+      token for a few hundred positions, or run the task metric you already have. A number you can
+      defend beats a tolerance you invented.</p>
+
+      <div class="callout callout--note">
+        <span class="callout__label">Worth knowing</span>
+        <p class="mt-0">Comparing <code>ep.module()</code> against eager PyTorch checks the
+        <strong>capture</strong> only. It does not check lowering, delegation or the device runtime.
+        Run the same comparison again against the real artefact — through <code>onnxruntime</code>,
+        through the ExecuTorch Python runtime, through Core ML on a Mac — before you believe the
+        export is finished.</p>
+      </div>
+
+      <h2 id="decide"><span class="h-num">09 · 8</span>Choosing, without regret</h2>
+
+      <p>Before choosing any of these, check whether you need to ship a model at all. Both phone
+      platforms now include one, and an OS model costs your app zero bytes of download. Lesson 10 §8
+      makes that argument properly, and names the four cases where you ship your own anyway.</p>
+
+      <p>If you are shipping your own, this table is the summary of everything above.</p>
+
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Target</th><th>First choice</th><th>Why</th><th>Runner-up</th></tr></thead>
+          <tbody>
+            <tr><td>iPhone or iPad, custom model</td><td>ExecuTorch <code>.pte</code>, with the Core ML and XNNPACK partitioners</td><td>PyTorch-native, no format conversion, production backends</td><td>coremltools <code>.mlpackage</code> for Xcode tooling and Neural Engine control</td></tr>
+            <tr><td>Android, custom model</td><td>ExecuTorch + XNNPACK, plus the Qualcomm or MediaTek partitioner</td><td>One graph: CPU baseline, NPU where it exists</td><td>LiteRT <code>.tflite</code> — Google's on-device runtime, formerly TensorFlow Lite — if the model came from TensorFlow or JAX</td></tr>
+            <tr><td>One artefact for iOS, Android and desktop</td><td>ONNX Runtime Mobile (<code>.ort</code>, minimal build)</td><td>Widest execution-provider coverage from one file</td><td>ExecuTorch</td></tr>
+            <tr><td>Browser</td><td>ONNX via <code>onnxruntime-web</code> on WebGPU</td><td>The only mature graph runtime inside a page</td><td>WebLLM, which compiles a chat model to WebGPU shaders ahead of time instead of interpreting a graph</td></tr>
+            <tr><td>Laptop or desktop CLI, known language model</td><td>llama.cpp + GGUF</td><td>One file, <code>mmap</code>, every backend, a huge model zoo</td><td>ExecuTorch desktop, or MLX — Apple's own array framework for Apple Silicon</td></tr>
+            <tr><td>Microcontroller or wearable</td><td>ExecuTorch + Arm Ethos-U or Cortex-M</td><td>Production at 1.0, and it plugs into CMSIS-NN, Arm's neural-network kernel library for Cortex-M</td><td>LiteRT for Microcontrollers</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="project">
+        <span class="project__label">Project 09</span>
+        <h3>The same model, four formats</h3>
+        <p>Take one model through every path in this lesson and write down what each one cost you.
+        The point is not to end with four working files — you will probably not get four. The point
+        is to find out <em>where</em> each path stops.</p>
+
+        <p>You do it twice, on the two models from §1.</p>
+
+        <p><strong>Warm-up — the tiny GPT of Lesson 04.</strong> No adapter to merge, no
+        quantization needed. It is here so that a strange error is an error in code you wrote.</p>
+        <ol class="steps">
+          <li>Load the tiny GPT of Lesson 04. Confirm it still generates readable text in eager
+              PyTorch, and save that output to compare against later.</li>
+          <li>Capture it: <code>torch.export.export</code> with the sequence dimension marked
+              <code>Dim.DYNAMIC</code>. Save the <code>.pt2</code>. Print
+              <code>ep.range_constraints</code> and read what export inferred.</li>
+          <li>Lower to <code>.pte</code> with <code>XnnpackPartitioner</code>. Record the file size,
+              then run <code>partition_report.py</code> from §5 and copy down all four numbers:
+              total nodes, delegated nodes, non-delegated nodes, and subgraphs.</li>
+        </ol>
+
+        <p><strong>The one you ship — the model you fine-tuned in Lesson 05.</strong> Merged with
+        <code>merge_and_unload()</code> in Lesson 05, quantized to INT4 in Lesson 07, profiled in
+        Lesson 08. This is the artefact Lesson 10 runs on a device and Lesson 13 loads.</p>
+        <ol class="steps" start="4">
+          <li>Capture and lower it to <code>.pte</code> exactly as above. Run the partition report
+              again. The delegated fraction will be lower than the tiny GPT's — find out which
+              operators were refused, and write them down.</li>
+          <li>Export to <code>.onnx</code> with <code>dynamo=True</code> and run it through
+              <code>onnxruntime</code> on the CPU execution provider.</li>
+          <li>Convert to <code>.mlpackage</code> with coremltools, in a second virtual environment
+              with torch 2.7. If it fails, record the operator it failed on — that is a result, not a
+              defeat.</li>
+          <li>Convert the <em>merged, unquantized</em> Lesson 05 model to GGUF with llama.cpp's
+              script, then quantize to <code>Q4_K_M</code>. It is a standard Llama-shaped
+              architecture, so this path should work. Note how many separate files you needed before
+              the conversion, and how many after.</li>
+          <li>Write <code>verify_export.py</code> from §7 and run it for five sequence lengths
+              against every artefact you produced. Compare against the quantized PyTorch model, not
+              the FP32 one.</li>
+        </ol>
+        <p><strong>Then break it on purpose.</strong> Each of these fails in a different, instructive
+        way:</p>
+        <ul>
+          <li>Export without <code>dynamic_shapes</code>, then call the artefact with a longer
+              prompt. Read the error and find the guard it names — it has the shape of the
+              <code>*args[0].shape[1]</code> message in §4.</li>
+          <li>Add <code>if ids.shape[1] &gt; 64: x = x * 2</code> to your forward pass, export, and
+              check whether the multiplication is in the graph for a 32-token input.</li>
+          <li>Add a <code>print(x.mean().item())</code> inside the model and confirm it is gone from
+              the exported program.</li>
+          <li>Compare the INT4 export against the FP32 eager model with <code>atol=1e-5</code>, watch
+              it fail, then fix the comparison rather than the tolerance.</li>
+        </ul>
+        <dl class="project__grid">
+          <div class="project__stat"><dt>Data</dt><dd>None — inference only</dd></div>
+          <div class="project__stat"><dt>Size</dt><dd>15M warm-up, then the 360M Lesson 05 model at INT4 (≈ 191 MB)</dd></div>
+          <div class="project__stat"><dt>Time</dt><dd>≈ 90–120 min, all CPU</dd></div>
+          <div class="project__stat"><dt>Target</dt><dd>3 artefacts that pass the numeric check</dd></div>
+        </dl>
+      </div>
+
+      <h2 id="check">Check yourself</h2>
+
+      <div class="check">
+        <p class="check__q">You exported with an example of shape <code>(1, 128)</code> and passed no
+        <code>dynamic_shapes</code>. In production the model is called with <code>(1, 64)</code>.
+        What happens?</p>
+        <div class="check__opts">
+          <button class="check__opt">It runs, padding the input to 128 automatically</button>
+          <button class="check__opt" data-right>It fails: the graph specialised on 128 and a shape guard rejects 64</button>
+          <button class="check__opt">It runs but returns wrong numbers, silently</button>
+          <button class="check__opt">It runs, and only fails for lengths above 128</button>
+        </div>
+        <p class="check__why">Capture bakes in every shape it observed unless you mark the dimension
+        dynamic. Shorter is not safer than longer — the constraint is equality with 128, not an upper
+        bound.</p>
+      </div>
+
+      <div class="check">
+        <p class="check__q">A model has 8 layers, 6 key-value heads and head dimension 64, at FP16.
+        You are at position 512. Using §6's two formulas, how many bytes does each design move for
+        that one token?</p>
+        <div class="check__opts">
+          <button class="check__opt">12 KiB for both — the position does not enter the formula</button>
+          <button class="check__opt" data-right>12,288 bytes as state; 12,288 × 512 bytes = 6 MiB passed in and out</button>
+          <button class="check__opt">6 MiB as state; 12,288 bytes passed in and out</button>
+          <button class="check__opt">512 × 64 × 2 = 65,536 bytes for both</button>
+        </div>
+        <p class="check__why">2 × 8 × 6 × 64 × 2 = 12,288 bytes, and that is the whole cost of the
+        state design at any position. The in-and-out design multiplies it by <i>T</i>, so at 512 it
+        moves 6,291,456 bytes — exactly 6 MiB — for one token. That factor is the entire argument of
+        §6.</p>
+      </div>
+
+      <div class="check">
+        <p class="check__q">You need one artefact that runs in an iOS app, in an Android app and in a
+        desktop command-line tool, and your model is an architecture you designed yourself. Which
+        path, and what do you give up?</p>
+        <div class="check__opts">
+          <button class="check__opt">GGUF — one file, every platform, mmap everywhere</button>
+          <button class="check__opt" data-right>ONNX Runtime Mobile — one file across all three, giving up the best per-platform accelerator support</button>
+          <button class="check__opt">Core ML, with an Android wrapper around the Neural Engine</button>
+          <button class="check__opt">Three separate exports — there is no single-artefact option</button>
+        </div>
+        <p class="check__why">GGUF is out immediately: llama.cpp must already implement your
+        architecture in C++, and yours is new. Core ML is Apple only. ExecuTorch would also reach all
+        three, but ONNX has the widest execution-provider coverage from one file. The cost is real:
+        the deepest Qualcomm and Neural Engine support lives in the platform-native paths, so you
+        trade peak speed for one artefact.</p>
+      </div>
+
+      <div class="check">
+        <p class="check__q">Your model exports with an NPU partitioner and the export succeeds, but
+        it is slower on the phone than the plain CPU build. What is the most likely cause?</p>
+        <div class="check__opts">
+          <button class="check__opt">The NPU is slower than the CPU for this model size</button>
+          <button class="check__opt">The weights were quantized to 4 bits and the NPU wants 8</button>
+          <button class="check__opt" data-right>The graph split into many delegate islands, and each boundary copies a tensor</button>
+          <button class="check__opt">The <code>.pte</code> file is memory-mapped instead of loaded</button>
+        </div>
+        <p class="check__why">Partial delegation always succeeds, because unclaimed nodes fall back
+        to portable CPU kernels. The cost appears at the borders, and the report tells you how many
+        borders there are: <code>num_delegated_subgraphs</code>, doubled, is your crossings per call.
+        A high delegated fraction spread over many subgraphs is the slow case.</p>
+      </div>
+
+      <div class="check">
+        <p class="check__q">Your INT8 export differs from the FP32 eager model by up to 3e-3 per
+        logit, and your test asserts <code>atol=1e-5, rtol=1e-5</code> on logits around 10. Does
+        raising <code>rtol</code> to 1e-4 fix it, and what should you do?</p>
+        <div class="check__opts">
+          <button class="check__opt">Yes — 1e-4 × 10 = 1e-3, which covers 3e-3</button>
+          <button class="check__opt">Yes, and it is the right fix: quantized models need looser tolerances</button>
+          <button class="check__opt" data-right>No — the budget would be 1.01e-3, still under 3e-3 — and the real fix is to compare against the INT8 model in PyTorch</button>
+          <button class="check__opt">No, because <code>rtol</code> is ignored whenever <code>atol</code> is set</button>
+        </div>
+        <p class="check__why">Do the arithmetic: the budget is atol + rtol·|ref| = 1e-5 + 1e-4 × 10 =
+        1.01e-3, which 3e-3 still exceeds. But chasing the tolerance is the wrong move anyway. You
+        are measuring two changes at once — quantization error plus export error. Quantize in
+        PyTorch first and compare like with like, so any remaining difference is genuinely the
+        export's fault.</p>
+      </div>
+
+      <div class="terms">
+        <span class="terms__label">Key words from this lesson</span>
+        <dl>
+          <dt>Eager <span class="en">also: eager execution</span></dt>
+          <dd>Ordinary PyTorch: one operator runs, then Python decides what to do next. The mode
+              export replaces, and the word its error messages assume you know.</dd>
+
+          <dt>Capture <span class="en">also: tracing</span></dt>
+          <dd>Running the model once and writing down every tensor operation it performed.</dd>
+
+          <dt>ExportedProgram</dt>
+          <dd>What <code>torch.export</code> returns: one flat graph, the weights, and the rules about
+              which shapes may change.</dd>
+
+          <dt>ATen operator</dt>
+          <dd>One of PyTorch's small set of primitive tensor operations. Every backend agrees on
+              their meaning.</dd>
+
+          <dt>Lowering</dt>
+          <dd>Rewriting the graph's operators into the narrower set that one particular backend can
+              execute.</dd>
+
+          <dt>Backend</dt>
+          <dd>A hardware target plus the code that runs on it — CPU kernels, GPU shaders, an
+              accelerator compiler.</dd>
+
+          <dt>Partitioner</dt>
+          <dd>The object you pass at export time. It walks the graph on one backend's behalf and
+              claims the nodes that backend can run, leaving the rest to the CPU.</dd>
+
+          <dt>Delegate island <span class="en">also: island, delegated subgraph</span></dt>
+          <dd>A maximal run of neighbouring operators one backend agreed to take. The run is replaced
+              by a single delegate call, and each of its two borders costs a tensor copy.</dd>
+
+          <dt>NPU <span class="en">neural processing unit</span></dt>
+          <dd>A fixed-function accelerator for neural-network arithmetic, beside the CPU and the GPU
+              on most recent phone chips. Apple's is called the Neural Engine.</dd>
+
+          <dt>Guard</dt>
+          <dd>A condition recorded during capture and checked on every call, such as "this dimension
+              equals 128".</dd>
+
+          <dt>Opset</dt>
+          <dd>The version number of the ONNX operator vocabulary a file is written in.</dd>
+
+          <dt>Execution provider</dt>
+          <dd>ONNX Runtime's name for a backend, such as CPU, Core ML or WebGPU.</dd>
+
+          <dt>Stateful model</dt>
+          <dd>A model that owns a buffer between calls, so it can update a cache in place instead of
+              copying it.</dd>
+
+          <dt>Flatbuffer</dt>
+          <dd>A binary file layout you read straight from disk, with no parsing step. It is what lets
+              a <code>.pte</code> be memory-mapped instead of loaded.</dd>
+
+          <dt>Tolerance <span class="en">atol and rtol</span></dt>
+          <dd>How large a numeric difference you accept before you call it a bug. <code>atol</code>
+              is a flat allowance; <code>rtol</code> is a fraction of the reference value. A test
+              passes when the difference is at most <code>atol + rtol × |ref|</code>.</dd>
+        </dl>
+      </div>
+
+      <h2 id="resources">Go deeper</h2>
+
+      <div class="resources">
+        <a class="res" href="https://docs.pytorch.org/executorch/stable/" target="_blank" rel="noopener">
+          <span class="res__kind" data-kind="docs">docs</span>
+          <span class="res__body">
+            <span class="res__title">ExecuTorch documentation</span>
+            <span class="res__why">The getting-started page has the exact export flow used above, and the backends overview tells you which partitioner exists for your hardware. Read it while doing the project.</span>
+          </span>
+        </a>
+        <a class="res" href="https://huggingface.co/docs/transformers.js/index" target="_blank" rel="noopener">
+          <span class="res__kind" data-kind="docs">docs</span>
+          <span class="res__body">
+            <span class="res__title">Transformers.js documentation</span>
+            <span class="res__why">The ONNX destination, seen from the browser side. Open it when you finish the ONNX track and want to see what your file becomes in Lesson 10.</span>
+          </span>
+        </a>
+        <a class="res" href="https://efficientml.ai/" target="_blank" rel="noopener">
+          <span class="res__kind" data-kind="course">course</span>
+          <span class="res__body">
+            <span class="res__title">MIT 6.5940 — EfficientML.ai</span>
+            <span class="res__why">A full university course on making models small and fast enough to deploy. The on-device inference lectures cover what this lesson only summarises.</span>
+          </span>
+        </a>
+        <a class="res" href="https://hanlab.mit.edu/courses/2024-fall-65940" target="_blank" rel="noopener">
+          <span class="res__kind" data-kind="course">course</span>
+          <span class="res__body">
+            <span class="res__title">6.5940 Fall 2024 — slides and labs</span>
+            <span class="res__why">The lecture materials themselves, free to download. Use the labs if you want quantization and deployment exercises with graded answers.</span>
+          </span>
+        </a>
+      </div>
+
+      <div class="callout callout--try">
+        <span class="callout__label">Next</span>
+        <p class="mt-0">You now have files instead of Python objects. In <strong>Lesson 10</strong> we
+        run them for real: the same model inside an iOS app and inside a browser tab, with no server
+        at all. Cold start, thermal throttling and the first token you actually see stop being
+        theory there.</p>
+      </div>
+
+    </article>
+  </main>
+
+  <aside class="toc-rail"></aside>
+</div>
+
+<script src="../assets/js/vendor/gsap.min.js"></script>
+<script src="../assets/js/scene.js"></script>
+<script src="../assets/js/svgkit.js"></script>
+<script src="../data/lessons.js"></script>
+<script src="../data/glossary.js"></script>
+<script src="../assets/js/course.js"></script>
+<script src="../data/narration/09.js"></script>
+<script src="../data/narration/09.timing.js" onerror="void 0"></script>
+<script src="../assets/js/scenes/09.js"></script>
+<script src="../assets/js/film.js"></script>
+</body>
+</html>

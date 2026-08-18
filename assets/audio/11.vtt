@@ -1,0 +1,138 @@
+WEBVTT
+
+a01
+00:00:00.000 --> 00:00:15.850
+So. By the end of this walkthrough you can take a microphone signal and turn it into text — and say what every number along the way actually means. Two bridges. Sound into a picture. Then a picture into letters, with nobody telling us where each letter begins.
+
+a02
+00:00:16.800 --> 00:00:27.610
+Here is the raw audio. One number per measurement, sixteen thousand of them every second. That is it. That is the whole format. And look at that line — there is nothing in it that resembles a letter.
+
+a03
+00:00:27.960 --> 00:00:44.050
+Speech does not sit still. It changes every few tens of milliseconds. So we chop it into short windows — 25 ms wide, moving only 10. Watch the box slide. Each window overlaps the last, so nothing falls between them.
+
+a04
+00:00:44.400 --> 00:00:57.770
+One window is 400 samples. An FFT turns it into 201 numbers, one for each band of 40 Hz. So — that is the frequency content of a single moment, one hundredth of a second wide.
+
+a05
+00:00:58.120 --> 00:01:09.090
+But 201 is more than we need. So 80 triangular filters squash them down to 80, and a logarithm compresses the loudness. And that. That is one column of the picture.
+
+a06
+00:01:09.440 --> 00:01:20.330
+Now do it for every window, and stand the columns side by side. 100 columns every second. And sound has become a picture — time running across, frequency running up.
+
+a07
+00:01:20.680 --> 00:01:36.930
+And here is the part that pays you back. You can read it. Strong energy low down? That is a vowel. A bright fuzzy block at the top with no stripes? A fricative, an s. Learn four shapes and you can debug an audio pipeline with your eyes.
+
+a08
+00:01:37.580 --> 00:01:54.710
+But why 80 bands, and why placed where they are? Because your ear is not linear. 100 Hz to 200 Hz is an enormous change. 4000 to 4100? You can barely hear it. Same number of hertz. Nothing like the same difference.
+
+a09
+00:01:55.060 --> 00:02:12.030
+So we warp the axis. This is the mel scale. Space the 80 filter centres evenly along it — perfectly even — then map every centre back to real frequency. Watch the lines lean. The spacing crowds up at the left and stretches wide at the right.
+
+a10
+00:02:12.380 --> 00:02:27.510
+Each centre becomes a triangular filter. Narrow and crowded low down, wide and sparse up high. About 43 of the 80 end up below 2 kHz. And the whole bank is one fixed matrix, so applying it is a single matrix multiply.
+
+a11
+00:02:28.160 --> 00:02:51.210
+Right. Now the hard part. Five seconds of speech is 500 frames, and the transcript is a couple of dozen characters. So who labels which frame is which letter? Nobody. CTC answers with one extra symbol — the blank. And blank does not mean silence.
+
+a12
+00:02:51.560 --> 00:03:02.130
+Rule one. Merge neighbours that carry the same symbol. So the two h frames at the start become one, and the pair of l frames become one too. That is all rule one does.
+
+a13
+00:03:02.480 --> 00:03:14.490
+Rule two. Delete every blank. And look — ten frames have become five letters. Hello. Nobody ever told this model where the e begins. It worked that out on its own.
+
+a14
+00:03:14.840 --> 00:03:26.130
+Now watch this one blank. The one sitting between the two l frames. It looks like nothing at all. It is doing real work — it holds those two apart, so rule one cannot merge them.
+
+a15
+00:03:26.480 --> 00:03:38.730
+Take it away, and the word loses a letter. Hello becomes helo. That is the whole reason the blank symbol exists. It is a separator. Not a silence detector.
+
+a16
+00:03:39.380 --> 00:03:51.470
+So if the model invents its own timing — which timing do we train it towards? Here is one path over eight frames, for the word "cat". It says the c lasted two frames, and the t lasted two more.
+
+a17
+00:03:51.820 --> 00:04:06.790
+Here are two more paths. The letters land in different places, and blanks pad out the rest. Three completely different stories about when each sound happened. Now collapse all three. The differences vanish. Same word, every time.
+
+a18
+00:04:07.140 --> 00:04:20.750
+For eight frames and the word "cat" there are 462 such paths. And CTC picks none of them. It adds up the probability of all 462, and training pushes that whole sum up.
+
+a19
+00:04:21.100 --> 00:04:40.080
+The loss is minus the log of that sum. A forward algorithm gets it with dynamic programming, so 1000 frames cost about 1000 steps, not an astronomical number. In the lesson you run it by hand on three frames. Six paths, 0.510. Loss, 0.673.
+
+a20
+00:04:40.730 --> 00:04:54.180
+Right. So CTC has a weakness. One symbol per frame, always — and no idea what it just wrote. The transducer fixes both, and it decodes on a grid. Frames run across. Emitted tokens run down.
+
+a21
+00:04:54.530 --> 00:05:09.820
+Three networks meet on this grid. The encoder gives one vector per audio frame, along the top. The prediction network gives one per token written so far, down the side — that is a small language model. And a joint network mixes them at every node.
+
+a22
+00:05:10.170 --> 00:05:27.460
+Two moves, and only two. Emit the blank and you step right, on to the next frame, writing nothing. Emit a token and you step down — writing one token, staying on the same frame. Watch. Frame two writes a c, then an a, without advancing at all.
+
+a23
+00:05:27.810 --> 00:05:37.970
+Two blanks carry us across the quiet frames. A t comes out on frame four. One last blank finishes the audio — and the path has spelled the word.
+
+a24
+00:05:38.320 --> 00:05:52.730
+Now take the down-moves away. What is left may only step right, one symbol per frame. That is CTC. And notice the path never goes backwards. That is monotonic — and it is why a transducer never waits for the end of a sentence.
+
+a25
+00:05:53.380 --> 00:06:04.030
+So what does all this cost you in delay? Whisper always processes exactly 30 seconds. Your three-second command goes in, and 27 seconds of zeros are packed around it to fill the box.
+
+a26
+00:06:04.380 --> 00:06:16.230
+Watch the meter fill. The encoder cost does not depend on how much you said. 1500 encoder states, every single time. So most of that work is spent on silence you invented yourself.
+
+a27
+00:06:16.580 --> 00:06:30.670
+A streaming encoder does the opposite. Zoom into those same three seconds and feed it one small chunk at a time. It keeps its KV cache between chunks — the same trick as Lesson 04 — so each chunk pays only for its new frames.
+
+a28
+00:06:31.020 --> 00:06:45.270
+And each chunk may peek a little way into the future. That is look-ahead. It buys you accuracy, and it costs exactly its own duration in delay. So your latency is the chunk, plus the look-ahead, plus the compute.
+
+a29
+00:06:45.620 --> 00:07:01.230
+And here is the trade in real numbers. 80 ms chunks give 8.43 % word error. 1.12 s chunks give 6.93 %. Fourteen times the delay, for 1.5 points. Same weights. One runtime flag.
+
+a30
+00:07:01.880 --> 00:07:13.730
+Last thing. How do you measure any of this honestly? Count the words in the reference — what the person actually said. There are nine. That nine is the denominator, and it never changes.
+
+a31
+00:07:14.080 --> 00:07:26.090
+Line the output up against it by edit distance, not by position — otherwise one early slip marks everything after it wrong. And here: the word "to", before "book", never got written. That is one deletion.
+
+a32
+00:07:26.440 --> 00:07:35.240
+Further along, "to" came back as "two". That is one substitution. And "today" was never said at all. That is one insertion.
+
+a33
+00:07:35.590 --> 00:07:55.690
+Three errors over nine reference words. 33.3 %. And insertions are not capped by that nine, so WER can pass 100 %. One last thing: 8.4 down to 6.9 is 1.5 points absolute, but 18 % relative. Relative always sounds bigger.
+
+a34
+00:07:56.640 --> 00:08:16.980
+That is the whole path. Air pressure to text. Now go and build it: your own features, a keyword model at about 95 % accuracy, then a real recogniser scored twice — once raw, once normalised. Lesson 12 runs this backwards, text to waveform. Lesson 13 makes it the ears of an assistant.
+

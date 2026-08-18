@@ -1,0 +1,897 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>10 · On the device — Model Engineering</title>
+<meta name="description" content="Running your exported model inside an iOS app and inside a browser tab: bundles, compute units, cold start, caching and memory limits.">
+<link rel="stylesheet" href="../assets/css/course.css">
+</head>
+<body data-lesson="10">
+
+<div class="shell shell--wide">
+  <nav class="rail" aria-label="Lessons"></nav>
+
+  <main class="main">
+    <article class="prose">
+
+      <header class="lesson-head">
+        <span class="lesson-head__num">10</span>
+        <h1>On the device</h1>
+        <p class="lead">A model file is not a product. Somebody has to open it, place it in memory,
+        pick a chip to run it on, and pay for all of that while a person is watching a loading
+        spinner. This lesson is about that last hundred metres, on two targets: an iPhone app and
+        a browser tab.</p>
+        <div class="lesson-head__meta">
+          <span class="chip"><b>Part IV</b> · Ship it</span>
+          <span class="chip">≈ <b>105 min</b> reading</span>
+          <span class="chip">Project · <b>Your model, in an app you can hold</b></span>
+          <span class="chip">Needs · <b>Lessons 08, 09</b></span>
+        </div>
+      </header>
+
+      <section class="outcomes">
+        <h2>By the end you can</h2>
+        <ul>
+          <li>Say exactly what goes into an <strong>app bundle</strong>, and why the weights should
+              usually not be one of those things.</li>
+          <li>Explain how a runtime decides which operator runs on the <strong>CPU, the GPU or the
+              Neural Engine</strong>, and what a fallback costs.</li>
+          <li>Break a <strong>cold start</strong> into three measured parts and fix the one that
+              actually dominates.</li>
+          <li>Ship a model into a <strong>browser tab</strong> with caching, and know why the first
+              visit is slow and the second is not.</li>
+          <li>Predict when the operating system will <strong>evict or terminate</strong> your app,
+              and design the context length around it.</li>
+          <li>Decide when the platform's own model beats shipping your own, and run a
+              <strong>licence check</strong> before release.</li>
+        </ul>
+      </section>
+
+      <h2 id="two-targets"><span class="h-num">10 · 1</span>Two targets, and the real reason</h2>
+
+      <p>In Lesson 09 you turned one PyTorch model into four files: a <code>.pte</code>, an
+      <code>.onnx</code>, a <code>.mlpackage</code>, a <code>.gguf</code>. Each is a frozen graph
+      plus its weights, and none of them does anything alone. Each needs a small C++ runtime that
+      opens the file, allocates buffers, and talks to the chips inside the device.</p>
+
+      <p>This lesson covers two places that runtime can live:</p>
+
+      <div class="compare">
+        <div class="compare__col compare__col--a">
+          <h4>An iOS app</h4>
+          <ul>
+            <li>You control the whole bundle: code, runtime library, model file.</li>
+            <li>Real access to the GPU and the Neural Engine.</li>
+            <li>Hard limits: download size, RAM budget, no fan.</li>
+            <li>A review process and a signed binary between you and the user.</li>
+          </ul>
+        </div>
+        <div class="compare__col compare__col--b">
+          <h4>A browser tab</h4>
+          <ul>
+            <li>No install, no store, no review. A URL is the whole distribution.</li>
+            <li>The GPU through <span class="term" data-term="webgpu">WebGPU</span>, the CPU through WebAssembly.</li>
+            <li>The weights arrive over the network on the first visit.</li>
+            <li>You get whatever browser and machine the user happens to have.</li>
+          </ul>
+        </div>
+      </div>
+
+      <p>People ask for both for the same reason, and it is not cost. It is <strong>privacy</strong>.
+      A voice memo, a medical note, a photo of a passport — these are things users and legal
+      departments do not want to send to a server. "The data never leaves the device" is a claim you
+      can make truthfully only if the model is on the device. Offline operation and low latency are
+      real too, but they are the second and third reason.</p>
+
+      <div class="callout callout--key">
+        <span class="callout__label">Remember this</span>
+        <p class="mt-0">On-device inference is a <strong>distribution</strong> problem wearing a
+        machine-learning costume. The maths was finished in Lesson 07. What is left is bytes on
+        disk, bytes over the network, bytes in RAM, and milliseconds before the first token.</p>
+      </div>
+
+      <p>One question comes before all of this, and it is cheap to ask: <strong>does the operating
+      system already ship a model that is good enough?</strong> Recent phones often do, and a system
+      model costs your app zero bytes. You ship your own for four reasons: a specific fine-tune, a
+      modality the platform does not cover, old devices, or identical behaviour everywhere.
+      Section 8 works that decision through. The rest of the lesson assumes you made it.</p>
+
+      <h2 id="bundle"><span class="h-num">10 · 2</span>What is actually inside the app</h2>
+
+      <p>An iOS app is a folder with a signature. Three things in it matter to us.</p>
+
+      <p><strong>Your code.</strong> Swift, the interface, images, strings. For an app whose point
+      is one model, this is small.</p>
+
+      <p><strong>The runtime library.</strong> The C++ engine that reads the model file and executes
+      it: <span class="term" data-term="executorch">ExecuTorch</span>, ONNX (Open Neural Network Exchange) Runtime,
+      <span class="term" data-term="core ml">Core ML</span>, or llama.cpp. A build decision pays off
+      here. ONNX Runtime Mobile offers a <em>minimal build</em>: you compile only the operator
+      kernels your own models need. That is the difference between tens of megabytes of binary and
+      a few.</p>
+
+      <p><strong>The model file.</strong> This is the download. A 360-million-parameter model is
+      1.44 GB in FP32, 720 MB in BF16, 360 MB in INT8, and about 200 MB at 4 bits with group
+      scales. The file you exported in Lesson 09 is 191 MB. This lesson says 200 MB throughout,
+      because that is the round number every later sum uses. Even after Lesson 07, it dwarfs
+      everything else in the bundle.</p>
+
+      <figure class="scene" data-scene="dev-bundle">
+        <div class="scene__head">
+          <span class="scene__badge">animation</span>
+          <span class="scene__title">The bundle, and the line you are not allowed to cross</span>
+        </div>
+        <div class="scene__stage">
+          <svg viewBox="0 0 900 330" role="img" aria-label="An app bundle containing code, a runtime library and a large model file, and a download-size bar that crosses a 200 megabyte limit until the model is moved out and fetched on first run">
+            <g id="db-plot"></g>
+          </svg>
+        </div>
+      </figure>
+
+      <p>The limit is real and it is close. Apple restricts App Store downloads above 200 MB over a
+      cellular connection, and Google Play caps an Android App Bundle's base module at roughly the
+      same size. A 200 MB model plus an app does not fit.</p>
+
+      <p>The answer is the same on both platforms: <strong>do not put the weights in the binary.</strong>
+      Ship a small app. On first run, download the model file, verify a hash so a corrupted or
+      substituted file cannot reach your runtime, and write it into a cache directory. Apple's
+      store-side version of this is called on-demand resources. Either way the weights travel
+      separately from the code.</p>
+
+      <div class="code">
+        <div class="code__head"><span>ModelStore.swift</span><span class="lang">swift</span></div>
+        <pre><code>// Where the weights live decides your app size and who is allowed to delete them.
+
+// (a) Inside the bundle: always present, counts against the download limit.
+let bundled = Bundle.main.url(forResource: "model", withExtension: "pte")
+
+// (b) Downloaded once: small app, but the OS may reclaim this at any time.
+let caches = FileManager.default
+    .urls(for: .cachesDirectory, in: .userDomainMask)[0]
+    .appendingPathComponent("model.pte")
+
+let haveModel = FileManager.default.fileExists(atPath: caches.path)</code></pre>
+      </div>
+
+      <div class="callout callout--pitfall">
+        <span class="callout__label">Common trap</span>
+        <p class="mt-0">A cache directory is not storage you own. iOS deletes files there when the
+        device runs low on space, silently, while your app is not running. If your code treats a
+        missing model file as an unexpected error, some users will see a permanently broken app.
+        Treat "the model is gone" as a normal state with a normal recovery path: show the download
+        screen again.</p>
+      </div>
+
+      <h2 id="units"><span class="h-num">10 · 3</span>Which chip runs which layer</h2>
+
+      <p>Pick the wrong chip and you pay twice: the answer is slower and the battery drains faster,
+      and neither shows up as an error. So it is worth knowing who decides.</p>
+
+      <p>A phone has three processors that can do matrix arithmetic. The CPU is general and always
+      available. The GPU is wide and good at large regular work. The third is Apple's Neural
+      Engine, an <span class="term" data-term="npu">NPU</span> — a neural processing unit, a chip
+      that does only the arithmetic neural networks need. It is fixed-function: it runs a
+      restricted set of operators very fast, and it uses far less power per operation than the
+      other two.</p>
+
+      <p>You do not choose per operator. You give the runtime a priority list — with
+      <code>coremltools</code> that is <code>ComputeUnit.CPU_AND_NE</code>, with ExecuTorch it is
+      the partitioners you pass to <code>to_edge_transform_and_lower</code>. The runtime then walks
+      your graph and asks each backend "can you take this node?". A run of accepted nodes becomes a
+      <strong>delegate</strong>: a slice of the graph one accelerator agreed to run, called from the
+      CPU as a single opaque step. The CPU hands over a tensor and gets a tensor back. Everything
+      refused stays on portable CPU kernels.</p>
+
+      <figure class="scene" data-scene="dev-units">
+        <div class="scene__head">
+          <span class="scene__badge">animation</span>
+          <span class="scene__title">One graph, three chips, and the copies in between</span>
+        </div>
+        <div class="scene__stage">
+          <svg viewBox="0 0 900 340" role="img" aria-label="Ten operator nodes rising from a single graph row into three lanes labelled Neural Engine, GPU and CPU, with red copy markers appearing wherever consecutive operators land on different chips">
+            <g id="du-plot"></g>
+          </svg>
+        </div>
+      </figure>
+
+      <p>The Neural Engine has conditions. It is built around FP16: an operator that forces FP32
+      falls back to the GPU or the CPU. It prefers four-dimensional tensors laid out as
+      <code>(B, C, 1, S)</code>, so unusual ranks push work off it. A model that "runs on the Neural
+      Engine" is in practice three to ten delegated islands with CPU glue between them, and
+      <strong>every boundary costs a copy of the tensor</strong>.</p>
+
+      <div class="callout callout--pitfall">
+        <span class="callout__label">Common trap</span>
+        <p class="mt-0">Asking for the Neural Engine at export time is not evidence that it ran.
+        The failure is silent: the model gives correct output and is slower than the plain CPU
+        build, because one unsupported operator in every transformer block split the graph. Dump
+        ExecuTorch's partition report, or open the Core ML Instrument in Xcode and see which unit
+        each region actually used.</p>
+      </div>
+
+      <p>Speed is not the only reason to care. The Neural Engine's advantage is <strong>energy per
+      token</strong> as much as time per token. On a device with a battery and no fan, that is often
+      the number a product decision rests on.</p>
+
+      <h2 id="cold-start"><span class="h-num">10 · 4</span>Cold start has three parts</h2>
+
+      <p>"The app takes three seconds to answer the first question" is not a bug report you can act
+      on. Start-up is three separate costs with three separate fixes, and only one of them is
+      usually large.</p>
+
+      <figure class="scene" data-scene="dev-cold">
+        <div class="scene__head">
+          <span class="scene__badge">animation</span>
+          <span class="scene__title">Where the first three seconds go, and what a warm start looks like</span>
+        </div>
+        <div class="scene__stage">
+          <svg viewBox="0 0 900 300" role="img" aria-label="Two horizontal time bars. The cold bar is dominated by a long red backend-compilation segment; the warm bar is short because that segment has collapsed">
+            <g id="dc-plot"></g>
+          </svg>
+        </div>
+      </figure>
+
+      <p><strong>Open and map the file.</strong> Both <code>.pte</code> and
+      <span class="term" data-term="gguf">GGUF</span> — GPT-Generated Unified Format — are designed
+      to be memory-mapped. The runtime asks the operating system to put the file's bytes in its address
+      space instead of reading them into a buffer. Nothing is copied, and pages arrive from storage
+      the first time a weight is touched. That is why a multi-gigabyte model "loads" in
+      milliseconds.</p>
+
+      <p><strong>Compile the model for this device.</strong> This is the expensive one. A
+      <code>.mlpackage</code> becomes an <code>.mlmodelc</code> the first time it is loaded, a
+      WebGPU backend compiles shaders, a compiler-based runtime generates kernels. For a large model
+      that is seconds, not milliseconds.</p>
+
+      <p><strong>Prefill the prompt.</strong> Running the prompt through the model once to fill the
+      <span class="term" data-term="kv cache">key-value (KV) cache</span>. It grows with prompt length, and it
+      is real work you can shorten but not remove. Prefill is the one part of generation that is
+      compute-bound: the whole prompt goes through in one wide batch. That is why an accelerator
+      helps here. Decoding one token at a time is
+      <span class="term" data-term="memory bound">memory-bound</span>, and gains nothing from the
+      Neural Engine.</p>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>Stage</th><th>Cold</th><th>Warm</th><th>What fixes it</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>Open file, memory-map</td><td class="num">12 ms</td><td class="num">12 ms</td><td>Nothing. It is already cheap.</td></tr>
+            <tr><td>Backend compilation</td><td class="num">2 400 ms</td><td class="num">40 ms</td><td>Compile ahead of time, cache the artifact.</td></tr>
+            <tr><td>Prefill the prompt</td><td class="num">380 ms</td><td class="num">380 ms</td><td>Shorter system prompt; run prefill on the Neural Engine.</td></tr>
+            <tr><td><strong>Total</strong></td><td class="num"><strong>2 792 ms</strong></td><td class="num"><strong>432 ms</strong></td><td></td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>These are the shape of a real measurement on one device with one model, not a universal
+      figure. But the ratio is the lesson: the fix for cold start is caching compilation, not faster
+      storage.</p>
+
+      <p>Here is that fix in full, because "cache the artifact" is doing a lot of work in one table
+      cell. On Apple platforms the compiled form of a <code>.mlpackage</code> is a directory called
+      <code>.mlmodelc</code>, and you can build it yourself.</p>
+
+      <div class="code">
+        <div class="code__head"><span>ModelCompile.swift</span><span class="lang">swift</span></div>
+        <pre><code>import CoreML
+
+// Application Support survives. The caches directory does not.
+let support = try FileManager.default.url(
+    for: .applicationSupportDirectory, in: .userDomainMask,
+    appropriateFor: nil, create: true)
+let compiled = support.appendingPathComponent("model.mlmodelc")
+
+if !FileManager.default.fileExists(atPath: compiled.path) {
+    // This is the 2 400 ms. It writes into a temporary directory
+    // that the system is free to delete, so move the result out.
+    let tmp = try MLModel.compileModel(at: packageURL)
+    try FileManager.default.moveItem(at: tmp, to: compiled)
+}
+
+let model = try MLModel(contentsOf: compiled)   // every later launch: tens of ms</code></pre>
+      </div>
+
+      <p>Two details decide whether this works. First, <code>compileModel</code> returns a URL in a
+      temporary directory that the system may empty before your next launch. If you do not move the
+      result, you recompile on every launch. Second, put it in <em>Application Support</em>, not caches.
+      Caches is the directory iOS reclaims under pressure — right for the weights, wrong for
+      this.</p>
+
+      <p>A browser gives you no equivalent call. You cannot compile the GPU shaders yourself and
+      store them; whether they are kept is the browser's decision. That is why section 5 tells you
+      to <em>measure</em> the second visit rather than assume it.</p>
+
+      <div class="callout callout--pitfall">
+        <span class="callout__label">Common trap</span>
+        <p class="mt-0">Measuring cold start twice in a row measures a warm page cache and a warm
+        compilation cache, so you report a number no first-time user sees. Reboot the device, or
+        delete the app's caches, before timing the first launch. Then report both numbers and label
+        which is which.</p>
+      </div>
+
+      <p>Keeping a model warm is the other half. Hold the handle for as long as the user might come
+      back. When iOS terminates a background app, everything in memory goes with it: the mapping,
+      the compiled artifact, the KV cache. The next launch is cold again — unless you wrote that
+      artifact to disk.</p>
+
+      <h2 id="browser"><span class="h-num">10 · 5</span>The browser path</h2>
+
+      <p>A browser tab has no bundle. Nothing to install, nothing to review — that is the whole
+      appeal. The price is that the weights arrive over the network the first time somebody opens
+      your page.</p>
+
+      <p>The library for this is <strong>Transformers.js</strong>, published as
+      <code>@huggingface/transformers</code>. Version 4 rewrote the WebGPU runtime in C++ with the
+      ONNX Runtime team, and covers roughly 200 model architectures. It is Apache-2.0 licensed. The
+      pinned version for this course is 4.2.0.</p>
+
+      <div class="code">
+        <div class="code__head"><span>embed.js</span><span class="lang">javascript</span></div>
+        <pre><code>// npm i @huggingface/transformers@4.2.0
+import { pipeline } from "@huggingface/transformers";
+
+const pipe = await pipeline(
+  "feature-extraction",
+  "onnx-community/all-MiniLM-L6-v2-ONNX",
+  { device: "webgpu", dtype: "q4f16" }
+);
+
+const out = await pipe("hello world", { pooling: "mean", normalize: true });
+console.log(out.dims);      // [1, 384]</code></pre>
+      </div>
+
+      <p>That returns one vector of 384 numbers for the whole sentence — a sentence embedding. It is
+      not Lesson 03's embedding table, which looks up one stored row per token id. This vector is
+      computed: the model runs over every token, and <code>pooling: "mean"</code> averages the
+      results into one. <code>out.dims</code> prints <code>[1, 384]</code>: one input, 384
+      dimensions. We
+      start here rather than with generation because this model is 20 MB, it runs in a second, and a
+      wrong shape is obvious.</p>
+
+      <p>Two arguments carry all the weight. <code>device</code> chooses the backend —
+      <code>"webgpu"</code> for the GPU. <code>dtype</code> chooses which quantized weight file to
+      download: <code>fp32</code>, <code>fp16</code>, <code>q4</code> or <code>q4f16</code>.
+      Changing <code>dtype</code> changes how many bytes the user downloads, which here is a product
+      decision, not a tuning knob.</p>
+
+      <figure class="scene" data-scene="dev-cache">
+        <div class="scene__head">
+          <span class="scene__badge">animation</span>
+          <span class="scene__title">First visit pays. Second visit does not.</span>
+        </div>
+        <div class="scene__stage">
+          <svg viewBox="0 0 900 310" role="img" aria-label="A browser downloading a model from a CDN into Cache Storage on the first visit, then loading the same model from cache with zero network bytes on the second visit">
+            <g id="dw-plot"></g>
+          </svg>
+        </div>
+      </figure>
+
+      <p>The downloaded files go into the browser's Cache Storage, keyed by URL, once per origin
+      rather than once per visit. The second visit resolves the same URLs from disk and sends
+      nothing over the network. This is the most important thing to get right in a browser
+      deployment. It is also what makes your own testing misleading: after the first run, your
+      machine sits permanently in the good case.</p>
+
+      <div class="callout callout--note">
+        <span class="callout__label">Worth knowing</span>
+        <p class="mt-0">Design the first visit as a real screen, not a spinner. Show the byte count
+        and the progress, and let the user start it deliberately. 200 MB arriving without warning on
+        a metered connection is a complaint, not a feature. Convert it to the unit a user feels:
+        200 MB is about 160 seconds on a 10 Mbit/s mobile connection, and about 32 seconds on
+        50 Mbit/s Wi-Fi.</p>
+      </div>
+
+      <p>Browsers can evict Cache Storage under storage pressure, exactly as iOS empties a caches
+      directory. Same rule: a cache miss is a normal state. And note what is <em>not</em> promised.
+      Your code caches the weights; whether the compiled shaders are kept is the browser's
+      business.</p>
+
+      <h2 id="webgpu-wasm"><span class="h-num">10 · 6</span>WebGPU and WebAssembly</h2>
+
+      <p>There are two ways to multiply matrices in a page, and they are not close.</p>
+
+      <p><strong>WebAssembly</strong> runs the arithmetic on the CPU. It has SIMD everywhere —
+      single instruction, multiple data: one CPU instruction does the same multiply on four or eight
+      numbers at once. That is why the CPU path is slow rather than hopeless. It can also use
+      several worker threads. Threads require <code>SharedArrayBuffer</code>, which requires the
+      page to be cross-origin isolated, which requires two response headers from your server:
+      Cross-Origin-Opener-Policy (COOP) and Cross-Origin-Embedder-Policy (COEP).</p>
+
+      <p><strong>WebGPU</strong> hands the same work to the GPU as one dispatch of many parallel
+      invocations. It is what made in-browser transformer inference practical. As of January 2026 it
+      is <strong>Baseline</strong>: the web platform's label for a feature that works in the current
+      version of every major browser. Today that means Chrome and Edge, Firefox 141, and
+      Safari 26.</p>
+
+      <figure class="scene" data-scene="dev-gpu">
+        <div class="scene__head">
+          <span class="scene__badge">animation</span>
+          <span class="scene__title">The same matrix multiply, four threads or thousands of invocations</span>
+        </div>
+        <div class="scene__stage">
+          <svg viewBox="0 0 900 320" role="img" aria-label="Two identical output grids. The WebAssembly grid fills four rows at a time, then one row at a time when threads are disabled. The WebGPU grid fills all at once.">
+            <g id="dg-plot"></g>
+          </svg>
+        </div>
+      </figure>
+
+      <div class="code">
+        <div class="code__head"><span>capabilities.js</span><span class="lang">javascript</span></div>
+        <pre><code>// Two lines that explain most "why is it slow in production" reports.
+console.log(!!navigator.gpu);        // false  -> no WebGPU, you are on the WASM path
+console.log(crossOriginIsolated);    // false  -> no SharedArrayBuffer, so ONE wasm thread
+
+// The two response headers that make crossOriginIsolated true:
+//   Cross-Origin-Opener-Policy: same-origin
+//   Cross-Origin-Embedder-Policy: require-corp</code></pre>
+      </div>
+
+      <div class="callout callout--pitfall">
+        <span class="callout__label">Common trap</span>
+        <p class="mt-0">Your development server sets those headers; your production host or content
+        delivery network (CDN) does not. Nothing breaks. Threads are disabled and the page falls
+        back to one WebAssembly thread. Inference then slows by roughly the number of worker threads
+        you lost — four to eight on current devices, and a rule of thumb to measure rather than a
+        constant. Nothing appears in the console, so log <code>crossOriginIsolated</code> in
+        production and put it in your telemetry.</p>
+      </div>
+
+      <p>What about WebNN, the browser API for talking to an NPU directly? It is still moving. The
+      specification has taken over a hundred substantive changes since 2024, and Chrome exposes it
+      only behind an origin trial. Plan for WebGPU now.</p>
+
+      <h2 id="memory"><span class="h-num">10 · 7</span>Memory, eviction, battery and heat</h2>
+
+      <p>A phone does not give your app all of its RAM. Each app gets a device-dependent budget, and
+      an app that exceeds it is not slowed or swapped out — it is killed. The mechanism has a name:
+      iOS calls it <strong>Jetsam</strong>, and it leaves a jetsam event in the crash logs, which is
+      how you confirm the cause. On a 6 GB phone a foreground app may safely hold about 2 to
+      3 GB.</p>
+
+      <p>Until now the running example was a 360-million-parameter model at 4 bits, about 200 MB.
+      That is the easy case. Take instead the largest model that could plausibly fit: 3 billion
+      parameters at 4 bits with group scales. That is the <strong>1.83 GB</strong> file you profiled
+      in Lesson 08. The rest of this section uses it.</p>
+
+      <figure class="scene" data-scene="dev-mem">
+        <div class="scene__head">
+          <span class="scene__badge">animation</span>
+          <span class="scene__title">Clean pages survive. Dirty pages get you terminated.</span>
+        </div>
+        <div class="scene__stage">
+          <svg viewBox="0 0 900 320" role="img" aria-label="A vertical memory column showing app memory, memory-mapped weights and a growing KV cache rising through a two-to-three gigabyte danger band until the operating system terminates the app">
+            <g id="dm-plot"></g>
+          </svg>
+        </div>
+      </figure>
+
+      <p>The distinction that decides your fate is <strong>clean versus dirty</strong>. Weights you
+      memory-mapped from a file are clean, file-backed pages: a copy already exists on disk, so under
+      pressure the system drops them and reads them again later. That costs latency. The KV cache is
+      the opposite — dirty anonymous memory that exists nowhere else, so it can only be kept or lost
+      with your process.</p>
+
+      <p>This is why <code>mmap</code> keeps appearing in this course, and it is a second reason —
+      after the cold-start argument — to prefer runtimes and formats built around it.</p>
+
+      <p>Now the sum this whole section exists for. Your context length is whatever is left after
+      everything else has taken its share.</p>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>What takes the memory</th><th>Size</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>Safe budget for a foreground app on a 6 GB phone</td><td class="num">2.50 GB</td></tr>
+            <tr><td>− weights, mapped from the file</td><td class="num">− 1.83 GB</td></tr>
+            <tr><td>− your app: interface, buffers, the runtime itself</td><td class="num">− 0.25 GB</td></tr>
+            <tr><td><strong>= left for the KV cache</strong></td><td class="num"><strong>0.42 GB</strong></td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>Lesson 08 worked out what one token costs in the cache, for exactly this model: 32 layers,
+      8 key/value heads, head dimension 128, cache kept in FP16. That is
+      <code>2 × 32 × 8 × 128 × 2 = 131 072</code> bytes, about <strong>131 kB per token</strong>.
+      So 0.42 GB divided by 131 kB is about <strong>3 200 tokens</strong>. That is where the app
+      dies, not what you ship. Leave a margin for a phone that is also running other apps, and ship
+      <strong>2 048</strong> — 0.27 GB of cache.</p>
+
+      <p>Notice how small that is beside the numbers a model advertises. Lesson 08 measured the same
+      cache at 8 192 tokens and got 1.07 GB, more than twice the headroom you have here. A
+      32 768-token context window is a property of the model, not a promise your phone can keep.</p>
+
+      <div class="callout callout--key">
+        <span class="callout__label">Remember this</span>
+        <p class="mt-0">On a phone, <strong>maximum context length is a memory setting</strong>, not
+        a product setting. In Lesson 04 the KV cache was a speed optimisation. Here it decides
+        whether the operating system terminates your app mid-conversation. Cap it, and free it when
+        you move to the background.</p>
+      </div>
+
+      <p>The project asks you to raise the context length until the app is terminated. That step
+      <em>verifies</em> the 3 200; it is not how you discover it. Predict first, then measure. A
+      prediction that misses by a factor of two means you forgot something in the table.</p>
+
+      <p>Two more physical limits, both from Lesson 08 and both worse on a phone than on a laptop.</p>
+
+      <p><strong>Heat.</strong> There is no fan. Sustained inference raises the die temperature, and
+      the system reduces clock speeds after roughly 30 to 120 seconds. So a ten-second benchmark
+      reports a number your users see for ten seconds. Report sustained throughput over five
+      minutes, and give background work a duty cycle.</p>
+
+      <p><strong>Battery.</strong> Generation is memory-bound: each token reads every weight once
+      and does very little arithmetic per byte. Moving bytes costs energy. Halving the bytes per
+      weight roughly halves both the time per token and the energy per token. That is why 4-bit is
+      the default on device, and why "INT8 is fast enough on the server" does not transfer.</p>
+
+      <h2 id="platform-models"><span class="h-num">10 · 8</span>When the best model is one you do not ship</h2>
+
+      <p>In 2026 the first question is no longer "which runtime?". It is "does the operating system
+      already ship a model that is good enough?" Section 1 raised it. Here is the answer in
+      detail.</p>
+
+      <p>On Apple platforms, the <strong>Foundation Models framework</strong> gives you an on-device
+      model of roughly three billion parameters. It is free, offline, and needs no API key. It can
+      also return a typed object instead of free text: <code>@Generable</code> is a Swift annotation
+      on a struct, and the model must fill that struct in. Apple publishes a toolkit for training
+      rank-32 LoRA (low-rank adaptation) adapters for it — Lesson 05's technique, on a model you never downloaded.</p>
+
+      <p>The same framework offers a larger model with a 32-thousand-token context, running under
+      Private Cloud Compute. Read that carefully: the request leaves the phone for Apple's servers.
+      The encryption story is unusually strong, but this option cannot carry the privacy claim from
+      section 1. If "the data never leaves the device" is your promise, it is not for you.</p>
+
+      <p>On Android, the equivalent is <strong>ML Kit's GenAI APIs over AICore</strong>. AICore is a
+      system service that hosts Gemini Nano and exposes prompting, summarization, proofreading,
+      rewriting and image description. It runs on recent MediaTek, Qualcomm and Google Tensor
+      devices.</p>
+
+      <p>In both cases the operating system shares one model, so it costs your app <strong>zero
+      bytes of download</strong>. Compare that with the 200 MB you were about to ask a user to
+      accept.</p>
+
+      <figure class="scene" data-scene="dev-os">
+        <div class="scene__head">
+          <span class="scene__badge">animation</span>
+          <span class="scene__title">Two hundred megabytes, or zero</span>
+        </div>
+        <div class="scene__stage">
+          <svg viewBox="0 0 900 300" role="img" aria-label="Two download bars side by side: a 200 megabyte bar for shipping your own model against a zero-byte bar for the system model, then four reasons that bring the first bar back">
+            <g id="do-plot"></g>
+          </svg>
+        </div>
+      </figure>
+
+      <p>You ship your own model when you need one of these four things:</p>
+
+      <ol>
+        <li>A specific fine-tune, or behaviour the platform model will not produce.</li>
+        <li>A modality the platform does not cover — your own speech, audio or vision model.</li>
+        <li>Guaranteed availability on older or cheaper devices that have no system model.</li>
+        <li>Identical behaviour across iOS, Android and the web, from one artifact.</li>
+      </ol>
+
+      <h3 id="checklist">The shipping checklist</h3>
+
+      <p>Before a build with a model in it leaves your machine, work through this. Every item here
+      is something that has shipped broken.</p>
+
+      <ol class="steps">
+        <li><strong>Licence of the weights.</strong> Read the model card and the repository licence,
+            not the blog post. Apache-2.0 and MIT are safe in a closed app. A <strong>copyleft</strong>
+            licence — GPL-3.0 and its relatives — asks anyone who distributes the software to publish
+            their own source under the same terms. That is why copyleft rarely survives a closed app.
+            The Piper <span class="term" data-term="tts">text-to-speech (TTS)</span> project is
+            GPL-3.0, and that is a decision your legal team makes, not you.</li>
+        <li><strong>Gating.</strong> Some models are gated on the Hugging Face Hub: you must accept
+            terms with an account before the files download. A gated model cannot be fetched by your
+            continuous-integration (CI) build or by your users' devices without credentials. Check
+            before you build a product on it.</li>
+        <li><strong>Licence of the training data</strong>, when you trained the model yourself.
+            TinyStories is CDLA-Sharing-1.0; CIFAR-10's card says the licence is unknown. Record what
+            you used.</li>
+        <li><strong>Download size</strong> measured on a clean install, against the 200 MB cellular
+            limit.</li>
+        <li><strong>Cold start after a reboot</strong>, reported as three numbers, not one.</li>
+        <li><strong>Peak memory</strong> at your maximum context length, measured with Instruments,
+            with headroom left over.</li>
+        <li><strong>Sustained throughput over five minutes</strong>, not ten seconds.</li>
+        <li><strong>The cache-miss path.</strong> Delete the model file while the app is closed,
+            then launch. Do the same in a browser with cleared storage.</li>
+        <li><strong>The no-WebGPU path</strong>, and <code>crossOriginIsolated</code> in production.</li>
+        <li><strong>Output check.</strong> Run the same ten prompts through the PyTorch model and
+            the exported one. Quantization and delegation both change numerics.</li>
+      </ol>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>Component of an offline assistant</th><th>Size</th><th>Licence</th><th>Closed app?</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>whisper-tiny.en, INT8</td><td class="num">≈ 39 MB</td><td>Apache-2.0</td><td>yes</td></tr>
+            <tr><td>SmolLM2-360M-Instruct, INT4</td><td class="num">≈ 200 MB</td><td>Apache-2.0</td><td>yes</td></tr>
+            <tr><td>Kokoro-82M (speech)</td><td class="num">60–80 MB</td><td>Apache-2.0</td><td>yes</td></tr>
+            <tr><td>Piper voice (alternative)</td><td class="num">—</td><td>GPL-3.0</td><td>check first</td></tr>
+            <tr><td>Transformers.js runtime</td><td class="num">—</td><td>Apache-2.0</td><td>yes</td></tr>
+            <tr><td><strong>Total model payload</strong></td><td class="num"><strong>300–320 MB</strong></td><td></td><td></td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>That table is Lesson 13's assistant, costed. It fits on a phone and in a browser tab. It
+      does not fit in an App Store binary.</p>
+
+      <div class="code">
+        <div class="code__head"><span>main.cpp — the iOS side, in three lines</span><span class="lang">cpp</span></div>
+        <pre><code>#include &lt;executorch/extension/module/module.h&gt;
+#include &lt;executorch/extension/tensor/tensor.h&gt;
+using namespace ::executorch::extension;
+
+Module module("/path/to/model.pte");        // mmap-ed, not read into a buffer
+float input[1 * 3 * 224 * 224];
+auto tensor = from_blob(input, {1, 3, 224, 224});
+
+const auto result = module.forward(tensor);
+if (result.ok()) {
+  const auto out = result-&gt;at(0).toTensor().const_data_ptr&lt;float&gt;();
+}</code></pre>
+      </div>
+
+      <p>That is the entire runtime API surface for a single-input model. The complexity in this
+      lesson is not in the call. It is in where the file came from, which chips ran it, and whether
+      the process is still alive.</p>
+
+      <div class="project">
+        <span class="project__label">Project 10</span>
+        <h3>Your model, in an app you can hold</h3>
+        <p>Take the model you fine-tuned in Lesson 05 and exported in Lesson 09, and make it run
+        somewhere a person can touch it.
+        The browser track is required, because everybody can do it. The iOS track is the second half
+        if you have a Mac and Xcode. There is no training here — the work is measurement and
+        honesty.</p>
+
+        <ol class="steps">
+          <li><strong>Serve the page.</strong> Install <code>@huggingface/transformers@4.2.0</code>
+              and build a one-page application that loads a model with
+              <code>{ device: "webgpu", dtype: "q4" }</code>. Start with the embedding model above,
+              then swap in your own ONNX export from Lesson 09.</li>
+          <li><strong>Measure the first visit.</strong> Open the page in a fresh private window with
+              the network panel recording. Write down three numbers: bytes over the network, then
+              milliseconds to a ready pipeline and to the first output.</li>
+          <li><strong>Measure the second visit.</strong> Reload. Write down the same three numbers.
+              The bytes should be zero. Explain, in one sentence, any part of the load time that did
+              <em>not</em> collapse.</li>
+          <li><strong>Measure the no-GPU path.</strong> Force the WebAssembly backend, log
+              <code>crossOriginIsolated</code>, and check whether you are on one thread or
+              several.</li>
+          <li><strong>Build the download screen.</strong> Show the byte count before starting, show
+              progress during, and handle the case where the cache was evicted between visits.</li>
+          <li><strong>iOS track.</strong> Put your <code>.pte</code> or <code>.mlpackage</code> into
+              an Xcode project and build it twice: once with the model inside the bundle, once
+              downloading it on first run. Record the app download size both ways.</li>
+          <li><strong>iOS track.</strong> Run it under Instruments. Record peak memory, and open the
+              Core ML Instrument to see which compute unit each region of the graph actually used.</li>
+        </ol>
+
+        <p><strong>Then break it on purpose.</strong> Each of these is a bug report you will
+        otherwise receive from a stranger:</p>
+        <ul>
+          <li>Clear site storage between runs. Throttle the network panel to a mobile profile. How
+              long is the first visit now?</li>
+          <li>Delete the downloaded model file while the app is closed, then launch. Does it
+              recover, or show an error screen with no way forward?</li>
+          <li>Remove the COOP and COEP headers from your server and measure the WebAssembly path
+              again. Nothing errors — how much slower did it get?</li>
+          <li>Generate continuously for five minutes on a phone. Plot tokens per second against
+              time and find the moment the clocks drop.</li>
+          <li>Raise the maximum context length until the app is terminated. Compare that number
+              with the one you predicted from the table in section 7.</li>
+        </ul>
+
+        <dl class="project__grid">
+          <div class="project__stat"><dt>Data</dt><dd>None — one exported model file</dd></div>
+          <div class="project__stat"><dt>Size</dt><dd>≈ 200 MB at 4 bits</dd></div>
+          <div class="project__stat"><dt>Time</dt><dd>An afternoon, no training</dd></div>
+          <div class="project__stat"><dt>Target</dt><dd>Second visit under 1 s, zero network bytes</dd></div>
+        </dl>
+      </div>
+
+      <h2 id="check">Check yourself</h2>
+
+      <div class="check">
+        <p class="check__q">Your iOS app takes 2.8 seconds from launch to the first token. You
+        measure the three parts and find 12 ms to map the file, 2 400 ms to compile, and 380 ms to
+        prefill. Which change helps most?</p>
+        <div class="check__opts">
+          <button class="check__opt">Store the model on faster flash storage</button>
+          <button class="check__opt">Shorten the system prompt</button>
+          <button class="check__opt" data-right>Compile the model ahead of time and cache the compiled artifact</button>
+          <button class="check__opt">Move the model from the caches directory into the app bundle</button>
+        </div>
+        <p class="check__why">Compilation is 86% of the total, so nothing else can matter much. The
+        <code>.mlmodelc</code> that Core ML builds on first load can be produced ahead of time and
+        stored, which turns 2 400 ms into tens of milliseconds on every launch after the first.</p>
+      </div>
+
+      <div class="check">
+        <p class="check__q">Your Transformers.js page loads in under a second every time you open
+        it. Users report a 40-second wait, then instant loads afterwards. What is happening, and
+        what do you change?</p>
+        <div class="check__opts">
+          <button class="check__opt">The content delivery network throttles first requests — mirror the weights on your own origin</button>
+          <button class="check__opt" data-right>Your browser already holds the weights in Cache Storage — test in a fresh profile and report both visits separately</button>
+          <button class="check__opt">Their browsers recompile the shaders on the first visit — store the compiled shaders yourself</button>
+          <button class="check__opt">Their devices lack WebGPU — set <code>dtype</code> to <code>fp32</code> so the WebAssembly path is accurate</button>
+        </div>
+        <p class="check__why">Cache Storage is keyed by URL and filled once per origin, not once per
+        visit, so after your first run your machine sits permanently in the good case. Nothing is
+        broken: the users are seeing the first visit and you are not. Fix the measurement, then
+        design the first visit as a real download screen. Storing compiled shaders is not offered to
+        you in a browser, and <code>dtype</code> chooses how many bytes are downloaded, so
+        <code>fp32</code> would make the wait longer.</p>
+      </div>
+
+      <div class="check">
+        <p class="check__q">On a laptop with no WebGPU, your page runs at full speed from your
+        development server and about six times slower from the production URL. Same browser, same
+        machine, nothing in the console. What do you check first?</p>
+        <div class="check__opts">
+          <button class="check__opt">Whether production serves a heavier <code>dtype</code> than the development build</button>
+          <button class="check__opt" data-right>Whether the production response carries COOP and COEP — without them there is no <code>SharedArrayBuffer</code>, so WebAssembly drops to one thread</button>
+          <button class="check__opt">Whether the graphics driver needs updating</button>
+          <button class="check__opt">Whether Cache Storage was evicted between the two runs</button>
+        </div>
+        <p class="check__why">With no WebGPU you are on the WebAssembly path, and its speed comes
+        from worker threads. Threads need <code>SharedArrayBuffer</code>, which needs a
+        cross-origin-isolated page, which needs both headers. Your development server sets them and
+        your host usually does not. Nothing errors, so log <code>crossOriginIsolated</code> in
+        production. The slowdown tracks the threads you lost, roughly four to eight on current
+        devices — measure it rather than trusting the number.</p>
+      </div>
+
+      <div class="check">
+        <p class="check__q">Your app maps 1.83 GB of weights from a file and also holds a 0.9 GB KV
+        cache. The device comes under memory pressure. What does the operating system do?</p>
+        <div class="check__opts">
+          <button class="check__opt">Swaps both to disk and continues, slowly</button>
+          <button class="check__opt" data-right>Can drop the mapped weight pages and re-read them, but cannot reclaim the KV cache</button>
+          <button class="check__opt">Compresses the weights in place</button>
+          <button class="check__opt">Reclaims the KV cache first, because it is larger per page</button>
+        </div>
+        <p class="check__why">Memory-mapped weights are clean, file-backed pages: an identical copy
+        already exists on disk, so dropping them costs only a later re-read. The KV cache is dirty
+        anonymous memory that exists nowhere else, so the only way to reclaim it is to terminate
+        your process.</p>
+      </div>
+
+      <div class="check">
+        <p class="check__q">A foreground app may hold 2.5 GB. Your weights are 1.83 GB and the rest
+        of the app is 0.25 GB. The KV cache costs 131 kB per token. What maximum context length do
+        you ship?</p>
+        <div class="check__opts">
+          <button class="check__opt">32 768 tokens, because that is what the model was trained for</button>
+          <button class="check__opt">About 3 200 tokens — use everything that is left</button>
+          <button class="check__opt" data-right>2 048 tokens: about 3 200 fit, and the rest is safety margin</button>
+          <button class="check__opt">There is no way to know without shipping and watching the crash logs</button>
+        </div>
+        <p class="check__why">2.5 − 1.83 − 0.25 = 0.42 GB for the cache, and 0.42 GB ÷ 131 kB is
+        about 3 200 tokens. That is where the app dies on a quiet device, and what the model was
+        trained for does not enter the sum. Ship well under it — 2 048 tokens is 0.27 GB — then
+        confirm the prediction with the project's termination test.</p>
+      </div>
+
+      <div class="check">
+        <p class="check__q">Your closed iOS app needs a voice. Piper is GPL-3.0. Kokoro-82M is
+        Apache-2.0 and 60–80 MB. Piper sounds slightly better in your listening test. What do you
+        do?</p>
+        <div class="check__opts">
+          <button class="check__opt">Ship Piper — a model file is data, so the licence does not travel with it</button>
+          <button class="check__opt" data-right>Ship Kokoro, record the licence with the build, and go to legal first if you truly need Piper</button>
+          <button class="check__opt">Ship Piper and open-source only the code that loads the model</button>
+          <button class="check__opt">Ship whichever sounds better and settle the licence before the next release</button>
+        </div>
+        <p class="check__why">Copyleft asks anyone who distributes the software to publish their own
+        source under the same terms. A closed app cannot, and "it is only data" is not a defence you
+        get to make on your company's behalf. The listening test is real, but it is not the deciding
+        input — which is what makes this a licence decision, not a technical one.</p>
+      </div>
+
+      <div class="terms">
+        <span class="terms__label">Key words from this lesson</span>
+        <dl>
+          <dt>App bundle</dt>
+          <dd>The signed folder installed on a phone: your code, the runtime library, and any files you shipped with them.</dd>
+
+          <dt>Memory mapping <span class="en">also: mmap</span></dt>
+          <dd>Making a file's bytes appear in your address space, so nothing is copied and pages load only when touched.</dd>
+
+          <dt>Clean page / dirty page</dt>
+          <dd>A clean page has an identical copy on disk and can be dropped safely. A dirty page exists only in memory and can only be kept or lost with the process.</dd>
+
+          <dt>Cold start</dt>
+          <dd>The time from launching the app to the first useful output, when nothing is cached yet.</dd>
+
+          <dt>Delegate <span class="en">also: partition, island</span></dt>
+          <dd>A part of the model graph that one accelerator agreed to run. The rest stays on the CPU, and each boundary costs a tensor copy.</dd>
+
+          <dt>Neural Engine <span class="en">a kind of NPU</span></dt>
+          <dd>Apple's fixed-function accelerator for neural network operators. Very efficient, and restricted in the operations and layouts it accepts.</dd>
+
+          <dt>On-demand resources</dt>
+          <dd>Large files an app fetches from the store after installation instead of shipping in the download.</dd>
+
+          <dt>Cross-origin isolation</dt>
+          <dd>A browser state, switched on by two response headers, that a page needs before it may use shared memory between threads.</dd>
+
+          <dt>Thermal throttling</dt>
+          <dd>The device lowering its clock speeds because it is too hot. It is why a ten-second benchmark on a phone is not a result.</dd>
+
+          <dt>Jetsam <span class="en">iOS memory kill</span></dt>
+          <dd>The system terminating an app that exceeded its memory budget. There is no swap and no warning the user can act on.</dd>
+        </dl>
+      </div>
+
+      <h2 id="resources">Go deeper</h2>
+
+      <div class="resources">
+        <a class="res" href="https://docs.pytorch.org/executorch/stable/" target="_blank" rel="noopener">
+          <span class="res__kind" data-kind="docs">docs</span>
+          <span class="res__body">
+            <span class="res__title">ExecuTorch documentation</span>
+            <span class="res__why">The iOS and Android integration pages, the backend list, and the partitioner API. Open it for the iOS track.</span>
+          </span>
+        </a>
+        <a class="res" href="https://huggingface.co/docs/transformers.js/index" target="_blank" rel="noopener">
+          <span class="res__kind" data-kind="docs">docs</span>
+          <span class="res__body">
+            <span class="res__title">Transformers.js documentation</span>
+            <span class="res__why">The current list of pipelines, devices and dtypes. Check it before copying any option object, including the ones here.</span>
+          </span>
+        </a>
+        <a class="res" href="https://efficientml.ai/" target="_blank" rel="noopener">
+          <span class="res__kind" data-kind="course">course</span>
+          <span class="res__body">
+            <span class="res__title">MIT 6.5940 — EfficientML.ai</span>
+            <span class="res__why">The academic version of Part III and Part IV. Start here for the research behind on-device inference.</span>
+          </span>
+        </a>
+        <a class="res" href="https://hanlab.mit.edu/courses/2024-fall-65940" target="_blank" rel="noopener">
+          <span class="res__kind" data-kind="video">video</span>
+          <span class="res__body">
+            <span class="res__title">EfficientML.ai — Fall 2024 lectures and slides</span>
+            <span class="res__why">Free recorded lectures with slides. The on-device and hardware-aware sections pair well with this lesson.</span>
+          </span>
+        </a>
+      </div>
+
+      <div class="callout callout--try">
+        <span class="callout__label">Next</span>
+        <p class="mt-0">Part IV has been about text. In <strong>Lesson 11</strong> Part V begins and
+        the input changes: sound becomes a picture, and the picture becomes letters. You will build
+        offline speech-to-text small enough for the app you just shipped.</p>
+      </div>
+
+    </article>
+  </main>
+
+  <aside class="toc-rail"></aside>
+</div>
+
+<script src="../assets/js/vendor/gsap.min.js"></script>
+<script src="../assets/js/scene.js"></script>
+<script src="../assets/js/svgkit.js"></script>
+<script src="../data/lessons.js"></script>
+<script src="../data/glossary.js"></script>
+<script src="../assets/js/course.js"></script>
+<script src="../data/narration/10.js"></script>
+<script src="../data/narration/10.timing.js" onerror="void 0"></script>
+<script src="../assets/js/scenes/10.js"></script>
+<script src="../assets/js/film.js"></script>
+</body>
+</html>

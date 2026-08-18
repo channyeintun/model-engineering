@@ -1,0 +1,1048 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>11 · Tiny speech recognition — Model Engineering</title>
+<meta name="description" content="Sound becomes a picture, the picture becomes letters: mel spectrograms, CTC, transducers, and why Whisper cannot stream.">
+<link rel="stylesheet" href="../assets/css/course.css">
+</head>
+<body data-lesson="11">
+
+<div class="shell shell--wide">
+  <nav class="rail" aria-label="Lessons"></nav>
+
+  <main class="main">
+    <article class="prose">
+
+      <header class="lesson-head">
+        <span class="lesson-head__num">11</span>
+        <h1>Tiny speech recognition</h1>
+        <p class="lead">A microphone gives you numbers. A transcript is letters. This lesson is the
+        two bridges between them. First, turning sound into a picture a network can read. Then
+        training a model when nobody told you which moment of sound is which letter.</p>
+        <div class="lesson-head__meta">
+          <span class="chip"><b>Part V</b> · Speech</span>
+          <span class="chip">≈ <b>140 min</b> reading</span>
+          <span class="chip">Project · <b>Offline speech-to-text on a phone</b></span>
+          <span class="chip">Needs · <b>Lessons 01, 02, 03, 07, 08</b></span>
+        </div>
+      </header>
+
+      <section class="outcomes">
+        <h2>By the end you can</h2>
+        <ul>
+          <li>Turn a <code>.wav</code> file into a <strong>log-mel spectrogram</strong> and say what
+              every number in the shape means.</li>
+          <li>Read a spectrogram with your own eyes: vowels, fricatives, plosives, pitch.</li>
+          <li>Explain <strong>CTC</strong>, its blank symbol and its collapse rule, well enough to
+              debug someone else's decoder.</li>
+          <li>Choose between <strong>CTC</strong>, a <strong>transducer</strong> and an
+              <strong>attention encoder-decoder</strong> for a given latency budget.</li>
+          <li>Draw a transducer's lattice and show a frame that emits two tokens.</li>
+          <li>Compute <strong>WER</strong> by hand and say why two papers' numbers are not comparable.</li>
+          <li>Reason about a streaming pipeline: chunk size, look-ahead, and the delay the user feels.</li>
+        </ul>
+      </section>
+
+      <h2 id="sound-is-numbers"><span class="h-num">11 · 1</span>Sound is a list of numbers</h2>
+
+      <p>The job of this lesson has a name: <span class="term" data-term="asr">automatic speech
+      recognition (ASR)</span> — audio in, text out. It is also the ears of the offline voice
+      assistant you will build in Lesson 13. Before any model can help, the sound has to become
+      numbers, so start there.</p>
+
+      <p>A microphone measures air pressure many times per second. The result is a plain list of
+      numbers, one per measurement. That is the whole raw format, and it has a name: PCM, pulse code
+      modulation.</p>
+
+      <p>Two constants run through <em>recognition</em> in this course. The <strong>sample rate</strong>
+      is <strong>16,000 Hz</strong>, so one second of audio is 16,000 numbers. And each number is
+      stored as a 16-bit signed integer, in the range −32768 to 32767. Models want float32 in the
+      range −1 to 1, and the conversion is one division:
+      <code>x_float = x_int16 / 32768.0</code>. Synthesis, in Lesson 12, runs at 24,000 Hz instead, so
+      a resample between the two is a real pipeline step. Do not assume one rate everywhere.</p>
+
+      <p>Why 16 kHz? The Nyquist theorem says a sample rate of <code>fs</code> can represent
+      frequencies up to <code>fs / 2</code>. At 16 kHz that ceiling is 8 kHz, and almost everything
+      that separates one speech sound from another lives below it. Telephone audio samples at 8 kHz,
+      so its ceiling is 4 kHz — which is exactly why <code>/s/</code> and <code>/f/</code> are hard
+      to tell apart on a phone call. Above 16 kHz, extra samples stop helping and only cost
+      compute.</p>
+
+      <div class="callout callout--pitfall">
+        <span class="callout__label">Common trap</span>
+        <p class="mt-0">Forgetting the division by 32768. The numbers are then about 32,000 times too
+        large — 90 decibels, if you prefer that unit. The features come out with values no trained
+        model has ever seen, and the output is confident nonsense. Nothing raises an error. The same
+        trap has a second form: feeding 44.1 kHz audio to a 16 kHz model. That does not error
+        either. It merely makes every sound too low and too slow.</p>
+      </div>
+
+      <p>Raw samples are almost never fed to a model directly. A network would have to learn from
+      scratch that sound is made of frequencies. So we do that part by hand, with maths we
+      understand, before the first learned layer.</p>
+
+      <h2 id="frames"><span class="h-num">11 · 2</span>Cut it up: frames, windows, the short-time Fourier transform</h2>
+
+      <p>Speech is not stationary. The sound changes every few tens of milliseconds. So we cut the
+      signal into short <strong>frames</strong> that are short enough to be almost unchanging inside,
+      and take the frequency content of each one.</p>
+
+      <p>The numbers below are not a suggestion. They are what Whisper, NeMo, Kaldi and torchaudio
+      all use, so an off-the-shelf model will expect exactly these.</p>
+
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Parameter</th><th>Value at 16 kHz</th><th>In samples</th></tr></thead>
+          <tbody>
+            <tr><td>Window length</td><td>25 ms</td><td class="num">400 &nbsp;(<code>n_fft</code>)</td></tr>
+            <tr><td>Hop length (stride)</td><td>10 ms</td><td class="num">160 &nbsp;(<code>hop_length</code>)</td></tr>
+            <tr><td>Overlap between frames</td><td>15 ms</td><td class="num">240</td></tr>
+            <tr><td>Frame rate</td><td>100 frames per second</td><td class="num">—</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>The window is 25 ms wide but moves only 10 ms, so consecutive frames <strong>overlap</strong>.
+      Overlap means no information falls between two frames, and it makes the feature sequence change
+      smoothly over time instead of jumping.</p>
+
+      <p>Each frame is multiplied by a <strong>window function</strong> — Hann in Whisper, Povey in
+      Kaldi — before the transform. A raw rectangular cut has sharp edges, and sharp edges in time
+      create fake energy at every frequency. That artefact is called <strong>spectral leakage</strong>.
+      The window fades the frame to zero at both ends and removes most of it.</p>
+
+      <p>Then apply a <strong>fast Fourier transform (FFT)</strong> to each windowed frame. An FFT
+      takes a slice of signal and reports how much energy sits at each frequency. Doing that to every
+      frame in turn is the <span class="term" data-term="stft">short-time Fourier transform
+      (STFT)</span>.</p>
+
+      <p>Two numbers fall out of it, and both are worth deriving rather than memorising. The window
+      holds 400 samples at 16,000 Hz, so each output bin covers <code>16000 / 400 = 40 Hz</code>. And
+      because the input is a real signal, the second half of the output mirrors the first. Only
+      <code>400 / 2 + 1 = 201</code> bins carry new information.</p>
+
+      <p>Each of those 201 outputs carries a strength and a phase — where in its cycle that frequency
+      was. Keep the strength, square it, throw the phase away. What is left is one column of 201
+      energies, once every 10 ms. A longer window gives finer frequency resolution but blurs time; a
+      shorter one does the reverse.</p>
+
+      <figure class="scene" data-scene="asr-frontend">
+        <div class="scene__head">
+          <span class="scene__badge">animation</span>
+          <span class="scene__title">A waveform becomes a picture, one column at a time</span>
+        </div>
+        <div class="scene__stage">
+          <svg viewBox="0 0 900 320" role="img" aria-label="A sliding 25 millisecond window over a waveform; each window becomes 201 frequency bins, then 80 mel bands, then one column of a spectrogram">
+            <g id="fe-plot"></g>
+          </svg>
+        </div>
+      </figure>
+
+      <h2 id="mel"><span class="h-num">11 · 3</span>The mel scale, and how to read the picture</h2>
+
+      <p>201 numbers per frame is more than we need, and they are spread over frequency in the wrong
+      way. Human hearing is not linear in frequency. The difference between 100 Hz and 200 Hz is
+      enormous. The difference between 4000 Hz and 4100 Hz is almost inaudible, even though both
+      gaps are the same number of Hz.</p>
+
+      <p>The <span class="term" data-term="mel">mel scale</span> is a warped frequency axis built to
+      match that perception. Here <code>f</code> is a frequency in Hz and <code>m</code> is the same
+      frequency in mel:</p>
+
+      <div class="eq">m  =  2595 · log10( 1 + f / 700 )        f in Hz, m in mel</div>
+
+      <p>Check it on three numbers. 1000 Hz gives 1000 mel, 2000 Hz gives 1521 mel, and 4000 Hz gives
+      2146 mel. Doubling the frequency does not double the mel value; the axis compresses as you go
+      up. That is exactly why about 43 of the 80 filter centres end up below 2 kHz.</p>
+
+      <p>We place 80 filter centres at <em>equal distance in mel</em>. Mapped back to Hz they are
+      narrow and crowded at the bottom and wide and sparse at the top. Each centre becomes a
+      triangular filter, and the whole bank is one fixed matrix of shape <code>(80, 201)</code>.
+      Applying it is a single matrix multiply.</p>
+
+      <figure class="scene" data-scene="asr-melscale">
+        <div class="scene__head">
+          <span class="scene__badge">animation</span>
+          <span class="scene__title">Equal steps in mel are very unequal steps in Hz</span>
+        </div>
+        <div class="scene__stage">
+          <svg viewBox="0 0 900 290" role="img" aria-label="Filter centres equally spaced on a mel axis, mapped up to a frequency axis where they crowd together at low frequency and spread apart at high frequency, becoming triangular filters">
+            <g id="ms-plot"></g>
+          </svg>
+        </div>
+      </figure>
+
+      <p>The last step is the <strong>log</strong>. Loudness perception is logarithmic, and a whisper
+      and a shout differ by four or five orders of magnitude in energy. The log squeezes that range
+      into one a network can train on. The result is the
+      <span class="term" data-term="spectrogram">log-mel spectrogram</span>, the input to nearly
+      every speech model you will meet.</p>
+
+      <div class="code">
+        <div class="code__head"><span>features.py</span><span class="lang">python</span></div>
+        <pre><code>import torchaudio
+
+# torchaudio.load already scales to float32 in [-1, 1].
+# Raw microphone bytes do not: there you divide the int16 values by 32768.0.
+wav, sr = torchaudio.load("command.wav")
+if sr != 16000:
+    wav = torchaudio.functional.resample(wav, sr, 16000)
+wav = wav.mean(dim=0, keepdim=True)          # force mono -> (1, num_samples)
+
+mel = torchaudio.transforms.MelSpectrogram(
+    sample_rate=16000, n_fft=400, hop_length=160,
+    n_mels=80, f_min=0.0, f_max=8000.0, power=2.0,
+)
+feats = (mel(wav) + 1e-10).log()             # (1, 80, T),  T = seconds * 100 + 1
+                                             # the +1 is torchaudio's centre padding
+print(feats.shape)</code></pre>
+      </div>
+
+      <p>Two reasons this matters on a device. First, <strong>size</strong>: 30 seconds of float32
+      audio is 480,000 × 4 = 1.92 MB, while its log-mel is 80 × 3000 × 4 = 0.96 MB. Half the memory,
+      and far fewer numbers for the first convolution to touch. Second, <strong>relevance</strong>:
+      the 80 bands spend their resolution where speech information actually is.</p>
+
+      <h3 id="reading">Reading a spectrogram</h3>
+
+      <p>A spectrogram has a strict meaning. Time runs across, one column per 10 ms frame. Mel band
+      runs up, band 0 at the bottom near 0 Hz and band 79 at the top near 8 kHz. Brightness is log
+      energy: bright means loud. Learn the four shapes below and you can debug an audio pipeline by
+      looking at it.</p>
+
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>What you see</th><th>What it is</th><th>What it tells you</th></tr></thead>
+          <tbody>
+            <tr><td>Evenly spaced horizontal stripes</td><td>Harmonics of the voice</td><td>Their spacing is the pitch: about 100 Hz apart for a typical male voice, about 200 Hz for a typical female voice</td></tr>
+            <tr><td>Bright bands that move and bend</td><td>Formants — resonances of the mouth</td><td>Vowels are identified by where the first two formants sit; "ee" and "oo" look clearly different</td></tr>
+            <tr><td>A bright fuzzy block at the top, no stripes</td><td>A fricative: <code>s</code>, <code>sh</code>, <code>f</code></td><td>Noise, not a tone. This is the energy an 8 kHz telephone throws away</td></tr>
+            <tr><td>A vertical gap, then a sudden vertical spike</td><td>A plosive: <code>p</code>, <code>t</code>, <code>k</code></td><td>Silence while the mouth is closed, then the burst when it opens</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>All four rows assume the usual colouring, where loud is bright. Plenty of tools ship an
+      inverted colormap, where loud is dark, and then all four descriptions flip. Check which way your
+      plot is coloured before you read anything into it.</p>
+
+      <div class="callout callout--note">
+        <span class="callout__label">Worth knowing</span>
+        <p class="mt-0">Whisper's feature extractor uses exactly <code>n_fft=400</code>,
+        <code>hop_length=160</code>, <code>feature_size=80</code> and a fixed
+        <code>chunk_length=30</code>. The one real change across its versions is that
+        <code>whisper-large-v3</code> uses <strong>128</strong> mel bands instead of 80. If you swap
+        a checkpoint and the model suddenly produces noise, check the number of mel bands before you
+        check anything else.</p>
+      </div>
+
+      <h2 id="ctc"><span class="h-num">11 · 4</span>Nobody said which frame is which letter</h2>
+
+      <p>Now the hard part. Five seconds of speech gives 500 feature frames. The transcript "turn on
+      the kitchen light" is 25 characters. The digit classifier in Lesson 01 had a label for every
+      image. A frame-wise classifier here would need a label for every frame. Nobody is going to
+      mark where the <code>k</code> in "kitchen" begins, across thousands of hours of audio.</p>
+
+      <p>This is the <strong>alignment problem</strong>, and every architecture in this lesson is one
+      answer to it. The first answer is <span class="term" data-term="ctc">connectionist temporal
+      classification (CTC)</span>.</p>
+
+      <p>The encoder still produces one probability distribution per frame, but over
+      <code>vocab + 1</code> symbols. The extra symbol is the <strong>blank</strong>, written
+      <code>ε</code>. Blank does not mean silence. It means "no new output at this frame". Then a
+      fixed collapse rule <code>B</code> turns a frame sequence into text, in this order:</p>
+
+      <ol>
+        <li>Merge consecutive <strong>identical</strong> symbols.</li>
+        <li>Delete every <code>ε</code>.</li>
+      </ol>
+
+      <figure class="scene" data-scene="asr-ctc">
+        <div class="scene__head">
+          <span class="scene__badge">animation</span>
+          <span class="scene__title">Ten frames collapse into five letters — and what the blank is for</span>
+        </div>
+        <div class="scene__stage">
+          <svg viewBox="0 0 900 300" role="img" aria-label="A row of ten per-frame symbols including blanks, merged and then stripped of blanks to spell hello, then the same row without one blank spelling helo">
+            <g id="ct-plot"></g>
+          </svg>
+        </div>
+      </figure>
+
+      <div class="callout callout--key">
+        <span class="callout__label">Remember this</span>
+        <p class="mt-0">The blank between the two <code>l</code>s in "hello" is <strong>load-bearing</strong>.
+        Remove it and rule 1 merges the two <code>l</code>s into one, and the model can never write a
+        double letter. That is the entire reason the blank symbol exists: it is a separator, not a
+        silence detector.</p>
+      </div>
+
+      <h3 id="ctc-loss">The loss sums over every alignment</h3>
+
+      <p>Many frame sequences collapse to the same text. CTC does not pick one of them and it never
+      needs a frame-level label. It adds up the probability of all of them.</p>
+
+      <div class="callout callout--math">
+        <span class="callout__label">The maths, once</span>
+        <p class="mt-0">Name everything first. <code>x</code> is the audio, <code>y</code> is the
+        correct transcript, and <code>a</code> is one <em>path</em> — one symbol chosen at every
+        frame. <code>B(a)</code> is that path put through the collapse rule. And
+        <code>p_t(a_t)</code> is the probability the model gave, at frame <code>t</code>, to the
+        symbol the path chose there.</p>
+        <div class="eq">p( y | x )  =  Σ over every path a with B(a) = y   Π over frames t   p_t( a_t )
+
+loss  =  − log p( y | x )</div>
+        <p>Read it as: the probability of the correct text is the probability of <em>any</em> path
+        that produces it. Training pushes that whole sum up, so the model discovers its own alignment.
+        This is still the cross-entropy of Lesson 01 — the target is a set of paths rather than one
+        class.</p>
+      </div>
+
+      <figure class="scene" data-scene="asr-align">
+        <div class="scene__head">
+          <span class="scene__badge">animation</span>
+          <span class="scene__title">Three different frame paths, one word — and the loss adds all of them</span>
+        </div>
+        <div class="scene__stage">
+          <svg viewBox="0 0 900 300" role="img" aria-label="Three eight-frame symbol paths that all collapse to the word cat, with a count of 462 possible paths">
+            <g id="al-plot"></g>
+          </svg>
+        </div>
+      </figure>
+
+      <h3 id="ctc-worked">Do the sum once, by hand</h3>
+
+      <p>That equation is easy to nod at and hard to believe. So here is the smallest version of it,
+      small enough to check on a calculator. The vocabulary is <code>a</code>, <code>b</code> and the
+      blank <code>ε</code>. The audio is three frames long, and the correct transcript is the single
+      letter <code>a</code>. Suppose the model produced these per-frame probabilities — each row sums
+      to 1, because each row is one softmax:</p>
+
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Frame</th><th><code>p(a)</code></th><th><code>p(b)</code></th><th><code>p(ε)</code></th></tr></thead>
+          <tbody>
+            <tr><td>1</td><td class="num">0.7</td><td class="num">0.1</td><td class="num">0.2</td></tr>
+            <tr><td>2</td><td class="num">0.2</td><td class="num">0.2</td><td class="num">0.6</td></tr>
+            <tr><td>3</td><td class="num">0.1</td><td class="num">0.1</td><td class="num">0.8</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>Which paths collapse to <code>a</code>? Any path with no <code>b</code>, at least one
+      <code>a</code>, and all its <code>a</code>s next to each other. There are six. Multiply each one
+      out, one probability per frame:</p>
+
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Path</th><th>Product</th><th>Probability</th></tr></thead>
+          <tbody>
+            <tr><td><code>a ε ε</code></td><td>0.7 × 0.6 × 0.8</td><td class="num">0.336</td></tr>
+            <tr><td><code>a a ε</code></td><td>0.7 × 0.2 × 0.8</td><td class="num">0.112</td></tr>
+            <tr><td><code>ε a ε</code></td><td>0.2 × 0.2 × 0.8</td><td class="num">0.032</td></tr>
+            <tr><td><code>a a a</code></td><td>0.7 × 0.2 × 0.1</td><td class="num">0.014</td></tr>
+            <tr><td><code>ε ε a</code></td><td>0.2 × 0.6 × 0.1</td><td class="num">0.012</td></tr>
+            <tr><td><code>ε a a</code></td><td>0.2 × 0.2 × 0.1</td><td class="num">0.004</td></tr>
+            <tr><td><strong>total</strong></td><td><code>p( y | x )</code></td><td class="num"><strong>0.510</strong></td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>So the loss is <code>−log(0.510) = 0.673</code>. Training nudges all six of those products up
+      at once. No single path is ever named as the right one.</p>
+
+      <p>One path is deliberately missing from the table. <code>a ε a</code> has probability
+      0.7 × 0.6 × 0.1 = 0.042, but it collapses to <code>aa</code>, not <code>a</code>. Its two
+      <code>a</code>s are separated by a blank, so rule 1 cannot merge them. That single exclusion is
+      the whole blank story again, now in arithmetic.</p>
+
+      <h3 id="ctc-forward">The forward algorithm, so the sum stays cheap</h3>
+
+      <p>Six paths for three frames is fine. For 500 frames the count is astronomical, so nobody
+      enumerates them. The <strong>forward algorithm</strong> does the same sum with dynamic
+      programming, in time linear in the number of frames.</p>
+
+      <p>Name its four symbols before you read the equation. Write <code>|y|</code> for the number of letters
+      in the transcript, so <code>|y| = 5</code> for "hello". Next comes <code>y′</code>, read
+      "y prime", the <strong>extended target</strong>. It is the transcript with a blank inserted
+      before, between and after every letter. For "hello" that is
+      <code>ε h ε e ε l ε l ε o ε</code>, which is <code>2|y| + 1 = 11</code> positions. And
+      <code>s</code> is a position in <code>y′</code>, so here it runs from 1 to 11.</p>
+
+      <p>The fourth is <code>α_t(s)</code>, said "alpha t of s". It is the total probability of
+      <em>every</em> path that has consumed <code>t</code> frames and arrived at position
+      <code>s</code>. That is the whole trick: one number holds a whole family of paths, so the family
+      never has to be listed.</p>
+
+      <div class="eq">α_t(s)  =  p_t( y'_s ) · [ α_{t−1}(s) + α_{t−1}(s−1) + skip · α_{t−1}(s−2) ]
+
+skip = 1 only when  y'_s ≠ ε  and  y'_s ≠ y'_{s−2}</div>
+
+      <p>Read the bracket aloud: to be at position <code>s</code> now, one frame ago you were at
+      <code>s</code>, or at <code>s − 1</code>, or sometimes at <code>s − 2</code>. Then multiply by
+      the model's probability at this frame for whatever symbol sits at <code>s</code>.</p>
+
+      <p>That <code>skip</code> condition is the collapse rule read backwards. You may not jump over
+      a blank that sits between two identical labels, because that blank is the thing keeping them
+      apart. The cost is <code>T × (2|y| + 1)</code> multiply-adds — linear in frames, not
+      exponential. Run it on the three-frame toy above and it returns 0.510, the same number the table
+      gave.</p>
+
+      <h3 id="ctc-decode">Decoding, and why CTC streams well</h3>
+
+      <p><strong>Greedy decoding</strong> takes the argmax at each frame and applies the collapse
+      rule. It costs one pass and about ten lines of code.</p>
+
+      <p><strong>Prefix beam search</strong> does better. A <em>beam search</em> keeps the
+      <code>k</code> best partial answers alive instead of committing to one at every step, and
+      scores each by its running log-probability. The prefix version keeps <code>k</code> candidate
+      <em>texts</em> rather than paths, and merges every path that collapses to the same prefix. It
+      typically removes 5 to 15 percent of the errors, and more with an external language model.
+      That is a <em>relative</em> improvement, which §11·8 distinguishes carefully from an
+      absolute one.</p>
+
+      <p>Why the gap? CTC assumes the outputs at different frames are conditionally independent given
+      the encoder. There is no internal language model at all. That is what makes it cheap and
+      perfectly parallel, and it is why CTC output can be phonetically plausible but linguistically
+      wrong — "their" where "there" was meant.</p>
+
+      <p>The same assumption is CTC's gift to streaming. A frame's decision never depends on a later
+      frame's decision. A <strong>causal</strong> encoder lets frame <code>t</code> look only at
+      frames up to <code>t</code>, never at later ones. With one of those you can emit output the
+      moment a frame arrives. And there is no <strong>autoregressive</strong> loop to unroll.
+      Nothing here feeds its own last output back in as its next input. The language model of
+      Lesson 04 does exactly that when it generates.</p>
+
+      <div class="code">
+        <div class="code__head"><span>ctc.py</span><span class="lang">python</span></div>
+        <pre><code>import torch.nn as nn
+
+# encoder_out: (B, T, C) raw logits — batch, frames, vocab — blank at index 0
+log_probs = encoder_out.log_softmax(dim=-1).permute(1, 0, 2)   # (T, B, C) is required
+ctc = nn.CTCLoss(blank=0, reduction="mean", zero_infinity=True)
+loss = ctc(log_probs, targets, input_lengths, target_lengths)
+
+def collapse(seq, blank=0):          # greedy decode of one utterance
+    out, prev = [], None
+    for i in seq.tolist():
+        if i != prev and i != blank:
+            out.append(i)
+        prev = i
+    return out
+
+ids = log_probs.argmax(-1).permute(1, 0)      # (B, T)
+print(collapse(ids[0]))</code></pre>
+      </div>
+
+      <div class="callout callout--pitfall">
+        <span class="callout__label">Common trap</span>
+        <p class="mt-0">Two silent bugs live in that block. <code>nn.CTCLoss</code> wants
+        <strong>(T, B, C)</strong> — frames first — not the (B, T, C) your model produces. PyTorch's
+        own documentation calls the batch axis <code>N</code>; this course calls it <code>B</code>,
+        and it is the same axis. It also wants
+        <strong>log-probabilities</strong>, not logits — unlike <code>nn.CrossEntropyLoss</code>,
+        which applies softmax itself. And the blank index is a convention: PyTorch defaults to
+        <code>blank=0</code>, while many published vocabularies put blank last. Get it wrong and the
+        loss still falls, slowly, toward a useless model.</p>
+      </div>
+
+      <h2 id="transducers"><span class="h-num">11 · 5</span>Transducers, and encoders that teach themselves</h2>
+
+      <p>The conditional independence of CTC is its weakness. It has no idea what it just wrote, so
+      it happily produces "their" where "there" was meant, and it cannot fit two letters into one
+      frame. The <span class="term" data-term="rnn-t">transducer, usually called RNN-T (recurrent
+      neural network transducer)</span>, fixes both by putting a small language model inside the
+      recogniser. It has three networks:</p>
+
+      <ul>
+        <li><strong>Encoder</strong> — audio frames in, a vector <code>h_t</code> per frame out. The same
+            job as the CTC encoder.</li>
+        <li><strong>Prediction network</strong> — reads the previous <em>non-blank</em> output tokens and
+            produces <code>g_u</code>. This is a small causal language model over the transcript.</li>
+        <li><strong>Joint network</strong> — combines one <code>h_t</code> and one <code>g_u</code>, then a
+            softmax over the vocabulary plus blank.</li>
+      </ul>
+
+      <p>Decoding walks a grid. Frames run across it — <code>T</code> of them — and emitted tokens run
+      down it, <code>U</code> of them. Call that grid the <strong>lattice</strong>. You start at the
+      top-left corner and you must reach the bottom-right one. Two moves are allowed, and only
+      two.</p>
+
+      <ul>
+        <li>Emit the blank: step <strong>right</strong>, to the next audio frame, writing nothing.</li>
+        <li>Emit a token: step <strong>down</strong>, writing one token and
+            <strong>staying on the same audio frame</strong>.</li>
+      </ul>
+
+      <p>That second move is the whole point. One frame can step down twice, so it emits two tokens.
+      CTC cannot do that at all, because CTC gets exactly one symbol per frame.</p>
+
+      <figure class="scene" data-scene="asr-transducer">
+        <div class="scene__head">
+          <span class="scene__badge">animation</span>
+          <span class="scene__title">The lattice: blank goes right, a token goes down</span>
+        </div>
+        <div class="scene__stage">
+          <svg viewBox="0 0 900 320" role="img" aria-label="A grid four frames wide and three tokens deep, with one decoding path drawn: blank steps right to the next frame, a token steps down while staying on the same frame, and frame two emits both c and a">
+            <g id="tr-plot"></g>
+          </svg>
+        </div>
+      </figure>
+
+      <p>That is why transducers dominate on-device streaming. They are causal. They are also
+      <strong>monotonic</strong>, meaning the path only moves forward through the audio, never
+      back. So they never need the end of a sentence before committing to its start. The prediction
+      network gives them an internal language model, so they beat CTC without an external one. And
+      the state is small and cacheable, so the cost per chunk is constant no matter how long the user
+      talks.</p>
+
+      <p>A recent variant, <strong>TDT</strong> (token-and-duration transducer), predicts the token
+      <em>and</em> how many frames to skip. Skipping frames is the direct reason NVIDIA's
+      Parakeet-TDT-0.6B-v3 reports an RTFx of 3332.74 — it does not look at most of the audio twice.
+      RTFx is seconds of audio processed per second of compute, so higher is better; §11·7 defines it
+      properly, together with the RTF it is the reciprocal of.</p>
+
+      <h3 id="ssl">Self-supervised encoders</h3>
+
+      <p>Where does a good encoder come from if your language has almost no transcripts?
+      <strong>wav2vec 2.0</strong> and <strong>HuBERT</strong> answer that. Both learn from
+      <em>unlabelled</em> audio, and then a small labelled set trains a CTC head on top.</p>
+
+      <p>wav2vec 2.0 works in four steps, and none of them needs a transcript. A convolution reads the
+      raw waveform — no mel at all — and produces one vector every 20 ms. A Transformer mixes each
+      vector with its neighbours. Each vector is then snapped to its nearest entry in a
+      <strong>codebook</strong>: a fixed list of a few hundred prototype vectors. That turns it into
+      a discrete label. Finally, training hides a short span and asks the model to pick its true label out of a
+      set of wrong ones.</p>
+
+      <p>That last step is the learning signal, and it comes free from the audio itself. HuBERT does
+      the same hiding, but its labels come from grouping earlier features into clusters with
+      <strong>k-means</strong>, an algorithm that sorts vectors into k groups by similarity. The first
+      round groups <strong>mel-frequency cepstral coefficients (MFCCs)</strong>, an older and smaller
+      cousin of the log-mel features of §11·3.</p>
+
+      <p>Here is the result that made the field pay attention. Pre-train on 53,000 hours of unlabelled
+      audio, then fine-tune on <strong>10 minutes</strong> of labelled speech. That takes wav2vec 2.0
+      LARGE to 4.8 % and 8.2 % WER on LibriSpeech test-clean and test-other. HuBERT LARGE reaches 4.7 % and
+      7.6 %. This is still the right starting point when your language has no released model.</p>
+
+      <h2 id="whisper"><span class="h-num">11 · 6</span>Whisper, and the 30-second box</h2>
+
+      <p>CTC has no language model at all, and a transducer has only a small one. On hard audio both
+      write things that sound right and read wrong. So ask the obvious question: what if the decoder
+      were a full language model that had already read a great deal of text?</p>
+
+      <p>That is Whisper, and the price it pays is that it cannot stream. The third family treats
+      speech recognition as ordinary sequence-to-sequence text generation. Whisper is a plain
+      Transformer encoder-decoder: the encoder reads the spectrogram, the decoder writes tokens while
+      attending to it, exactly the machinery of Lesson 03.</p>
+
+      <p>Its shapes are worth memorising, because they explain both its quality and its problem:</p>
+
+      <div class="eq">30 s at 16 kHz   =  480,000 samples
+log-mel          =  (80, 3000)          — 128 bands for large-v3
+conv stem, stride 2 on time
+encoder states   =  1500                — each one covers 20 ms</div>
+
+      <p>Whisper <em>always</em> processes exactly 30 seconds. Shorter audio is zero-padded to fill
+      the box. A three-second command therefore costs the compute of a thirty-second meeting.</p>
+
+      <p>The decoder is steered entirely by control tokens in its prompt:
+      <code>&lt;|startoftranscript|&gt; &lt;|en|&gt; &lt;|transcribe|&gt; &lt;|notimestamps|&gt;</code>.
+      There is one token per supported language, 99 of them, and
+      <code>&lt;|transcribe|&gt;</code> versus <code>&lt;|translate|&gt;</code> picks the task with the
+      same weights. Drop <code>&lt;|notimestamps|&gt;</code> and it emits timestamps at 0.02 s
+      resolution — exactly the 20 ms encoder stride.</p>
+
+      <p>Now the awkward part. Whisper cannot stream, for three independent reasons:</p>
+
+      <ol>
+        <li>The encoder uses full bidirectional self-attention over all 1500 positions. Position 10
+            attends to position 1499 — it needs the future.</li>
+        <li>The input is a fixed 30-second block, so you must wait or pad.</li>
+        <li>The decoder's cross-attention reads the entire encoder output.</li>
+      </ol>
+
+      <p>Chunked "streaming Whisper" wrappers exist. They re-run the encoder for every chunk and
+      duplicate or truncate words at the seams. Treat them as an approximation, not as streaming.</p>
+
+      <h2 id="streaming"><span class="h-num">11 · 7</span>Streaming for real: chunk, look-ahead, delay</h2>
+
+      <p>A streaming encoder replaces unlimited attention with a bounded context. There are three
+      knobs, and together they are the entire latency story.</p>
+
+      <ul>
+        <li><strong>Causal (left-only) attention</strong>: frame <code>t</code> attends to
+            <code>[t − left, t]</code>, where <code>left</code> is how many past frames it may see.
+            Zero added delay, worst accuracy.</li>
+        <li><strong>Chunked attention</strong>: process a block of <code>chunk</code> frames together;
+            inside the block frames see each other freely. The delay is the chunk duration.</li>
+        <li><strong>Look-ahead</strong>: allow <code>right</code> frames of future context beyond the
+            chunk. These are <em>encoder</em> frames, not the 10 ms feature frames of §11·2.
+            A streaming encoder subsamples time by 8, so one encoder frame covers 80 ms. Each
+            look-ahead frame buys accuracy and costs that 80 ms.</li>
+      </ul>
+
+      <figure class="scene" data-scene="asr-stream">
+        <div class="scene__head">
+          <span class="scene__badge">animation</span>
+          <span class="scene__title">One fixed 30-second box, or many small chunks with a peek ahead</span>
+        </div>
+        <div class="scene__stage">
+          <svg viewBox="0 0 900 310" role="img" aria-label="Whisper padding three seconds of speech into a thirty second window with a full compute meter, compared with a streaming encoder using 320 millisecond chunks and 80 milliseconds of look-ahead">
+            <g id="st-plot"></g>
+          </svg>
+        </div>
+      </figure>
+
+      <p>NVIDIA writes this as <code>att_context_size = [left, right]</code>, counted in encoder frames, and
+      publishes the result for the same weights at four settings. This one table is the whole
+      trade-off in real numbers:</p>
+
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Chunk</th><th><code>att_context_size</code></th><th>Average WER, 8 test sets</th></tr></thead>
+          <tbody>
+            <tr><td>80 ms</td><td><code>[70, 0]</code></td><td class="num">8.43 %</td></tr>
+            <tr><td>160 ms</td><td><code>[70, 1]</code></td><td class="num">not published</td></tr>
+            <tr><td>560 ms</td><td><code>[70, 6]</code></td><td class="num">not published</td></tr>
+            <tr><td>1.12 s</td><td><code>[70, 13]</code></td><td class="num">6.93 %</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>The model card publishes only the two extremes, so the two middle rows are honestly blank. It
+      does say which way the curve bends, and the shape is the usual one. Most of the gain arrives in
+      the first few hundred milliseconds. The last doubling of delay buys very little.</p>
+
+      <p>Fourteen times more delay buys 1.5 points of absolute WER — 8.43 down to 6.93. Same weights,
+      one runtime flag. That is the decision you will actually make when you ship: a dictation app can
+      afford 1.12 s, a voice assistant that must feel alive cannot.</p>
+
+      <p>"Cache-aware" means the encoder keeps its key/value cache between chunks. That is the same
+      idea as the <span class="term" data-term="kv cache">KV cache</span> from Lesson 04. Each new
+      chunk then costs only its new frames. The older approach re-ran the encoder over an overlapping window and
+      wasted up to three times the compute.</p>
+
+      <div class="eq">latency  ≈  chunk duration  +  look-ahead  +  compute time per chunk</div>
+
+      <p>You keep up with real time only if the compute term is smaller than the chunk duration. That
+      ratio is the <strong>RTF</strong>, the real-time factor: <code>processing_time / audio_duration</code>,
+      and it must be below 1. The Open ASR Leaderboard reports <strong>RTFx</strong>, which is
+      <code>1 / RTF</code>, so there higher is better. They are reciprocals, and confusing them is a
+      classic way to report a result backwards.</p>
+
+      <h3 id="vad">Do not run the big model on silence</h3>
+
+      <p>Most of the audio from a microphone is not speech. Running an ASR model on it wastes battery,
+      and Whisper in particular <em>hallucinates</em> on empty audio — "Thank you for watching!" on a
+      silent recording is a well-known failure. A <span class="term" data-term="vad">voice activity
+      detector (VAD)</span> gates the expensive model: a tiny network that answers only "is anyone
+      speaking right now?".</p>
+
+      <p>Silero VAD is the usual choice — about 2 MB on disk, small enough that you put it in front of
+      everything. Lesson 13 takes it apart properly. Deciding when a <em>turn</em> actually
+      ended is much harder than deciding whether the current 32 ms holds speech. That decision is
+      what makes an assistant feel rude or patient. Here you only need the call:</p>
+
+      <div class="code">
+        <div class="code__head"><span>gate.py</span><span class="lang">python</span></div>
+        <pre><code>from silero_vad import load_silero_vad, read_audio, get_speech_timestamps
+
+model = load_silero_vad()
+wav = read_audio("meeting.wav")            # resamples to 16 kHz for you
+segments = get_speech_timestamps(wav, model, return_seconds=True)
+print(segments)                            # [{'start': 1.28, 'end': 4.96}, ...]</code></pre>
+      </div>
+
+      <p>A production on-device pipeline is then: microphone → ring buffer → resample to 16 kHz →
+      VAD on 32 ms chunks. If that says speech, the streaming encoder runs on 320 ms chunks with
+      80 ms look-ahead, and the transducer decodes. Partial text appears, and you are allowed to
+      rewrite it. Then the turn ends and you finalise the segment. That last step is the interesting
+      one, and it is the subject of Lesson 13.</p>
+
+      <h2 id="wer"><span class="h-num">11 · 8</span>Measuring it, and adapting it</h2>
+
+      <p>A model that is not measured is a model you cannot improve, and speech has one measure
+      everyone quotes. <span class="term" data-term="wer">Word error rate (WER)</span> is word-level
+      edit distance divided by the length of the reference. Compute it once by hand and you will never
+      misread a leaderboard again.</p>
+
+      <div class="callout callout--math">
+        <span class="callout__label">The maths, once</span>
+        <div class="eq">WER  =  ( sub + del + ins ) / n_ref_words
+
+sub   words replaced by a wrong word
+del   words the model failed to write
+ins   words the model wrote that nobody said
+n_ref_words   how many words the reference actually contains</div>
+        <p>The denominator is the reference length only. Insertions are not bounded by it, so WER can
+        be larger than 100 % when a model produces more wrong words than there were true words.</p>
+      </div>
+
+      <figure class="scene" data-scene="asr-wer">
+        <div class="scene__head">
+          <span class="scene__badge">animation</span>
+          <span class="scene__title">One substitution, one deletion, one insertion — and the percentage</span>
+        </div>
+        <div class="scene__stage">
+          <svg viewBox="0 0 900 280" role="img" aria-label="A reference sentence and a hypothesis aligned word by word, marking one deletion, one substitution and one insertion, giving 33.3 percent word error rate">
+            <g id="we-plot"></g>
+          </svg>
+        </div>
+      </figure>
+
+      <p>The same computation over characters is the <strong>character error rate (CER)</strong>. For
+      the reference "boston" and the hypothesis "bostin", CER is 1 / 6 = 16.7 %. CER is the right
+      metric for languages written without spaces between words, and it is a fairer view when a model
+      gets a word nearly right.</p>
+
+      <div class="callout callout--key">
+        <span class="callout__label">Remember this</span>
+        <p class="mt-0">Papers report improvements two ways, and the two look very different.
+        <strong>Absolute</strong> means points of WER: 8.4 % down to 6.9 % is 1.5 points absolute.
+        <strong>Relative</strong> means the fraction of the errors removed: the same change is
+        1.5 / 8.4 = 18 % relative. Relative numbers are always the bigger ones, which is why
+        marketing prefers them. Always check which one you are reading before you compare two
+        results.</p>
+      </div>
+
+      <div class="code">
+        <div class="code__head"><span>score.py</span><span class="lang">python</span></div>
+        <pre><code>from jiwer import wer, cer
+
+ref = "i would like to book a flight to boston"
+hyp = "i would like book a flight two boston today"
+
+print(wer(ref, hyp))              # 0.3333...  -> 33.3 %
+print(cer("boston", "bostin"))    # 0.1666...  -> 16.7 %</code></pre>
+      </div>
+
+      <div class="callout callout--pitfall">
+        <span class="callout__label">Common trap</span>
+        <p class="mt-0">Text normalisation moves WER more than most model changes do. Casing,
+        punctuation, "1st" against "first", "%" against "percent" — a raw comparison can report
+        roughly double the WER of a normalised one. Whisper ships an <code>EnglishTextNormalizer</code>
+        for this reason. Always say which normaliser produced a number. And remember what the test
+        set is. LibriSpeech test-clean is read audiobooks in quiet rooms. Real WER on noisy
+        far-field speech is often three to five times higher.</p>
+      </div>
+
+      <h3 id="finetune">Fine-tuning for a new accent or language</h3>
+
+      <p>Two recipes, chosen by how much labelled audio you have.</p>
+
+      <div class="compare">
+        <div class="compare__col compare__col--a">
+          <h4>CTC head on a self-supervised encoder</h4>
+          <ul>
+            <li>Best with 1 to 50 hours, and for a language the base model never saw.</li>
+            <li>Build a character or BPE (byte-pair encoding, Lesson 03) vocabulary from your
+                transcripts; reserve one index for blank.</li>
+            <li>Freeze the convolutional feature extractor with <code>model.freeze_feature_encoder()</code>.</li>
+            <li><code>Wav2Vec2ForCTC</code>, <code>ctc_loss_reduction="mean"</code>, learning rate
+                around <code>1e-4</code> with warmup, and SpecAugment on. SpecAugment blanks out a few
+                mel bands and a few time spans of each spectrogram during training. The model then
+                cannot lean on any one of them.</li>
+          </ul>
+        </div>
+        <div class="compare__col compare__col--b">
+          <h4>Whisper sequence-to-sequence fine-tune</h4>
+          <ul>
+            <li>Best for accent and domain adaptation, and languages Whisper already partly knows.</li>
+            <li><span class="term" data-term="lora">LoRA (low-rank adaptation)</span> on the attention projections fits a
+                <code>whisper-small</code> run in about 8 GB and finishes in hours, not days.</li>
+            <li>Freeze the encoder below roughly 10 hours of data, or the model overfits and loses
+                its robustness.</li>
+            <li>Merge the adapter before exporting to <span class="term" data-term="onnx">ONNX (Open Neural Network Exchange)</span>.
+                The other route is the GGML format <code>whisper.cpp</code> expects. GGML is the older
+                tensor library and file format behind <code>whisper.cpp</code> and <code>llama.cpp</code>.
+                Its successor is the <span class="term" data-term="gguf">GPT-Generated Unified Format
+                (GGUF)</span> of Lesson 07, and the two are not interchangeable.</li>
+          </ul>
+        </div>
+      </div>
+
+      <p>Accents need surprisingly little data. Five to ten hours of the target accent usually removes
+      a large fraction of the remaining errors. The encoder is already strong, and you are mostly
+      re-weighting the decoder's expectations. A new <em>language</em> with a different script is a different
+      project: vocabulary work plus 100 hours or more, or the self-supervised route above.</p>
+
+      <div class="code">
+        <div class="code__head"><span>finetune.py</span><span class="lang">python</span></div>
+        <pre><code>from transformers import WhisperForConditionalGeneration, WhisperProcessor
+
+processor = WhisperProcessor.from_pretrained("openai/whisper-small",
+                                             language="hindi", task="transcribe")
+model = WhisperForConditionalGeneration.from_pretrained("openai/whisper-small")
+
+# forced_decoder_ids on the model config is deprecated. Set the task here instead.
+model.generation_config.language = "hindi"
+model.generation_config.task = "transcribe"
+model.generation_config.forced_decoder_ids = None
+
+ids = model.generate(input_features, language="hindi", task="transcribe")</code></pre>
+      </div>
+
+      <h3 id="landscape">What you would actually ship in 2026</h3>
+
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Model</th><th>Params / size</th><th>WER</th><th>Speed</th><th>Licence</th></tr></thead>
+          <tbody>
+            <tr><td>Moonshine tiny</td><td class="num">27M / 26 MB</td><td class="num">12.66 % avg</td><td class="num">—</td><td>MIT (English)</td></tr>
+            <tr><td>Moonshine streaming-tiny</td><td class="num">34M</td><td class="num">4.49 % LS clean</td><td class="num">RTFx 847.2</td><td>MIT</td></tr>
+            <tr><td>Moonshine streaming-medium</td><td class="num">245M</td><td class="num">6.65 % avg</td><td class="num">RTFx 448.15</td><td>MIT</td></tr>
+            <tr><td>sherpa-onnx streaming Zipformer EN</td><td class="num">~70M · 68 MB int8 encoder</td><td class="num">—</td><td class="num">—</td><td>Apache-2.0</td></tr>
+            <tr><td>Parakeet TDT 0.6B v3</td><td class="num">600M</td><td class="num">1.93 % / 3.59 % LS</td><td class="num">RTFx 3332.74</td><td>CC-BY-4.0</td></tr>
+            <tr><td>Nemotron Speech Streaming En 0.6B</td><td class="num">600M</td><td class="num">6.93 % avg @ 1.12 s</td><td>native streaming</td><td>NVIDIA Open Model</td></tr>
+            <tr><td>Silero VAD v6</td><td class="num">~300K / 2 MB</td><td class="num">—</td><td>&lt; 1 ms per 32 ms chunk</td><td>MIT</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>Two lessons hide in that table. First, the decoder decides speed far more than size does.
+      Parakeet CTC 1.1B runs at RTFx 2793.75, against Whisper large-v3 at RTFx 68.56. That is a 40×
+      gap for about a quarter point of WER. Second, <span class="term" data-term="quantization">quantization</span>
+      from Lesson 07 pays here. A 2026 paper took Nemotron Speech Streaming from 2.47 GB to 0.67 GB
+      with int4 k-quantization. Average WER came out at 8.20 %, against the 8.43 % that §11·7 gives for
+      the 80 ms streaming configuration. It then ran faster than real time on CPU, with no GPU, at 0.56 s of
+      latency.</p>
+
+      <p>The <em>Flavors of Moonshine</em> work adds a rule for everything in Part V: at 27M
+      parameters, monolingual models beat multilingual ones. Their per-language tiny models remove
+      48 % of Whisper Tiny's errors — a relative figure — and match Whisper Medium, which is 28 times
+      larger. At small scale, pick one language. And read the licences: Moonshine's English models are
+      MIT, its non-English models are non-commercial, and NVIDIA's Open Model Licence is not MIT
+      either.</p>
+
+      <div class="project">
+        <span class="project__label">Project 11</span>
+        <h3>Offline speech-to-text on a phone</h3>
+        <p>Build the whole path once. Raw audio to features you made yourself, then a small model you
+        trained yourself. Then a real recogniser, measured honestly and packed small enough to run
+        with no network. Rung A trains in minutes and proves your front end is correct. Rung B is the
+        real thing.</p>
+        <ol class="steps">
+          <li><strong>Look at the sound.</strong> Load one clip, resample to 16 kHz, build the log-mel
+              with <code>features.py</code> above, and plot it. Find a vowel, a fricative and a
+              plosive with your eyes before you train anything.</li>
+          <li><strong>Rung A — keyword spotting.</strong> Take Speech Commands v0.02 from the parquet
+              mirror <code>pollen-robotics/speech-commands-v0.02</code>: 35 words, 1-second clips at
+              16 kHz. Features <code>[B, 1, 64, 101]</code>, then the same kind of
+              <span class="term" data-term="cnn">convolutional network (CNN)</span> you built in
+              Lesson 02, about 200k parameters, cross-entropy, AdamW. Ten epochs should reach about
+              95 % accuracy.<br>
+              Two numbers there deserve a note, because they are not the 80 and 100 of §11·3. We drop
+              to <strong>64</strong> mel bands on purpose: one-second keyword clips do not need the
+              top detail, and the CNN gets smaller. And it is <strong>101</strong> frames, not 100,
+              because torchaudio pads half a window onto each end by default, so a <code>T</code>-second
+              clip gives <code>T · 100 + 1</code> frames. An off-by-one here costs an evening.</li>
+          <li><strong>Rung B — a real recogniser.</strong> Fine-tune <code>openai/whisper-tiny.en</code>
+              (39M parameters, Apache-2.0) on <code>openslr/librispeech_asr</code>, split
+              <code>train.clean.100</code> — 100 hours, about 28k utterances, parquet, so it loads
+              with <code>datasets</code> 5. One thousand steps is enough to see the WER move.</li>
+          <li><strong>Score it.</strong> Run <code>score.py</code> on the held-out set twice: once on
+              raw text, once through Whisper's <code>EnglishTextNormalizer</code>. Write both numbers
+              down. The difference is the point.</li>
+          <li><strong>Put it on the device.</strong> Two honest routes. For batch transcription, build
+              <code>whisper.cpp</code> v1.9.2 and run an int8 model with its built-in VAD. For real
+              streaming, run a streaming Zipformer transducer through <code>sherpa-onnx</code> v1.13.5,
+              which has Swift and Kotlin bindings and ships an int8 encoder of about 68 MB.</li>
+          <li><strong>Measure it.</strong> Time 20 utterances with a warm-up and take the median, as in
+              Lesson 08. Report RTF, not "it felt fast". Then compare the RTF of the padded 30-second
+              path with the streaming one. This number is the "ears" line of the latency budget you
+              will assemble in Lesson 13.</li>
+        </ol>
+        <p><strong>Then break it on purpose.</strong> Each of these fails silently in production:</p>
+        <ul>
+          <li>Feed the model 44.1 kHz audio without resampling. Read the transcript. Nothing errors.</li>
+          <li>Remove the division by 32768 from a raw PCM path and look at the feature values.</li>
+          <li>Pass <code>(B, T, C)</code> to <code>nn.CTCLoss</code>, which wants
+              <code>(T, B, C)</code>, or move the blank index to the last position. Watch the loss
+              fall toward a useless model.</li>
+          <li>Run Whisper on 30 seconds of silence with the VAD switched off, and count the invented
+              sentences.</li>
+        </ul>
+        <dl class="project__grid">
+          <div class="project__stat"><dt>Data</dt><dd>Speech Commands v0.02 · LibriSpeech train.clean.100</dd></div>
+          <div class="project__stat"><dt>Size</dt><dd>~200k params (rung A) · 39M (whisper-tiny.en)</dd></div>
+          <div class="project__stat"><dt>Time</dt><dd>~2–5 min/epoch on MPS · 1–2 h on a T4 for 1000 steps</dd></div>
+          <div class="project__stat"><dt>Target</dt><dd>~95 % keyword accuracy · RTF well below 1</dd></div>
+        </dl>
+      </div>
+
+      <h2 id="check">Check yourself</h2>
+
+      <div class="check">
+        <p class="check__q">A 2.5-second clip at 16 kHz goes through <code>n_fft=400</code>,
+        <code>hop_length=160</code>, <code>n_mels=80</code>, with torchaudio's default centre
+        padding. What is the shape of the log-mel tensor?</p>
+        <div class="check__opts">
+          <button class="check__opt">(80, 250)</button>
+          <button class="check__opt" data-right>(80, 251)</button>
+          <button class="check__opt">(201, 250)</button>
+          <button class="check__opt">(400, 250)</button>
+        </div>
+        <p class="check__why">The first axis is the number of mel bands, so 80 — the 201 FFT bins were
+        already collapsed by the filterbank. The second is frames: 2.5 s × 16000 = 40,000 samples,
+        divided by the 160-sample hop, gives 250, and centre padding adds the one extra frame.</p>
+      </div>
+
+      <div class="check">
+        <p class="check__q">A CTC model emits this frame sequence, where <code>ε</code> is the blank:
+        <code>ε t t ε o o ε o</code>. What text does the collapse rule produce?</p>
+        <div class="check__opts">
+          <button class="check__opt">to</button>
+          <button class="check__opt" data-right>too</button>
+          <button class="check__opt">tooo</button>
+          <button class="check__opt">t o o</button>
+        </div>
+        <p class="check__why">Merge identical neighbours first: <code>ε t ε o ε o</code>. Then delete
+        the blanks: "too". The order matters. Delete the blanks first and the two runs of
+        <code>o</code> touch, merge into one, and you get "to" — which is exactly the bug the blank
+        exists to prevent.</p>
+      </div>
+
+      <div class="check">
+        <p class="check__q">A reference has 6 words. The model outputs 8 words: 5 correct, 1 wrong
+        word in place of a correct one, and 2 words that were never said. What is the WER?</p>
+        <div class="check__opts">
+          <button class="check__opt">25 %</button>
+          <button class="check__opt" data-right>50 %</button>
+          <button class="check__opt">37.5 %</button>
+          <button class="check__opt">33.3 %</button>
+        </div>
+        <p class="check__why">One substitution plus two insertions plus zero deletions is 3 errors,
+        divided by the 6 reference words: 3 / 6 = 50 %. The denominator is always the reference
+        length, never the hypothesis length.</p>
+      </div>
+
+      <div class="check">
+        <p class="check__q">You need partial text on screen within about 200 ms of the user speaking,
+        on a phone, offline. Which architecture fits?</p>
+        <div class="check__opts">
+          <button class="check__opt">Whisper with a chunked wrapper, because it has the best accuracy</button>
+          <button class="check__opt" data-right>A cache-aware streaming transducer with a small chunk and short look-ahead</button>
+          <button class="check__opt">An attention encoder-decoder with timestamp tokens switched on</button>
+          <button class="check__opt">wav2vec 2.0 with prefix beam search and an external language model</button>
+        </div>
+        <p class="check__why">Whisper's encoder is bidirectional over a fixed 30-second block, so it
+        structurally cannot answer in 200 ms. A transducer is causal and monotonic, keeps its cache
+        between chunks, and its delay is the chunk plus the look-ahead you choose.</p>
+      </div>
+
+      <div class="terms">
+        <span class="terms__label">Key words from this lesson</span>
+        <dl>
+          <dt>Sample rate <span class="en">16,000 Hz for speech</span></dt>
+          <dd>How many times per second the microphone measured air pressure. One second of speech audio is 16,000 numbers.</dd>
+
+          <dt>Frame and hop <span class="en">25 ms and 10 ms</span></dt>
+          <dd>The short slice of audio we analyse, and how far we move before taking the next slice. Slices overlap on purpose.</dd>
+
+          <dt>Mel scale <span class="en">/mel/</span></dt>
+          <dd>A warped frequency axis on which equal distances sound equally different to a human ear.</dd>
+
+          <dt>Log-mel spectrogram</dt>
+          <dd>The picture of sound that speech models read: 80 frequency bands, about 100 columns per second at 16 kHz with a 10 ms hop, values compressed by a logarithm.</dd>
+
+          <dt>Blank <span class="en">written ε</span></dt>
+          <dd>An extra output symbol meaning "no new letter at this frame". It is a separator, not silence.</dd>
+
+          <dt>Collapse rule</dt>
+          <dd>Merge neighbouring identical symbols, then delete every blank. This turns a frame sequence into text.</dd>
+
+          <dt>Transducer <span class="en">also: RNN-T, recurrent neural network transducer</span></dt>
+          <dd>A recogniser with three parts — encoder, prediction network, joint network — that can emit several tokens from one audio frame.</dd>
+
+          <dt>Monotonic</dt>
+          <dd>A decoder that only ever moves forward through the audio, never back. This is what lets a transducer commit to early words before the sentence has finished.</dd>
+
+          <dt>Look-ahead</dt>
+          <dd>How many future frames a streaming model is allowed to see. More accuracy, more delay.</dd>
+
+          <dt>RTF and RTFx</dt>
+          <dd>Processing time divided by audio duration, and its reciprocal. RTF must be under 1; RTFx must be over 1.</dd>
+
+          <dt>WER <span class="en">word error rate</span></dt>
+          <dd>Substitutions plus deletions plus insertions, divided by the number of words that were actually said.</dd>
+
+          <dt>CER <span class="en">character error rate</span></dt>
+          <dd>The same edit-distance count over characters instead of words. The right metric for scripts written without spaces, and fairer when a word is nearly right.</dd>
+
+          <dt>Absolute and relative</dt>
+          <dd>Two ways to report a gain. 8.4 % down to 6.9 % is 1.5 points absolute, and 18 % relative. Relative always sounds larger.</dd>
+        </dl>
+      </div>
+
+      <h2 id="resources">Go deeper</h2>
+
+      <div class="resources">
+        <a class="res" href="https://huggingface.co/learn/audio-course/chapter0/introduction" target="_blank" rel="noopener">
+          <span class="res__kind" data-kind="course">course</span>
+          <span class="res__body">
+            <span class="res__title">Hugging Face Audio Course</span>
+            <span class="res__why">Unit 5 is speech recognition and Unit 6 is synthesis. Work through Unit 5 next to this lesson; it has the dataloader details we skipped.</span>
+          </span>
+        </a>
+        <a class="res" href="https://huggingface.co/blog/fine-tune-whisper" target="_blank" rel="noopener">
+          <span class="res__kind" data-kind="code">code</span>
+          <span class="res__body">
+            <span class="res__title">Fine-tune Whisper for multilingual ASR</span>
+            <span class="res__why">The reference recipe for rung B of the project. Read it after you have a WER number of your own to beat.</span>
+          </span>
+        </a>
+        <a class="res" href="https://huggingface.co/blog/open-asr-leaderboard" target="_blank" rel="noopener">
+          <span class="res__kind" data-kind="docs">docs</span>
+          <span class="res__body">
+            <span class="res__title">Open ASR Leaderboard</span>
+            <span class="res__why">60+ models over 11 datasets, with RTFx beside WER. Open it whenever you are tempted to choose a model by accuracy alone.</span>
+          </span>
+        </a>
+        <a class="res" href="https://huggingface.co/nvidia/nemotron-speech-streaming-en-0.6b" target="_blank" rel="noopener">
+          <span class="res__kind" data-kind="docs">docs</span>
+          <span class="res__body">
+            <span class="res__title">Nemotron Speech Streaming En 0.6B — model card</span>
+            <span class="res__why">The source of the latency table above. It shows exactly how one runtime flag trades delay against accuracy.</span>
+          </span>
+        </a>
+        <a class="res" href="https://github.com/snakers4/silero-vad" target="_blank" rel="noopener">
+          <span class="res__kind" data-kind="code">code</span>
+          <span class="res__body">
+            <span class="res__title">Silero VAD</span>
+            <span class="res__why">2 MB, MIT, and the first thing you should put in front of any speech model. Read the README before you write your own gate.</span>
+          </span>
+        </a>
+      </div>
+
+      <div class="callout callout--try">
+        <span class="callout__label">Next</span>
+        <p class="mt-0">You can now turn sound into text. <strong>Lesson 12</strong> runs the same
+        pipeline backwards: text to phonemes to a mel spectrogram to an actual waveform. The
+        spectrogram you learned to read here becomes the thing the model has to <em>produce</em>, and
+        the new hard number is time to first audio. Then <strong>Lesson 13</strong> bolts the two
+        together into the offline assistant. The recogniser you built here is its ears. And knowing
+        when the user has finished speaking turns out to be its own problem.</p>
+      </div>
+
+    </article>
+  </main>
+
+  <aside class="toc-rail"></aside>
+</div>
+
+<script src="../assets/js/vendor/gsap.min.js"></script>
+<script src="../assets/js/scene.js"></script>
+<script src="../assets/js/svgkit.js"></script>
+<script src="../data/lessons.js"></script>
+<script src="../data/glossary.js"></script>
+<script src="../assets/js/course.js"></script>
+<script src="../data/narration/11.js"></script>
+<script src="../data/narration/11.timing.js" onerror="void 0"></script>
+<script src="../assets/js/scenes/11.js"></script>
+<script src="../assets/js/film.js"></script>
+</body>
+</html>

@@ -1,0 +1,1041 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>03 · Inside a Transformer — Model Engineering</title>
+<meta name="description" content="Attention, one matrix at a time: tokens, embeddings, heads, masks, and the block that repeats.">
+<link rel="stylesheet" href="../assets/css/course.css">
+</head>
+<body data-lesson="03">
+
+<div class="shell shell--wide">
+  <nav class="rail" aria-label="Lessons"></nav>
+
+  <main class="main">
+    <article class="prose">
+
+      <header class="lesson-head">
+        <span class="lesson-head__num">03</span>
+        <h1>Inside a Transformer</h1>
+        <p class="lead">A decoder-only transformer is one function: integers in, a probability for every
+        possible next token out. This lesson opens that function and follows the shapes through,
+        until nothing is left that you could not write yourself.</p>
+        <div class="lesson-head__meta">
+          <span class="chip"><b>Part I</b> · Foundations</span>
+          <span class="chip">≈ <b>105 min</b> reading</span>
+          <span class="chip">Project · <b>Write attention from scratch</b></span>
+          <span class="chip">Needs · <b>Lesson 01, 02</b></span>
+        </div>
+      </header>
+
+      <section class="outcomes">
+        <h2>By the end you can</h2>
+        <ul>
+          <li>Explain why models read <strong>subwords</strong>, and what a bigger vocabulary costs.</li>
+          <li>Write <strong>scaled dot-product attention</strong> from memory with correct shapes, and say why the division by √d<sub>h</sub> is there.</li>
+          <li>Draw the <strong>causal mask</strong> and say where in the computation it belongs.</li>
+          <li>Choose between <strong>multi-head, grouped-query and multi-query attention</strong> using a key/value (KV) cache size in megabytes.</li>
+          <li>Read a model config file and predict its <strong>parameter count</strong> before downloading it.</li>
+          <li>Name the parts of a modern block — <strong>RoPE, RMSNorm, SwiGLU, residuals</strong> — and what each fixes.</li>
+        </ul>
+      </section>
+
+      <h2 id="tokens"><span class="h-num">03 · 1</span>From text to integers</h2>
+
+      <p>A network only consumes numbers, and text is a string. The <strong>tokenizer</strong> stands
+      between them. It is not part of the model and is not trained by gradient descent: it is a fixed
+      dictionary, built once, before training starts.</p>
+
+      <p>There are three ways to split text, and two of them are bad. One character per
+      <span class="term" data-term="token">token</span> gives a tiny vocabulary but very long
+      sequences, and attention cost grows with the square of sequence length. One word per token
+      gives short sequences but an endless vocabulary: every typo becomes an unknown word.
+      <strong>Subwords</strong> are the compromise everybody uses.</p>
+
+      <p><strong>Byte pair encoding (BPE)</strong> builds the dictionary with an algorithm you could
+      write in an afternoon. Start with single symbols. Count every adjacent pair in a large corpus.
+      Merge the most frequent pair into one new symbol and write down the merge rule. Repeat until
+      the vocabulary is the size you asked for. Prose is easy to nod along to, so run the loop by
+      hand.</p>
+
+      <div class="code">
+        <div class="code__head"><span>bpe by hand</span><span class="lang">trace</span></div>
+        <pre><code>corpus       low low lower
+start        every character is its own symbol
+             l o w   l o w   l o w e r
+
+count pairs  (l,o) 3    (o,w) 3    (w,e) 1    (e,r) 1
+merge 1      (l,o) is joint first, take it  ->  new symbol "lo"
+             lo w   lo w   lo w e r
+
+count pairs  (lo,w) 3   (w,e) 1    (e,r) 1
+merge 2      (lo,w) wins  ->  new symbol "low"
+             low   low   low e r
+
+merge list   [ (l,o), (lo,w) ]          <- this is the whole tokenizer
+vocabulary   l o w e r  +  lo  low      <- 5 characters plus 2 merges
+
+encoding replays the merge list in order, first every (l,o), then every (lo,w):
+   "low"    ->  low            1 token,  because it was frequent
+   "lower"  ->  low + e + r    3 tokens, because it was not</code></pre>
+      </div>
+
+      <p>That is the whole trade in miniature. A real tokenizer runs the same loop with 50,000 merges.</p>
+
+      <p><strong>Byte-level</strong> BPE, introduced with GPT-2, makes one extra choice: the starting
+      alphabet is the 256 byte values, not characters. Any text becomes bytes first, so the tokenizer
+      encodes Chinese, emoji and source code without ever producing an unknown token. The price: one
+      non-ASCII character can take two to four tokens.</p>
+
+      <figure class="scene" data-scene="tf-tokens">
+        <div class="scene__head">
+          <span class="scene__badge">animation</span>
+          <span class="scene__title">Text becomes pieces, pieces become ids, ids become vectors</span>
+        </div>
+        <div class="scene__stage">
+          <svg viewBox="0 0 900 300" role="img" aria-label="A sentence splitting into subword tokens, then into integer ids, then into rows pulled from an embedding table">
+            <g id="tk-plot"></g>
+          </svg>
+        </div>
+      </figure>
+
+      <div class="code">
+        <div class="code__head"><span>tokenize.py</span><span class="lang">python</span></div>
+        <pre><code>from transformers import AutoTokenizer
+
+tok = AutoTokenizer.from_pretrained("HuggingFaceTB/SmolLM3-3B")
+
+ids = tok("Tokenizers split rare words.")["input_ids"]
+print(len(tok))                       # the vocabulary size
+print(ids)                            # a list of integers
+print(tok.convert_ids_to_tokens(ids)) # the pieces those integers stand for
+print(tok.decode(ids))                # exactly the original string, spaces included</code></pre>
+      </div>
+
+      <p>Run that on your own text. Two habits follow. First, the rule of thumb: English text is
+      roughly <strong>4 characters per token</strong>. A word plus its space averages 5 characters, so
+      a 2,000-word article is about 10,000 characters, and 10,000 / 4 = <strong>2,500 tokens</strong>.
+      The same rule reversed: 1 token ≈ 0.8 words.</p>
+
+      <p>Second, the space in front of a word usually belongs to the token: <code>" split"</code> and
+      <code>"split"</code> are different ids. End a prompt with a trailing space and the model must
+      continue a token that normally begins with one — a shape it has almost never seen. Completions
+      get noticeably worse. This is why chat templates never leave a space before the answer.</p>
+
+      <div class="callout callout--pitfall">
+        <span class="callout__label">Common trap</span>
+        <p class="mt-0">Token counts are <strong>not comparable between models</strong>. The same
+        sentence can be 18 tokens for one tokenizer and 24 for another. Any metric that depends on
+        tokens — context length, price per token, <span class="term" data-term="perplexity">perplexity</span>
+        (Lesson 04 defines it) — is only meaningful next to the tokenizer that produced it.</p>
+      </div>
+
+      <h2 id="embedding"><span class="h-num">03 · 2</span>The embedding table, and what vocabulary costs</h2>
+
+      <p>An <span class="term" data-term="embedding">embedding</span> is a lookup table with shape
+      <code>(V, d)</code>. <code>V</code> is the vocabulary size. <code>d</code> is the model width,
+      usually written <code>d_model</code>. Token id 4,471 means "give me row 4,471". Input shape
+      <code>(B, T)</code> of integers becomes output shape <code>(B, T, d)</code> of floats. That is
+      the entire operation. The rows start random and are trained like any other weight.</p>
+
+      <p>Vocabulary size is a real engineering decision: the table is <code>V × d</code> numbers.</p>
+
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Tokenizer / model family</th><th>Vocabulary</th></tr></thead>
+          <tbody>
+            <tr><td>GPT-2</td><td class="num">50,257</td></tr>
+            <tr><td><code>cl100k_base</code></td><td class="num">100,277</td></tr>
+            <tr><td>Llama 3.x, SmolLM3</td><td class="num">128,256</td></tr>
+            <tr><td>Qwen3</td><td class="num">151,936</td></tr>
+            <tr><td>Phi-4-mini</td><td class="num">200,064</td></tr>
+            <tr><td>Qwen3.5</td><td class="num">248,320</td></tr>
+            <tr><td>Gemma 3, Gemma 4</td><td class="num">262,144</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>A larger vocabulary means fewer tokens per sentence, so shorter sequences, less attention work
+      and better coverage of languages other than English. It also means a larger table. Gemma 4 E2B
+      has <code>d = 1,536</code> and a 262,144-token vocabulary, so the embedding alone is about
+      <strong>403 million parameters</strong> — larger than several complete "1B" models.</p>
+
+      <div class="callout callout--note">
+        <span class="callout__label">Worth knowing</span>
+        <p class="mt-0">At the other end of the model sits a matrix of the same shape: the output
+        head that turns the final <code>d</code> numbers into one score per vocabulary entry. Nearly
+        every small model <strong>ties</strong> these two together and stores one matrix instead of
+        two — <code>tie_word_embeddings: true</code>. It is true for Qwen3-0.6B, Qwen3.5-2B,
+        SmolLM3-3B, Llama 3.2 1B and 3B, and Phi-4-mini. With a wide vocabulary and a narrow body,
+        this halves a very large number.</p>
+      </div>
+
+      <h2 id="position"><span class="h-num">03 · 3</span>Attention has no idea what order the tokens are in</h2>
+
+      <p>This is the fact that surprises people. Attention is
+      <strong>permutation-equivariant</strong>: shuffle the input tokens and the outputs come back in
+      the same shuffled order, unchanged. "dog bites man" and "man bites dog" give the same set of
+      vectors. Position has to be injected on purpose.</p>
+
+      <p>The original 2017 transformer added a fixed pattern of sines and cosines to the embedding.
+      GPT-2 and BERT — an encoder-only model, the kind Section 7 explains — learned a second table,
+      <code>(max_len, d)</code>, and added that. Both have problems: the sinusoidal version
+      extrapolates badly past the training lengths, and the learned version caps context at
+      <code>max_len</code>.</p>
+
+      <p><span class="term" data-term="rope">RoPE</span> — rotary position embedding — is what every
+      model in this course uses. It does not add anything. It takes each pair of adjacent numbers
+      inside <code>q</code> and <code>k</code> and treats the pair as a point in a plane. Then it
+      <strong>rotates</strong> that point by an angle proportional to the token's position.</p>
+
+      <div class="callout callout--math">
+        <span class="callout__label">The maths, once</span>
+        <div class="eq">θ<sub>i</sub> = base<sup>−2i/d<sub>h</sub></sup>        rotate pair <i>i</i> at position <i>m</i> by <i>m</i>·θ<sub>i</sub>
+
+   after rotation:   <i>q</i><sub>m</sub> · <i>k</i><sub>n</sub>   depends only on   (<i>m</i> − <i>n</i>)
+
+   <i>m</i> <i>n</i>   the positions of the query token and the key token
+   θ<sub>i</sub>     the rotation angle for pair <i>i</i> · d<sub>h</sub> the head dimension</div>
+        <p>That last line is the whole trick, and the one claim here you should not take on faith.</p>
+      </div>
+
+      <p>So check it. Take one pair, so each vector is a point in a plane, and reach for a calculator.</p>
+
+      <div class="code">
+        <div class="code__head"><span>rope by hand</span><span class="lang">trace</span></div>
+        <pre><code>q = (1, 0) at position m,  k = (1, 0) at position n,  theta = 0.1 rad per position
+rotating (1, 0) by an angle a gives (cos a, sin a)
+
+m = 5,  n = 3     q rotated by 5*0.1 = 0.5 rad  -> (0.878, 0.479)
+                  k rotated by 3*0.1 = 0.3 rad  -> (0.955, 0.296)
+                  dot = 0.878*0.955 + 0.479*0.296 = 0.980
+
+m = 12, n = 10    q rotated by 1.2 rad          -> (0.362, 0.932)
+                  k rotated by 1.0 rad          -> (0.540, 0.841)
+                  dot = 0.362*0.540 + 0.932*0.841 = 0.980
+
+why it must be so:  dot of two unit vectors at angles a and b  =  cos(a - b)
+                    here that is cos(m*theta - n*theta) = cos((m - n)*theta)
+                    both rows have m - n = 2, so both give cos(0.2) = 0.980
+
+and for any q and k:  each one is turned by its own position, so the angle
+                      between them ends up (m - n)*theta plus whatever angle
+                      they started with. The cancellation does not need q = k.
+
+Both tokens moved 7 positions down the sequence. The score did not move at all.</code></pre>
+      </div>
+
+      <figure class="scene">
+        <div class="scene__head">
+          <span class="scene__badge">figure</span>
+          <span class="scene__title">Both arrows turn together, so the angle between them never changes</span>
+        </div>
+        <div class="scene__stage">
+          <svg viewBox="0 0 900 260" role="img" aria-label="Two circles. In the left circle a query arrow at 0.5 radians and a key arrow at 0.3 radians, a gap of 0.2 radians. In the right circle both arrows have turned a further 0.7 radians and the gap between them is still 0.2 radians, so the dot product is the same 0.980 in both.">
+            <g transform="translate(210,130)">
+              <circle r="82" fill="none" stroke="var(--line)" stroke-width="1.2"></circle>
+              <line x1="-96" y1="0" x2="96" y2="0" stroke="var(--line-soft)" stroke-width="1"></line>
+              <line x1="0" y1="-96" x2="0" y2="96" stroke="var(--line-soft)" stroke-width="1"></line>
+              <path d="M 0 0 L 72.0 -39.3" stroke="var(--c-data)" stroke-width="3" stroke-linecap="round"></path>
+              <path d="M 0 0 L 78.3 -24.2" stroke="var(--c-param)" stroke-width="3" stroke-linecap="round"></path>
+              <path d="M 43.9 -13.6 A 46 46 0 0 0 40.4 -22.0" fill="none" stroke="var(--c-ok)" stroke-width="2"></path>
+            </g>
+            <g transform="translate(660,130)">
+              <circle r="82" fill="none" stroke="var(--line)" stroke-width="1.2"></circle>
+              <line x1="-96" y1="0" x2="96" y2="0" stroke="var(--line-soft)" stroke-width="1"></line>
+              <line x1="0" y1="-96" x2="0" y2="96" stroke="var(--line-soft)" stroke-width="1"></line>
+              <path d="M 0 0 L 29.7 -76.4" stroke="var(--c-data)" stroke-width="3" stroke-linecap="round"></path>
+              <path d="M 0 0 L 44.3 -69.0" stroke="var(--c-param)" stroke-width="3" stroke-linecap="round"></path>
+              <path d="M 24.9 -38.7 A 46 46 0 0 0 16.7 -42.9" fill="none" stroke="var(--c-ok)" stroke-width="2"></path>
+            </g>
+            <text x="210" y="34" text-anchor="middle" font-size="14" fill="var(--text)">positions 5 and 3</text>
+            <text x="660" y="34" text-anchor="middle" font-size="14" fill="var(--text)">positions 12 and 10</text>
+            <text x="210" y="238" text-anchor="middle" font-size="13" fill="var(--text-dim)">gap 0.2 rad · dot product 0.980</text>
+            <text x="660" y="238" text-anchor="middle" font-size="13" fill="var(--text-dim)">gap 0.2 rad · dot product 0.980</text>
+            <text x="320" y="80" font-size="12.5" fill="var(--c-data)">query</text>
+            <text x="320" y="100" font-size="12.5" fill="var(--c-param)">key</text>
+            <text x="435" y="136" text-anchor="middle" font-size="20" fill="var(--text-dim)">→</text>
+          </svg>
+        </div>
+      </figure>
+
+      <p>Two tokens two positions apart contribute the same score wherever they sit. Position becomes
+      <em>relative</em>, for free, inside the dot product — no extra parameters, no length limit.</p>
+
+      <div class="code">
+        <div class="code__head"><span>rope.py</span><span class="lang">python</span></div>
+        <pre><code>import torch
+
+def rope_cache(T, d_head, base=10000.0, device=None):
+    inv = 1.0 / (base ** (torch.arange(0, d_head, 2, device=device).float() / d_head))
+    ang = torch.outer(torch.arange(T, device=device).float(), inv)   # (T, d_head/2)
+    return ang.cos(), ang.sin()
+
+def apply_rope(x, cos, sin):          # x: (B, H, T, d_head)
+    x1, x2 = x[..., 0::2], x[..., 1::2]
+    cos, sin = cos[None, None], sin[None, None]
+    return torch.stack([x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1).flatten(-2)</code></pre>
+      </div>
+
+      <p>The <code>base</code> value, <code>rope_theta</code> in config files, decides how fast the
+      angles turn. A larger base means slower rotation, and so a longer usable context. Llama 3.2 uses
+      500,000; Qwen3-0.6B 1,000,000; SmolLM3-3B 5,000,000; Qwen3.5-2B 10,000,000. When a model card
+      advertises a long context, that number is part of the reason.</p>
+
+      <p>Two variations in 2026 configs look like contradictions until you see the reason.
+      <strong>Partial RoPE</strong> rotates only a fraction of each head. Qwen3.5-2B sets
+      <code>partial_rotary_factor: 0.25</code>, leaving three quarters of every head free of position
+      — room for facts that mean the same thing wherever the token sits. <strong>NoPE layers</strong>
+      — no positional embedding — switch RoPE off entirely; SmolLM3-3B does this every fourth layer.
+      An unrotated layer cannot be thrown off by an angle it never saw in training, and the RoPE
+      layers around it still supply the order.</p>
+
+      <h2 id="attention"><span class="h-num">03 · 4</span>Attention, one matrix at a time</h2>
+
+      <p>Start with what is broken. After the embedding, every token is described by its own vector and
+      nothing else. Take "The cat sat on the mat and it". The vector for <code>"it"</code> is the
+      same one it would have in any other sentence, with no trace of the cat. Something must let
+      <code>"it"</code> read <code>"cat"</code>, and the model must <em>learn</em> which word to reach
+      for, because no rule tells it in advance.</p>
+
+      <p><span class="term" data-term="attention">Attention</span> is that step: each token looks at
+      the other tokens and pulls in what is relevant to it. Every token produces three vectors from
+      the same input, through three different learned matrices:</p>
+
+      <ul>
+        <li><strong>query</strong> <code>q</code> — what this token is looking for.</li>
+        <li><strong>key</strong> <code>k</code> — what this token offers to others.</li>
+        <li><strong>value</strong> <code>v</code> — what this token actually hands over if chosen.</li>
+        <li><strong>output</strong> <code>Wo</code> — one more learned matrix at the end, which mixes
+            the heads' results back into a single vector.</li>
+      </ul>
+
+      <p>The comparison is a dot product: large when two vectors point the same way, near zero when
+      unrelated, negative when they point apart. So <code>q · k</code> is a similarity score, and one
+      query against all keys gives a row of them.</p>
+
+      <figure class="scene" data-scene="tf-attend">
+        <div class="scene__head">
+          <span class="scene__badge">animation</span>
+          <span class="scene__title">One query, five keys, and a weighted mixture of values</span>
+        </div>
+        <div class="scene__stage">
+          <svg viewBox="0 0 900 340" role="img" aria-label="A query vector compared with every key by dot product, the raw scores scaled and passed through softmax, then the value vectors mixed in proportion to the weights">
+            <g id="at-plot"></g>
+          </svg>
+        </div>
+      </figure>
+
+      <div class="callout callout--key">
+        <span class="callout__label">Remember this</span>
+        <div class="eq">Attention(<i>Q</i>, <i>K</i>, <i>V</i>)  =  softmax( <i>Q</i><i>K</i>ᵀ / √d<sub>h</sub> ) <i>V</i>
+
+   <i>Q</i> <i>K</i> <i>V</i>   activations, shape (B, H, T, d_h)
+   <b>W</b>q <b>W</b>k <b>W</b>v <b>W</b>o   learned matrices, shape (d, ·)</div>
+        <p>Everything else here is packaging around that line.</p>
+      </div>
+
+      <p>Now the shapes. Every letter in this lesson is named here, once. <code>B</code> is the batch
+      size. <code>T</code> is the sequence length in tokens. <code>d</code> is the model width,
+      <code>d_model</code>. <code>H</code> is the number of <em>query</em> heads. <code>G</code> is
+      the number of <em>key/value</em> heads, and <code>G = H</code> in plain multi-head attention.
+      <code>d_h = d / H</code> is the <strong>head dimension</strong>, <code>d_head</code> in code —
+      unless a config sets <code>head_dim</code> itself, which Section 8 covers.</p>
+
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Step</th><th>Shape</th><th>What it holds</th></tr></thead>
+          <tbody>
+            <tr><td><code>x</code></td><td><code>(B, T, d)</code></td><td>one vector per token</td></tr>
+            <tr><td><code>q, k, v</code> after reshape</td><td><code>(B, H, T, d_h)</code></td><td>each head gets its own slice</td></tr>
+            <tr><td><code>scores = q @ k.transpose(-2,-1)</code></td><td><code>(B, H, T, T)</code></td><td>every token against every token</td></tr>
+            <tr><td><code>attn = softmax(scores)</code></td><td><code>(B, H, T, T)</code></td><td>each row sums to 1</td></tr>
+            <tr><td><code>out = attn @ v</code></td><td><code>(B, H, T, d_h)</code></td><td>a mixture of values</td></tr>
+            <tr><td><code>out @ Wo</code></td><td><code>(B, T, d)</code></td><td>back onto the block's main vector — the residual stream of Section 6</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>The <code>(B, H, T, T)</code> row is the expensive one. It grows with the <em>square</em> of the
+      sequence length. That is why long context is hard, and why Section 5 works so hard at making
+      the stored keys and values smaller.</p>
+
+      <h3 id="scale">Why divide by √d<sub>h</sub></h3>
+
+      <p>Assume the entries of <code>q</code> and <code>k</code> have mean 0 and variance 1. Their dot
+      product sums <code>d_h</code> such products, so it has variance <code>d_h</code> and standard
+      deviation <code>√d_h</code>. At a head dimension of 128 that is a spread of roughly ±11.</p>
+
+      <p>Feed numbers that far apart into softmax and the result is almost one-hot: one weight near 1,
+      the rest near 0. In Lesson 01 you saw that a probability of 1 on the right answer gives a loss of
+      0, and therefore no gradient. The same thing happens here, in the middle of the network: the
+      softmax saturates, the gradient through it becomes almost zero, and training stalls. Dividing by
+      <code>√d_h</code> restores unit variance. PyTorch does this by default:
+      <code>scale = 1 / sqrt(query.size(-1))</code>.</p>
+
+      <h3 id="mask">The causal mask</h3>
+
+      <p>A language model predicts the next token. If position 5 could read position 6, it would be
+      reading the answer. So before the softmax, every score whose key comes after its query is set
+      to negative infinity.</p>
+
+      <figure class="scene" data-scene="tf-mask">
+        <div class="scene__head">
+          <span class="scene__badge">animation</span>
+          <span class="scene__title">The upper triangle is the future, and it is switched off</span>
+        </div>
+        <div class="scene__stage">
+          <svg viewBox="0 0 900 320" role="img" aria-label="An eight by eight score matrix whose upper triangle is greyed out before softmax, leaving each row summing to one over the past only">
+            <g id="mk-plot"></g>
+          </svg>
+        </div>
+      </figure>
+
+      <p>The exponential of negative infinity is 0, so those weights are exactly zero. Everything on
+      and below the diagonal stays, and each row still sums to 1 over the part it may see.</p>
+
+      <p>This mask is what makes one forward pass so productive. Row 0 predicts token 1 from one token
+      of context; row 7 predicts token 8 from eight. One pass over length <code>T</code> produces
+      <code>T</code> separate training signals at once, at no extra cost. That is why next-token
+      prediction scales the way it does.</p>
+
+      <div class="callout callout--pitfall">
+        <span class="callout__label">The mistake that still trains</span>
+        <p class="mt-0">Apply the mask <strong>after</strong> softmax — zeroing the upper triangle instead
+        of setting it to −inf beforehand — and nothing crashes. The rows stop summing to 1, the model
+        leaks a little of the future through the normalisation, and the loss curve looks almost
+        normal. You lose days to this. Mask first, softmax second, always.</p>
+      </div>
+
+      <div class="code">
+        <div class="code__head"><span>attention.py</span><span class="lang">python</span></div>
+        <pre><code>import math, torch, torch.nn.functional as F
+
+def attention(q, k, v, causal=True):
+    """q, k, v: (B, H, T, d_head) -> (B, H, T, d_head)"""
+    d_head = q.size(-1)
+    scores = (q @ k.transpose(-2, -1)) / math.sqrt(d_head)       # (B, H, Tq, Tk)
+    if causal:
+        Tq, Tk = q.size(-2), k.size(-2)
+        # tril(0) is the plain lower triangle. The offset Tk - Tq keeps it correct
+        # when q is shorter than k, which happens once you decode one token
+        # against a cache (Lesson 04). With Tq == Tk the offset is 0.
+        keep = torch.ones(Tq, Tk, dtype=torch.bool, device=q.device).tril(Tk - Tq)
+        scores = scores.masked_fill(~keep, float("-inf"))        # mask BEFORE softmax
+    return torch.softmax(scores, dim=-1) @ v
+
+q, k, v = torch.randn(3, 2, 4, 16, 64).unbind(0)                 # B=2, H=4, T=16, d_h=64
+mine = attention(q, k, v)
+ref  = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+print(torch.allclose(mine, ref, atol=1e-5))                      # True</code></pre>
+      </div>
+
+      <p>That is the whole mechanism. In production you call
+      <code>F.scaled_dot_product_attention</code> instead, because it never builds the
+      <code>(B, H, T, T)</code> matrix in memory. Same function — and now you can prove it.</p>
+
+      <h2 id="heads"><span class="h-num">03 · 5</span>Heads, and the size of the KV cache</h2>
+
+      <p>One softmax row is one weighted average, so it expresses one relation per position and no more.
+      Multi-head attention runs several side by side. The important detail: heads do not make the
+      layer wider. The <code>d</code> numbers are <strong>cut into H slices</strong> of
+      <code>d_h = d / H</code>. Each slice gets its own <code>Wq</code>, <code>Wk</code> and
+      <code>Wv</code>, and the outputs are laid end to end again. The arithmetic is unchanged.</p>
+
+      <figure class="scene" data-scene="tf-heads">
+        <div class="scene__head">
+          <span class="scene__badge">animation</span>
+          <span class="scene__title">One wide vector, six narrow heads, six different relations</span>
+        </div>
+        <div class="scene__stage">
+          <svg viewBox="0 0 900 300" role="img" aria-label="A 384-number vector split into six slices of 64, each slice running its own attention pattern, then concatenated back">
+            <g id="hd-plot"></g>
+          </svg>
+        </div>
+      </figure>
+
+      <p>Heads specialise on their own, with nobody telling them to. Researchers have found
+      previous-token heads, syntax heads, and <em>induction heads</em> that complete a pattern: having
+      seen <code>[A][B]</code> earlier, when <code>[A]</code> returns they push <code>[B]</code>. That
+      last one is much of why these models copy a name or a format from earlier in your prompt.</p>
+
+      <h3 id="gqa">Multi-head, grouped-query and multi-query</h3>
+
+      <p>Now the part that decides whether your model fits on a phone. Everything so far computes all
+      <code>T</code> positions in one parallel pass. Generation does not work that way: you produce
+      token 1, append it, run the model again, produce token 2, and so on — the loop Lesson 04 builds.
+      Unaided, each new token re-runs attention over the whole prefix from scratch.</p>
+
+      <p>So the keys and values are stored instead. That store is the
+      <span class="term" data-term="kv cache">key/value cache</span>, written <strong>KV
+      cache</strong>. It grows linearly with the conversation, and its size is set by the number of
+      <em>key/value</em> heads — not query heads.</p>
+
+      <div class="eq">bytes  =  2 × n_layers × n_kv_heads × d_head × seq_len × bytes_per_element
+
+   2                  one K and one V
+   n_kv_heads         key/value heads per layer, the <i>G</i> of Section 4
+   d_head             the head dimension, d<sub>h</sub>
+   bytes_per_element  2 for FP16 (a 16-bit float is 2 bytes), 4 for FP32</div>
+
+      <p>Memorise that line. Nothing in it depends on the query heads, so decouple the two: many query
+      heads, few key/value heads, each group of queries sharing one pair. That is
+      <strong>grouped-query attention (<span class="term" data-term="gqa">GQA</span>)</strong>, the
+      default in almost every 2026 model. It sits between two extremes. <strong>Multi-head attention
+      (MHA)</strong> gives every query head its own key/value head, so <code>G = H</code>.
+      <strong>Multi-query attention (<span class="term" data-term="mqa">MQA</span>)</strong> shares one
+      across all of them, so <code>G = 1</code>.</p>
+
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Variant</th><th>Q heads</th><th>KV heads</th><th>Cache size</th><th>Quality</th></tr></thead>
+          <tbody>
+            <tr><td>MHA — multi-head</td><td class="num">H</td><td class="num">H</td><td class="num">1×</td><td>best</td></tr>
+            <tr><td>GQA — grouped-query</td><td class="num">H</td><td class="num">G</td><td class="num">G/H</td><td>close to MHA</td></tr>
+            <tr><td>MQA — multi-query</td><td class="num">H</td><td class="num">1</td><td class="num">1/H</td><td>noticeable drop</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <figure class="scene" data-scene="tf-gqa">
+        <div class="scene__head">
+          <span class="scene__badge">animation</span>
+          <span class="scene__title">32 query heads, 8 key/value heads, one quarter of the memory</span>
+        </div>
+        <div class="scene__stage">
+          <svg viewBox="0 0 900 300" role="img" aria-label="Thirty-two query heads first paired with thirty-two key value heads, then grouped onto eight, then onto one, with the KV cache size falling each time">
+            <g id="gq-plot"></g>
+          </svg>
+        </div>
+      </figure>
+
+      <p>Put real numbers on it. Llama 3.2 1B has 16 layers, head dimension 64, 32 query heads and 8
+      key/value heads, and stores its cache in FP16. Every factor below comes from that sentence:</p>
+
+      <div class="eq">2 (K and V) × 16 layers × 8 KV heads × 64 per head × 2 bytes
+  =  32,768 bytes  =  <b>32 KiB per token</b></div>
+
+      <p>An 8,192-token context therefore costs <code>8192 × 32 KiB</code> = <strong>256 MiB</strong>.
+      With plain multi-head attention it would store 32 KV heads instead of 8, four times as many.
+      That same context would then cost <strong>1 GiB</strong>, on top of the weights.</p>
+
+      <p>Gemma 4 E2B goes all the way to one KV head, true MQA, because it is built for a device.
+      PyTorch supports the sharing directly:
+      <code>F.scaled_dot_product_attention(..., enable_gqa=True)</code> repeats the key and value
+      heads internally, and requires <code>n_q_heads % n_kv_heads == 0</code>.</p>
+
+      <div class="code">
+        <div class="code__head"><span>attn_module.py</span><span class="lang">python</span></div>
+        <pre><code>import torch.nn as nn, torch.nn.functional as F
+
+class Attention(nn.Module):
+    def __init__(self, d, n_head, n_kv_head):
+        super().__init__()
+        self.nh, self.nkv, self.dh = n_head, n_kv_head, d // n_head
+        self.wq = nn.Linear(d, n_head    * self.dh, bias=False)
+        self.wk = nn.Linear(d, n_kv_head * self.dh, bias=False)
+        self.wv = nn.Linear(d, n_kv_head * self.dh, bias=False)
+        self.wo = nn.Linear(n_head * self.dh, d, bias=False)
+
+    def forward(self, x, cos, sin):
+        B, T, _ = x.shape
+        q = self.wq(x).view(B, T, self.nh,  self.dh).transpose(1, 2)
+        k = self.wk(x).view(B, T, self.nkv, self.dh).transpose(1, 2)
+        v = self.wv(x).view(B, T, self.nkv, self.dh).transpose(1, 2)
+        q, k = apply_rope(q, cos, sin), apply_rope(k, cos, sin)
+        o = F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=True)
+        return self.wo(o.transpose(1, 2).reshape(B, T, -1))</code></pre>
+      </div>
+
+      <div class="callout callout--pitfall">
+        <span class="callout__label">Common trap</span>
+        <p class="mt-0">Passing both <code>attn_mask</code> and <code>is_causal=True</code> to
+        <code>F.scaled_dot_product_attention</code> raises an error. Pick one. If you need padding
+        as well as causality, build the combined boolean mask yourself and pass it as
+        <code>attn_mask</code> with <code>is_causal=False</code>.</p>
+      </div>
+
+      <h2 id="block"><span class="h-num">03 · 6</span>The rest of the block</h2>
+
+      <p>Attention moves information <em>between</em> positions, but does no thinking within one — every
+      output is a weighted average of values. The second half of the block does that work, and holds
+      most of the parameters.</p>
+
+      <p>That second half is the feed-forward network, also written FFN. This course usually calls it
+      the <span class="term" data-term="mlp">MLP</span>, short for multi-layer perceptron. Classically
+      it is two matrices with a non-linear
+      <span class="term" data-term="activation">activation</span> between them:
+      <code>d → 4d → d</code>. Call that inner width <code>d_ff</code>, the number of neurons in the
+      middle. It is the only shape in a block not fixed to a multiple of <code>d</code>.</p>
+
+      <p>Modern models use <strong>SwiGLU</strong>: three matrices and a gate, written
+      <code>down( SiLU(gate(x)) * up(x) )</code>. Here <code>SiLU(z) = z · sigmoid(z)</code>, and
+      <code>sigmoid(z) = 1 / (1 + e<sup>−z</sup>)</code> is the S-curve that squashes any number into
+      0…1. So SiLU — sigmoid linear unit — leaves large positive values almost untouched and pushes
+      negative ones toward zero. The multiply lets one path decide how much of the other gets
+      through.</p>
+
+      <p>Three matrices instead of two means more parameters at the same <code>d_ff</code>. The
+      original SwiGLU papers kept the total fixed with <code>d_ff ≈ (2/3) · 4d</code>. Modern models
+      often do not bother — compare the <code>d_ff</code> column below with <code>4 · d_model</code>
+      — and accept a larger MLP.</p>
+
+      <p>Around both sub-layers sits the structure that makes depth possible.</p>
+
+      <figure class="scene" data-scene="tf-block">
+        <div class="scene__head">
+          <span class="scene__badge">animation</span>
+          <span class="scene__title">The residual stream is a highway; each sub-layer only edits it</span>
+        </div>
+        <div class="scene__stage">
+          <svg viewBox="0 0 900 320" role="img" aria-label="A horizontal residual stream with an attention branch above it and an MLP branch below, each reading a normalised copy and adding its result back">
+            <g id="bk-plot"></g>
+          </svg>
+        </div>
+      </figure>
+
+      <p>The line running through the block is the <strong>residual stream</strong>. Its shape is
+      <code>(B, T, d)</code> from the embedding to the final norm, and it is never replaced — only
+      added to. In Lesson 02 you watched gradients shrink through a chain of matrix multiplies. The
+      residual path has no matrix on it, so the gradient reaches layer 1 intact. That is the only
+      reason a 36-layer network trains at all. Normalisation then keeps the numbers on the stream in
+      a sane range.</p>
+
+      <div class="eq">LayerNorm(<i>x</i>) = <b>γ</b> · (<i>x</i> − mean) / √(var + ε) + <b>β</b>     2d parameters
+RMSNorm(<i>x</i>)   = <b>γ</b> · <i>x</i> / √( mean(<i>x</i>²) + ε )              d parameters
+
+   <b>γ</b>   a learned scale, one number per channel — d of them
+   <b>β</b>   a learned shift, one number per channel — d more
+   ε   a tiny constant, 1e-6, that stops a divide by zero. Not learned.</div>
+
+      <p>Now the counts are visible rather than asserted. LayerNorm learns <b>γ</b> and <b>β</b>, so
+      <code>2d</code>. RMSNorm drops the mean subtraction and keeps only <b>γ</b>, so <code>d</code>.
+      It is around 10–15% faster and works just as well. Every model in this lesson uses it, with
+      <code>rms_norm_eps = 1e-6</code>. Where the norm sits matters more than which norm you pick.</p>
+
+      <div class="compare">
+        <div class="compare__col compare__col--a">
+          <h4>Post-norm (2017)</h4>
+          <ul>
+            <li><code>x = Norm(x + sublayer(x))</code></li>
+            <li>The norm sits <em>on</em> the residual stream.</li>
+            <li>Will not train at all unless the learning rate is raised slowly from near zero over the
+                first few hundred steps — the warmup of Lesson 04.</li>
+            <li>Becomes unstable as depth grows.</li>
+          </ul>
+        </div>
+        <div class="compare__col compare__col--b">
+          <h4>Pre-norm (standard today)</h4>
+          <ul>
+            <li><code>x = x + sublayer(Norm(x))</code></li>
+            <li>The norm sits <em>inside</em> the branch.</li>
+            <li>The stream itself stays untouched, so gradients travel cleanly.</li>
+            <li>Trains at 30+ layers without tricks.</li>
+          </ul>
+        </div>
+      </div>
+
+      <div class="code">
+        <div class="code__head"><span>block.py</span><span class="lang">python</span></div>
+        <pre><code>import torch, torch.nn as nn, torch.nn.functional as F
+
+class RMSNorm(nn.Module):
+    def __init__(self, d, eps=1e-6):
+        super().__init__(); self.eps = eps
+        self.weight = nn.Parameter(torch.ones(d))
+    def forward(self, x):
+        return self.weight * x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+
+class SwiGLU(nn.Module):
+    def __init__(self, d, d_ff):
+        super().__init__()
+        self.gate = nn.Linear(d, d_ff, bias=False)
+        self.up   = nn.Linear(d, d_ff, bias=False)
+        self.down = nn.Linear(d_ff, d, bias=False)
+    def forward(self, x):
+        return self.down(F.silu(self.gate(x)) * self.up(x))
+
+class Block(nn.Module):                       # pre-norm decoder block
+    def __init__(self, d, n_head, n_kv_head, d_ff):
+        super().__init__()
+        self.n1, self.attn = RMSNorm(d), Attention(d, n_head, n_kv_head)
+        self.n2, self.mlp  = RMSNorm(d), SwiGLU(d, d_ff)
+    def forward(self, x, cos, sin):
+        x = x + self.attn(self.n1(x), cos, sin)   # edit the stream, never replace it
+        x = x + self.mlp(self.n2(x))
+        return x</code></pre>
+      </div>
+
+      <p>That block is stacked <code>n_layers</code> times with nothing between the copies. Everything
+      else — the embedding at the front, a final RMSNorm and the output head at the back — is a few
+      lines. Here is the shared 2026 recipe in practice:</p>
+
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Model</th><th>Layers</th><th>d_model</th><th>Q / KV heads</th><th>d_ff</th><th>Vocab</th></tr></thead>
+          <tbody>
+            <tr><td>Qwen3-0.6B</td><td class="num">28</td><td class="num">1024</td><td class="num">16 / 8</td><td class="num">3072</td><td class="num">151,936</td></tr>
+            <tr><td>Llama 3.2 1B</td><td class="num">16</td><td class="num">2048</td><td class="num">32 / 8</td><td class="num">8192</td><td class="num">128,256</td></tr>
+            <tr><td>Qwen3.5-2B</td><td class="num">24</td><td class="num">2048</td><td class="num">8 / 2</td><td class="num">6144</td><td class="num">248,320</td></tr>
+            <tr><td>Gemma 4 E2B</td><td class="num">35</td><td class="num">1536</td><td class="num">8 / 1</td><td class="num">6144</td><td class="num">262,144</td></tr>
+            <tr><td>SmolLM3-3B</td><td class="num">36</td><td class="num">2048</td><td class="num">16 / 4</td><td class="num">11008</td><td class="num">128,256</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>Five laboratories, one architecture: decoder-only, pre-norm, RMSNorm, RoPE, GQA or MQA, a gated
+      MLP, no biases, tied embeddings. The differences are in the numbers, not the shape.</p>
+
+      <h2 id="shapes"><span class="h-num">03 · 7</span>Encoder, decoder, and both</h2>
+
+      <p>"Transformer" names a family, and the masking separates its members.</p>
+
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Type</th><th>Mask</th><th>Trained to</th><th>Examples</th></tr></thead>
+          <tbody>
+            <tr><td>Encoder-only</td><td>none — every token sees every token</td><td>fill in hidden words</td><td>BERT, RoBERTa, ModernBERT, embedding models</td></tr>
+            <tr><td>Decoder-only</td><td>causal</td><td>predict the next token</td><td>GPT, Llama, Qwen, Gemma, Phi, SmolLM</td></tr>
+            <tr><td>Encoder-decoder</td><td>none in the encoder, causal plus cross-attention in the decoder</td><td>turn one sequence into another</td><td>T5 (text to text), Whisper (speech to text), NLLB (translation)</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>An encoder is better at <em>understanding</em> a fixed text, because every token has the full
+      context on both sides. It cannot generate, having already seen the answer. A decoder can, and
+      predicting the next token turns out to be rich enough to learn understanding as a side effect.
+      Cross-attention is ordinary attention with the queries from the decoder and the keys and values
+      from the encoder. You meet it again in Lesson 11, because Whisper is this shape.</p>
+
+      <p>Everything else in this course is decoder-only.</p>
+
+      <h2 id="counting"><span class="h-num">03 · 8</span>Counting a tiny GPT</h2>
+
+      <p>Every model on Hugging Face ships a <code>config.json</code>. Map its keys onto the letters of
+      Section 4 and you can predict the size before downloading a weight:</p>
+
+      <div class="code">
+        <div class="code__head"><span>config.json</span><span class="lang">json, annotated</span></div>
+        <pre><code>{
+  "hidden_size":          2048,     # d      the model width
+  "num_hidden_layers":      16,     # layers how many blocks are stacked
+  "num_attention_heads":    32,     # H      query heads
+  "num_key_value_heads":     8,     # G      key/value heads
+  "head_dim":               64,     # d_h    width of one head; 2048 / 32 agrees
+  "intermediate_size":    8192,     # d_ff   inner width of the MLP
+  "vocab_size":         128256,     # V      rows in the embedding table
+  "tie_word_embeddings":  true,     #        one matrix, not two
+  "rope_theta":         500000.0    #        the RoPE base of Section 3
+}</code></pre>
+      </div>
+
+      <p>That is Llama 3.2 1B. One warning before the arithmetic: <code>head_dim</code> is the head
+      width, and where a config lists it, it <strong>wins</strong> over <code>d / H</code>. Here the two
+      agree at 64. Qwen3-0.6B, in the table above, sets <code>head_dim</code> to 128 where
+      <code>d / H</code> would give 64. That is why it counts about 596 M parameters and is called
+      0.6B, not the 508 M that <code>d / H</code> predicts.</p>
+
+      <p>Per layer, no biases:</p>
+
+      <div class="eq">attn  =  d·(H·d_h)  +  2·d·(G·d_h)  +  (H·d_h)·d
+mlp   =  3·d·d_ff                       (gate, up, down)
+norm  =  2·d                            (two RMSNorms)</div>
+
+      <p>The three <code>attn</code> terms are <code>Wq</code>, then <code>Wk</code> and <code>Wv</code>
+      together, then <code>Wo</code>. Only the middle one uses <code>G</code> — which is exactly why
+      grouped queries shrink attention and leave the MLP alone. Then add <code>V·d</code> once for the
+      tied embedding and <code>d</code> for the final norm.</p>
+
+      <p>Work it on this lesson's project shape, with a small BPE vocabulary instead of characters.
+      <code>d = 384</code>, 6 layers, 6 heads, <code>d_h = 64</code>, <code>d_ff = 1024</code>,
+      <code>V = 8192</code>. Here <code>G = H = 6</code>, so attention collapses to
+      <code>4 · 384²</code>.</p>
+
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Piece</th><th>Arithmetic</th><th>Parameters</th></tr></thead>
+          <tbody>
+            <tr><td>Attention, one layer</td><td>4 · 384²</td><td class="num">589,824</td></tr>
+            <tr><td>SwiGLU MLP, one layer</td><td>3 · 384 · 1024</td><td class="num">1,179,648</td></tr>
+            <tr><td>Two RMSNorms</td><td>2 · 384</td><td class="num">768</td></tr>
+            <tr><td>One block</td><td>—</td><td class="num">1,770,240</td></tr>
+            <tr><td>Six blocks</td><td>6 × 1,770,240</td><td class="num">10,621,440</td></tr>
+            <tr><td>Tied embedding</td><td>8192 · 384</td><td class="num">3,145,728</td></tr>
+            <tr><td><strong>Total</strong></td><td>+ final norm</td><td class="num"><strong>13,767,552</strong></td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="code">
+        <div class="code__head"><span>count.py</span><span class="lang">python</span></div>
+        <pre><code>def gpt_params(d=384, n_layer=6, n_head=6, n_kv_head=6, d_ff=1024, vocab=8192):
+    d_h  = d // n_head
+    attn = d * (n_head * d_h) + 2 * d * (n_kv_head * d_h) + (n_head * d_h) * d
+    mlp  = 3 * d * d_ff
+    norm = 2 * d
+    per_layer = attn + mlp + norm
+    total = n_layer * per_layer + vocab * d + d      # tied embedding, final norm
+    return per_layer, total
+
+print(gpt_params())            # (1770240, 13767552)
+print(gpt_params(n_kv_head=2)) # GQA: fewer parameters and a 3x smaller KV cache</code></pre>
+      </div>
+
+      <p>Just under 14 million parameters, under 28 MB in FP16 at 2 bytes each. The project uses a
+      65-character vocabulary instead, so its embedding is <code>65 · 384 = 24,960</code> and the whole
+      model is about <strong>10.65 M</strong>. The blocks are identical; only the embedding changed.</p>
+
+      <p>Two consequences. First, in this model the MLP holds about twice as many parameters as
+      attention, so <code>d_ff</code> is the first knob for a smaller model. In a grouped-query model
+      the gap is far wider. Llama 3.2 1B has roughly 10.5 M attention parameters per layer against
+      50.3 M in the MLP, because <code>G = 8</code> shrinks attention and nothing shrinks the MLP.
+      Second, the embedding is 23% of this model: a small model with a large vocabulary spends most
+      of itself on a lookup.</p>
+
+      <div class="callout callout--note">
+        <span class="callout__label">How long the training will take</span>
+        <p class="mt-0">Training compute is about <code>6 × N_nonembedding × D_tokens</code> FLOPs. A
+        FLOP is one floating-point operation — one multiply or one add. The 6 is two operations
+        forward and four backward, per parameter per token. <code>N_nonembedding</code> is the
+        parameter count <em>without</em> the embedding table: 10.6 million here, not 13.8 million,
+        because a lookup does no arithmetic. Over 100 million tokens that is
+        <code>6 × 10.6e6 × 1e8 ≈ 6.4e15</code> FLOPs. A laptop GPU gives roughly 2 TFLOP/s — 2
+        trillion operations per second — so <code>6.4e15 / 2e12 ≈ 3,200 s</code>, under an hour. You
+        can genuinely train this yourself.</p>
+      </div>
+
+      <div class="project">
+        <span class="project__label">Project 03</span>
+        <h3>Write attention from scratch</h3>
+        <p>You are building <strong>the tiny GPT</strong>: the model you understand completely, every line
+        yours. Steps 1 to 3 are the deliverable; Lesson 04 trains it properly. Steps 4 to 6 are a
+        short Shakespeare run, so that you have something to break.</p>
+        <ol class="steps">
+          <li>Write <code>attention(q, k, v, causal)</code> as in Section 4. Compare it with
+              <code>F.scaled_dot_product_attention</code> using <code>torch.allclose</code>, first
+              with <code>causal=False</code>, then with the mask on.</li>
+          <li>Write <code>RMSNorm</code>, <code>SwiGLU</code> and <code>Block</code>. Assert that a
+              <code>(2, 16, 384)</code> tensor comes out with the same shape.</li>
+          <li>Add token embeddings, RoPE, six blocks, a final norm, and an output head tied to the
+              embedding. Print the parameter count and check it against your own arithmetic — with a
+              65-character vocabulary you should land near 10.65 M, as Section 8 reconciles.</li>
+          <li>Download <code>input.txt</code> from nanoGPT's Shakespeare-character example (1.1 MB, public
+              domain). Build a 65-entry character vocabulary: the tokenizer is one line of
+              <code>sorted(set(text))</code>.</li>
+          <li>Train with the loop from Lesson 01: <code>AdamW</code>, context 256, batch 64, about 5,000
+              steps. Shift the labels by one — <code>logits[:, :-1]</code> against
+              <code>input_ids[:, 1:]</code> — with <code>F.cross_entropy</code>.</li>
+          <li>Sample 500 characters and read them.</li>
+        </ol>
+        <p><strong>Then break it on purpose.</strong> Each fails in a different, informative way:</p>
+        <ul>
+          <li>Remove the <code>/ math.sqrt(d_head)</code>. Print the standard deviation of the scores and
+              the largest softmax weight in layer 1. How much slower does the loss fall?</li>
+          <li>Remove the causal mask. The training loss drops far below 1.48. Sample anyway, and explain
+              why the output is still useless.</li>
+          <li>Apply the mask <em>after</em> softmax. Print one row of the weights and check whether it
+              still sums to 1.</li>
+          <li>Set <code>n_kv_head=1</code>. Size the KV cache with the formula from Section 5, then compare
+              the sample quality.</li>
+        </ul>
+        <dl class="project__grid">
+          <div class="project__stat"><dt>Data</dt><dd>Shakespeare, 1.1 MB, 65-token character vocab</dd></div>
+          <div class="project__stat"><dt>Size</dt><dd>≈ 10.6 M parameters</dd></div>
+          <div class="project__stat"><dt>Time</dt><dd>≈ 10–20 min on Apple MPS, 5–8 min on a T4</dd></div>
+          <div class="project__stat"><dt>Target</dt><dd>validation loss ≈ 1.48</dd></div>
+        </dl>
+      </div>
+
+      <h2 id="check">Check yourself</h2>
+
+      <div class="check">
+        <p class="check__q">You increase the head dimension from 64 to 256 and forget to change the
+        scaling factor, leaving <code>/ sqrt(64)</code> in the code. What happens?</p>
+        <div class="check__opts">
+          <button class="check__opt">The output shapes stop matching and PyTorch raises an error</button>
+          <button class="check__opt" data-right>The scores get a wider spread, the softmax becomes almost one-hot, and gradients through attention nearly vanish</button>
+          <button class="check__opt">Attention becomes uniform over all positions</button>
+          <button class="check__opt">Nothing changes, because softmax is invariant to scaling</button>
+        </div>
+        <p class="check__why">The dot product of two <code>d_h</code>-dimensional vectors has standard
+        deviation <code>√d_h</code>, so at 256 the scores spread about twice as wide as the code
+        assumes. Softmax saturates, and a saturated softmax passes almost no gradient — the same effect
+        you met in Lesson 01 with a confident, correct classifier.</p>
+      </div>
+
+      <div class="check">
+        <p class="check__q">A model has 24 layers, 32 query heads, 8 key/value heads and a head
+        dimension of 128. You switch it from GQA to plain MHA and change nothing else. What happens to
+        the KV cache?</p>
+        <div class="check__opts">
+          <button class="check__opt">It stays the same — query heads do not enter the formula</button>
+          <button class="check__opt">It doubles</button>
+          <button class="check__opt" data-right>It becomes 4× larger</button>
+          <button class="check__opt">It becomes 32× larger</button>
+        </div>
+        <p class="check__why">Cache size is <code>2 × layers × kv_heads × d_head × tokens × bytes</code>.
+        Only <code>kv_heads</code> changes, from 8 to 32, so the cache grows by a factor of 4. The
+        number of query heads never appears in the formula.</p>
+      </div>
+
+      <div class="check">
+        <p class="check__q">Your causal model reaches a training loss of 0.4 in a few hundred steps,
+        far below anything you expected, but the text it generates is nonsense. What is the most likely
+        cause?</p>
+        <div class="check__opts">
+          <button class="check__opt">The learning rate is too high</button>
+          <button class="check__opt">The embedding table is too small</button>
+          <button class="check__opt" data-right>The causal mask is missing or wrong, so each position can read the token it is supposed to predict</button>
+          <button class="check__opt">You forgot the residual connections</button>
+        </div>
+        <p class="check__why">A loss that is far too good, far too fast, almost always means the model
+        can see the answer. Without the mask, position <code>t</code> attends to position
+        <code>t+1</code> during training. At generation time that token does not exist yet, so the
+        model has learned a task it can never perform.</p>
+      </div>
+
+      <div class="check">
+        <p class="check__q">A config reads <code>hidden_size 2048</code>,
+        <code>num_hidden_layers 28</code>, <code>num_attention_heads 16</code>,
+        <code>num_key_value_heads 8</code>, <code>head_dim 128</code>,
+        <code>intermediate_size 6144</code>, <code>vocab_size 151936</code>,
+        <code>tie_word_embeddings true</code>. Roughly how many parameters?</p>
+        <div class="check__opts">
+          <button class="check__opt">0.31 billion</button>
+          <button class="check__opt">1.37 billion</button>
+          <button class="check__opt" data-right>1.72 billion</button>
+          <button class="check__opt">2.03 billion</button>
+        </div>
+        <p class="check__why">Here <code>head_dim</code> and <code>d / H</code> agree at 128, so
+        attention is <code>2048·2048 + 2·2048·1024 + 2048·2048 = 12.58 M</code>. The MLP is
+        <code>3 · 2048 · 6144 = 37.75 M</code>, and the norms add 4,096. That is 50.34 M per layer, so
+        1,409 M over 28 layers. The tied embedding adds <code>151,936 · 2048 = 311 M</code>, giving
+        <strong>1,720,567,808</strong> — about 1.72 B. The wrong answers count the embedding twice
+        (2.03), forget the gate matrix (1.37), or read the embedding alone (0.31).</p>
+      </div>
+
+      <div class="check">
+        <p class="check__q">You swap a model's 32,000-entry tokenizer for a 262,144-entry one and
+        change nothing else. The width is <code>d = 1,536</code> and the embedding is tied. What have
+        you bought, and what has it cost?</p>
+        <div class="check__opts">
+          <button class="check__opt">Shorter sequences, and no cost at all — the table is tied, so it is stored once either way</button>
+          <button class="check__opt" data-right>Shorter sequences, but the tied table grows from about 49 M to about 403 M parameters — 354 M added</button>
+          <button class="check__opt">Longer sequences, because each token now covers less text</button>
+          <button class="check__opt">Shorter sequences, and attention cost rises with the square of the vocabulary</button>
+        </div>
+        <p class="check__why">The table is <code>V × d</code>: <code>32,000 · 1,536 = 49,152,000</code>
+        against <code>262,144 · 1,536 = 402,653,184</code>. Tying stores it once, and one copy is
+        already the whole cost. A wider vocabulary does cut tokens per sentence, which is the real win,
+        because attention grows with <code>T²</code>. <code>V</code> never enters attention's cost — it
+        enters the parameter count, which is why Gemma 4 E2B spends 403 M on a lookup.</p>
+      </div>
+
+      <div class="terms">
+        <span class="terms__label">Key words from this lesson</span>
+        <dl>
+          <dt>Tokenizer <span class="en">also: BPE, SentencePiece</span></dt>
+          <dd>A fixed dictionary splitting text into pieces, each mapped to an integer. Built before training, never learned by gradient descent.</dd>
+
+          <dt>d_model <span class="en">also: model width, hidden size</span></dt>
+          <dd>How many numbers describe one token inside the model. Nearly every shape here contains it.</dd>
+
+          <dt>d_ff <span class="en">also: intermediate size</span></dt>
+          <dd>The inner width of the feed-forward network — the one shape in a block not tied to d_model.</dd>
+
+          <dt>Query, key, value</dt>
+          <dd>Three vectors made from one token by three learned matrices: what it wants, what it offers, what it hands over.</dd>
+
+          <dt>Causal mask</dt>
+          <dd>Setting every future token's score to negative infinity before the softmax, so a position can never read ahead.</dd>
+
+          <dt>Head <span class="en">/hed/</span></dt>
+          <dd>One slice of the model width running its own attention. Several heads express several relations at once.</dd>
+
+          <dt>GQA <span class="en">grouped-query attention</span></dt>
+          <dd>Query heads sharing one key/value head, so the cache shrinks while quality stays close to multi-head attention (MHA). One shared head for all of them is MQA, multi-query attention.</dd>
+
+          <dt>RoPE <span class="en">rotary position embedding</span></dt>
+          <dd>Rotating pairs of numbers inside the query and key by an angle set by position, so the dot product depends only on the distance between two tokens.</dd>
+
+          <dt>RMSNorm</dt>
+          <dd>Dividing a vector by the root mean square of its entries, then scaling by one learned number per channel. Half of LayerNorm's parameters.</dd>
+
+          <dt>Residual stream</dt>
+          <dd>The vector running unchanged through every block, shape (B, T, d). Each sub-layer reads a copy and adds a result back.</dd>
+
+          <dt>SwiGLU</dt>
+          <dd>The gated feed-forward network of modern models: two matrices up, one a gate, one back down.</dd>
+        </dl>
+      </div>
+
+      <h2 id="resources">Go deeper</h2>
+
+      <div class="resources">
+        <a class="res" href="https://github.com/karpathy/nanoGPT" target="_blank" rel="noopener">
+          <span class="res__kind" data-kind="code">code</span>
+          <span class="res__body">
+            <span class="res__title">nanoGPT</span>
+            <span class="res__why">Everything above, in a few hundred readable lines. Read <code>model.py</code> after you have written your own version, not before.</span>
+          </span>
+        </a>
+        <a class="res" href="https://github.com/karpathy/nn-zero-to-hero" target="_blank" rel="noopener">
+          <span class="res__kind" data-kind="course">course</span>
+          <span class="res__body">
+            <span class="res__title">Neural Networks: Zero to Hero</span>
+            <span class="res__why">The "Let's build GPT" video builds this lesson live, with every shape printed. The best second pass if any part stayed abstract.</span>
+          </span>
+        </a>
+        <a class="res" href="https://d2l.ai/" target="_blank" rel="noopener">
+          <span class="res__kind" data-kind="course">course</span>
+          <span class="res__body">
+            <span class="res__title">Dive into Deep Learning</span>
+            <span class="res__why">The attention equations written out properly, with runnable code beside each one.</span>
+          </span>
+        </a>
+        <a class="res" href="https://huggingface.co/learn/llm-course/chapter1/1" target="_blank" rel="noopener">
+          <span class="res__kind" data-kind="course">course</span>
+          <span class="res__body">
+            <span class="res__title">Hugging Face LLM Course</span>
+            <span class="res__why">The same architecture from the library side, with tokenizers in much more depth.</span>
+          </span>
+        </a>
+        <a class="res" href="https://github.com/karpathy/nanochat" target="_blank" rel="noopener">
+          <span class="res__kind" data-kind="code">code</span>
+          <span class="res__body">
+            <span class="res__title">nanochat</span>
+            <span class="res__why">Tokenizer, pretraining, fine-tuning and inference in about 8,000 lines. Open it after Lesson 05, to see the whole pipeline in one repository.</span>
+          </span>
+        </a>
+      </div>
+
+      <div class="callout callout--try">
+        <span class="callout__label">Next</span>
+        <p class="mt-0">You can now build the model. <strong>Lesson 04</strong> trains this same block
+        for real: choosing data, watching the loss fall from <code>ln(V)</code>, adding the KV cache
+        whose size you can already predict, and picking how your model sounds. It rebuilds one size up
+        — eight blocks instead of six, and a trained 4,096-entry BPE tokenizer instead of 65 characters,
+        so 15.7 M parameters instead of 10.65 M. The block is the one you wrote here, unchanged. Its
+        starting loss is <code>ln(4,096) = 8.32</code>, not the 10.8 of Lesson 01, which was a
+        50,000-token vocabulary.</p>
+      </div>
+
+    </article>
+  </main>
+
+  <aside class="toc-rail"></aside>
+</div>
+
+<script src="../assets/js/vendor/gsap.min.js"></script>
+<script src="../assets/js/scene.js"></script>
+<script src="../assets/js/svgkit.js"></script>
+<script src="../data/lessons.js"></script>
+<script src="../data/glossary.js"></script>
+<script src="../assets/js/course.js"></script>
+<script src="../data/narration/03.js"></script>
+<script src="../data/narration/03.timing.js" onerror="void 0"></script>
+<script src="../assets/js/scenes/03.js"></script>
+<script src="../assets/js/film.js"></script>
+</body>
+</html>

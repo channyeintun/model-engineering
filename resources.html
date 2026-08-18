@@ -1,0 +1,161 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Reading list — Model Engineering</title>
+<meta name="description" content="The best free companion material for each part of the course, and which lesson each one belongs to.">
+<link rel="stylesheet" href="assets/css/course.css">
+</head>
+<body data-page="resources">
+
+<div class="shell shell--wide">
+  <nav class="rail" aria-label="Lessons"></nav>
+
+  <main class="main">
+    <article class="prose">
+
+      <header class="lesson-head">
+        <span class="eyebrow">reference</span>
+        <h1>Reading list</h1>
+        <p class="lead">This course is a path through a field that has no single textbook. These are
+        the resources worth your time, and — more usefully — <strong>when</strong> to read each one.
+        Opening the right thing at the wrong moment is how people give up.</p>
+      </header>
+
+      <div class="callout callout--note">
+        <span class="callout__label">How to use this page</span>
+        <p class="mt-0">Do not read these in parallel with the course. Finish a lesson, then open
+        the one resource listed for it if you want more depth. Everything here is free.</p>
+      </div>
+
+      <h2 id="foundations"><span class="h-num">read · 1</span>For Part I — Foundations</h2>
+
+      <div class="resources">
+        <a class="res" href="https://github.com/karpathy/nn-zero-to-hero" target="_blank" rel="noopener">
+          <span class="res__kind" data-kind="video">video</span>
+          <span class="res__body">
+            <span class="res__title">Karpathy — Neural Networks: Zero to Hero</span>
+            <span class="res__why">Lessons 01–03. Builds autograd, then a language model, from nothing. If you watch one thing on this page, watch this. Older than the rest of this list, and still the clearest.</span>
+          </span>
+        </a>
+        <a class="res" href="https://course.fast.ai/" target="_blank" rel="noopener">
+          <span class="res__kind" data-kind="course">course</span>
+          <span class="res__body">
+            <span class="res__title">fast.ai — Practical Deep Learning</span>
+            <span class="res__why">Lessons 01–02. Top-down and practical. Good if this course feels too bottom-up for you.</span>
+          </span>
+        </a>
+        <a class="res" href="https://d2l.ai/" target="_blank" rel="noopener">
+          <span class="res__kind" data-kind="course">course</span>
+          <span class="res__body">
+            <span class="res__title">Dive into Deep Learning</span>
+            <span class="res__why">Lessons 01–03, as a reference rather than a read-through. Go here when you want a formula written out exactly, with runnable code beside it.</span>
+          </span>
+        </a>
+        <a class="res" href="https://docs.pytorch.org/tutorials/beginner/basics/intro.html" target="_blank" rel="noopener">
+          <span class="res__kind" data-kind="docs">docs</span>
+          <span class="res__body">
+            <span class="res__title">PyTorch — Learn the Basics</span>
+            <span class="res__why">Lesson 01. Eight short pages, one sitting. The official version of this course's first lesson.</span>
+          </span>
+        </a>
+      </div>
+
+      <h2 id="language"><span class="h-num">read · 2</span>For Part II — Language models</h2>
+
+      <div class="resources">
+        <a class="res" href="https://github.com/karpathy/nanoGPT" target="_blank" rel="noopener">
+          <span class="res__kind" data-kind="code">code</span>
+          <span class="res__body">
+            <span class="res__title">nanoGPT</span>
+            <span class="res__why">Lessons 03–04. A complete, readable GPT training repository. Read <code>model.py</code> line by line after Lesson 03; it will all be familiar.</span>
+          </span>
+        </a>
+        <a class="res" href="https://github.com/karpathy/nanochat" target="_blank" rel="noopener">
+          <span class="res__kind" data-kind="code">code</span>
+          <span class="res__body">
+            <span class="res__title">nanochat</span>
+            <span class="res__why">Lessons 04–06, and a good model for the capstone. Tokenizer, pretraining, fine-tuning, inference and a web interface in about eight thousand lines. One <code>--depth</code> flag controls model size, and it runs on a single GPU or on Apple Silicon.</span>
+          </span>
+        </a>
+        <a class="res" href="https://huggingface.co/learn/llm-course/chapter1/1" target="_blank" rel="noopener">
+          <span class="res__kind" data-kind="course">course</span>
+          <span class="res__body">
+            <span class="res__title">Hugging Face LLM Course</span>
+            <span class="res__why">Lessons 04–06. The library-centred view: tokenizers, datasets, Trainer. Useful once you already know what is inside the model, which is the order this course puts them in.</span>
+          </span>
+        </a>
+        <a class="res" href="https://huggingface.co/learn/smol-course" target="_blank" rel="noopener">
+          <span class="res__kind" data-kind="course">course</span>
+          <span class="res__body">
+            <span class="res__title">Hugging Face smol-course</span>
+            <span class="res__why">Lessons 05–06. Focused entirely on fine-tuning small models — instruction tuning, preference alignment, evaluation. The closest thing to a companion for Part II.</span>
+          </span>
+        </a>
+      </div>
+
+      <h2 id="small"><span class="h-num">read · 3</span>For Parts III and IV — Making it small, shipping it</h2>
+
+      <div class="resources">
+        <a class="res" href="https://efficientml.ai/" target="_blank" rel="noopener">
+          <span class="res__kind" data-kind="course">course</span>
+          <span class="res__body">
+            <span class="res__title">MIT 6.5940 — EfficientML.ai (Song Han)</span>
+            <span class="res__why">Lessons 06–10, and the single best academic source for this half of the course. Pruning, quantization, distillation, neural architecture search and on-device deployment, taught properly. Lecture videos and slides are public.</span>
+          </span>
+        </a>
+        <a class="res" href="https://hanlab.mit.edu/courses/2024-fall-65940" target="_blank" rel="noopener">
+          <span class="res__kind" data-kind="course">course</span>
+          <span class="res__body">
+            <span class="res__title">EfficientML — Fall 2024 course page</span>
+            <span class="res__why">The most recent complete run with all materials posted. Use this if the main site points at a term that has not started.</span>
+          </span>
+        </a>
+      </div>
+
+      <h2 id="speech"><span class="h-num">read · 4</span>For Part V — Speech</h2>
+
+      <div class="resources">
+        <a class="res" href="https://huggingface.co/learn/audio-course/chapter0/introduction" target="_blank" rel="noopener">
+          <span class="res__kind" data-kind="course">course</span>
+          <span class="res__body">
+            <span class="res__title">Hugging Face Audio Course</span>
+            <span class="res__why">Lessons 11–12. Unit 5 is speech recognition, Unit 6 is speech synthesis. It is the right foundation for Part V — but note that it stops before Lesson 13: it does not cover full-duplex conversation, which is still closer to research than to a standard course module.</span>
+          </span>
+        </a>
+      </div>
+
+      <h2 id="honest">What this list does not have</h2>
+
+      <p>There is no single course for on-device model engineering. The material is split between
+      deep learning courses that stop before deployment, library documentation that assumes you
+      already know the theory, efficiency courses aimed at researchers, and runtime documentation
+      written for people who already chose the runtime.</p>
+
+      <p>That gap is the reason this course exists, and it is worth knowing that the gap is real
+      rather than assuming you have failed to find the obvious resource. You have not. It does not
+      exist yet.</p>
+
+      <div class="callout callout--try">
+        <span class="callout__label">Where to go next after the course</span>
+        <p class="mt-0">Follow the runtime you chose in Lesson 09 and read its release notes
+        regularly — ExecuTorch, ONNX Runtime, Core ML and llama.cpp all move quickly, and the
+        practical limits of what fits on a phone move with them. That is the part of this field
+        with no textbook at all, only changelogs.</p>
+      </div>
+
+    </article>
+  </main>
+
+  <aside class="toc-rail"></aside>
+</div>
+
+<script src="assets/js/vendor/gsap.min.js"></script>
+<script src="assets/js/scene.js"></script>
+<script src="assets/js/svgkit.js"></script>
+<script src="data/lessons.js"></script>
+<script src="data/glossary.js"></script>
+<script src="assets/js/course.js"></script>
+</body>
+</html>

@@ -1,0 +1,12 @@
+{
+  "name": "model-engineering-tools",
+  "private": true,
+  "type": "module",
+  "description": "Build tooling for the Model Engineering course site. The site itself is static and dependency-free; these deps are for offline narration synthesis only.",
+  "scripts": {
+    "synth": "node tools/synth.mjs"
+  },
+  "dependencies": {
+    "onnxruntime-node": "^1.23.0"
+  }
+}

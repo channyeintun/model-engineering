@@ -1,0 +1,8 @@
+# Generated narration artefacts. The audio is reproducible from
+# data/narration/*.js with tools/narrate.py, so it does not belong in git.
+.narration-cache/
+node_modules/
+
+# Your voice sample is personal. Keep it out of the repository.
+voice/
+myvoice.*

@@ -1,0 +1,918 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>06 · Distillation: teacher to student — Model Engineering</title>
+<meta name="description" content="A big model already knows the answer. Copy its confidence, not just its answers — and then delete the parts of a model that hardware can actually skip.">
+<link rel="stylesheet" href="../assets/css/course.css">
+</head>
+<body data-lesson="06">
+
+<div class="shell shell--wide">
+  <nav class="rail" aria-label="Lessons"></nav>
+
+  <main class="main">
+    <article class="prose">
+
+      <header class="lesson-head">
+        <span class="lesson-head__num">06</span>
+        <h1>Distillation: teacher to student</h1>
+        <p class="lead">A label tells a model one fact: the answer. A trained model asked the same
+        question tells you the answer <em>and</em> what it nearly said instead. That second part is
+        free, and it is worth more than the label.</p>
+        <div class="lesson-head__meta">
+          <span class="chip"><b>Part III</b> · Make it small</span>
+          <span class="chip">≈ <b>105 min</b> reading</span>
+          <span class="chip">Project · <b>Shrink a model 5x and keep its skill</b></span>
+          <span class="chip">Needs · <b>Lessons 01, 05</b></span>
+        </div>
+      </header>
+
+      <section class="outcomes">
+        <h2>By the end you can</h2>
+        <ul>
+          <li>Explain <strong>dark knowledge</strong>: what a soft target contains that a label does not.</li>
+          <li>Write the <strong>combined distillation loss</strong> from memory, including the <code>τ²</code> factor, and show on numbers why it is there.</li>
+          <li>Choose between <strong>logit</strong>, <strong>hidden-state</strong> and <strong>attention</strong> matching on purpose.</li>
+          <li>Say why <strong>on-policy distillation</strong> beats feeding the student the teacher's own text.</li>
+          <li>Predict which kind of <strong>pruning</strong> makes real hardware faster, and which only moves a number in a paper.</li>
+          <li>Recognise the cases where distillation is the <em>wrong</em> tool.</li>
+        </ul>
+      </section>
+
+      <h2 id="two-families"><span class="h-num">06 · 1</span>Two ways to make a model smaller</h2>
+
+      <p>Part III has three levers, and they are not the same lever. Lesson 07 changes the
+      <em>precision</em> of each number: 32 bits become 4, and the count stays the same. This lesson
+      changes <em>how many numbers there are</em>. There are two honest ways to do that.</p>
+
+      <p><strong>Distillation</strong> — in full, <strong>knowledge distillation (KD)</strong> —
+      trains a small model with a large model's help. You never shrink the large model. You build a
+      new small one and use the large one as a supervisor. <strong>Pruning</strong> goes the other
+      way: take the large model, delete parts of it, then repair the damage with more training.</p>
+
+      <p>In 2026 the strongest small models use both, in that order: prune a big parent into the
+      shape you want, then distil from the frozen parent to recover what the cut destroyed. This
+      lesson builds to that recipe.</p>
+
+      <div class="callout callout--note">
+        <span class="callout__label">Where this sits in the course</span>
+        <p class="mt-0">The model that reaches the phone is <strong>the one you fine-tuned in
+        Lesson 05</strong>. Lesson 07 quantizes it, Lesson 09 exports it, and in Lesson 13 it becomes
+        the offline voice assistant's brain. Distillation is not on that path. It is the lever you
+        reach for <em>after</em> quantization runs out — when 4-bit weights are still too slow, or
+        when you need a shape no open checkpoint gives you.</p>
+      </div>
+
+      <h2 id="dark-knowledge"><span class="h-num">06 · 2</span>Dark knowledge</h2>
+
+      <p>Here is the observation that makes
+      <span class="term" data-term="distillation">distillation</span> work. You show a model a
+      handwritten 7. The dataset label is the one-hot vector
+      <code>[0, 0, 0, 1, 0, 0, 0, 0, 0, 0]</code> — one entry set to 1, the rest 0. It says one
+      thing: class 7, probability 1, everything else impossible.</p>
+
+      <p>Now ask an already-trained model the same question. It answers with a full distribution:
+      0.93 on the 7, 0.06 on the 1, 0.004 on the 3, 0.0005 on the 8. Almost all the mass sits in the
+      same place, so this looks like the same information written less tidily. It is not. The teacher
+      has told you that <strong>a 7 resembles a 1 about a hundred times more than it resembles an
+      8</strong>. Nothing in the dataset ever says that.</p>
+
+      <figure class="scene" data-scene="kd-soft">
+        <div class="scene__head">
+          <span class="scene__badge">animation</span>
+          <span class="scene__title">One label, or a whole distribution</span>
+        </div>
+        <div class="scene__stage">
+          <svg viewBox="0 0 900 320" role="img" aria-label="A one-hot label beside a teacher's full probability distribution, redrawn on a log axis so the small non-zero bars become visible">
+            <g id="ds-plot"></g>
+          </svg>
+        </div>
+      </figure>
+
+      <p>That relative ordering across the <em>wrong</em> classes is called <strong>dark
+      knowledge</strong>. It describes how the teacher has organised the input space, and a one-hot
+      label contains none of it. Hinton, Vinyals and Dean named the effect in 2015 and it has not
+      been improved on since. Everything newer in this lesson is about <em>where</em> to apply it.</p>
+
+      <p>Be concrete about the size of the gain. A one-hot label over a 256,000-token vocabulary
+      carries about 18 bits — all it takes to name one option out of 256,000. The teacher's
+      distribution constrains all 256,000 numbers at once. Every example carries more signal, so the
+      student needs fewer. NVIDIA's Minitron derived 8B and 4B models from a 15B parent with
+      <strong>40× fewer training tokens per model</strong> than training from scratch.</p>
+
+      <div class="callout callout--key">
+        <span class="callout__label">Remember this</span>
+        <p class="mt-0">Four things make a distilled student beat the same student trained from
+        scratch. <strong>More signal per example</strong> — a distribution, not one bit.
+        <strong>Regularisation</strong> — the teacher's uncertainty stops the student becoming
+        over-confident. <strong>An easier landscape</strong> — the teacher's function is smoother
+        than raw data. <strong>Data efficiency</strong>, which follows from the first three.</p>
+      </div>
+
+      <h2 id="temperature"><span class="h-num">06 · 3</span>Temperature, and the τ² you must not forget</h2>
+
+      <p>There is a problem with using the teacher's distribution directly. Look at those numbers
+      again: 0.93, 0.06, 0.004, 0.0005. After
+      <span class="term" data-term="softmax">softmax</span> the gradient a 0.0005 carries is almost
+      nothing. The dark knowledge is there, but the optimizer barely feels it.</p>
+
+      <p>The fix is one division. Divide every logit by a number called the <strong>temperature</strong>
+      before the softmax. This course writes it <code>τ</code>, the Greek letter tau, because
+      <code>T</code> already means sequence length in Lessons 03 and 04. The code in this lesson
+      calls it <code>temp</code>.</p>
+
+      <div class="eq">q<sub>i</sub>  =  exp( <i>z</i><sub>i</sub> / τ )  /  Σ<sub>j</sub> exp( <i>z</i><sub>j</sub> / τ )
+
+   τ = 1   the ordinary softmax     τ &gt; 1   flatter, the tail becomes visible
+   τ → ∞   completely uniform       <i>z</i>   the raw logits, never changed</div>
+
+      <p>This is the temperature you met when sampling text, used for the opposite purpose. When
+      generating, you lower it to make the model decisive. When distilling, you raise it to make the
+      teacher <em>talkative</em> about its second and third choices.</p>
+
+      <figure class="scene" data-scene="kd-temp">
+        <div class="scene__head">
+          <span class="scene__badge">animation</span>
+          <span class="scene__title">The temperature dial: the same logits, four different lessons</span>
+        </div>
+        <div class="scene__stage">
+          <svg viewBox="0 0 900 300" role="img" aria-label="A dial moving from temperature 1 to temperature 10 while the same set of logits produces flatter and flatter probability bars">
+            <g id="tp-plot"></g>
+          </svg>
+        </div>
+      </figure>
+
+      <p>Typical values are <code>τ = 2</code> to <code>τ = 4</code> for classifiers. Language-model
+      recipes often leave <code>τ = 1</code>, because a 50,000-entry vocabulary already has a long
+      informative tail. Raise it anyway when the student is much smaller than the teacher, and the
+      tail is the thing you need it to copy. That is why the project below starts at
+      <code>τ = 2</code> on a language model. The first check question pushes to <code>τ = 4</code>,
+      where the factor you are about to meet is impossible to miss.</p>
+
+      <div class="callout callout--math">
+        <span class="callout__label">The maths, once</span>
+        <div class="eq"><b>L</b>  =  α · CE( student, label )   +   (1 − α) · τ² · KL( teacher ‖ student )
+
+   <b>L</b>    the loss                          α    how much you trust the hard label
+   CE   cross-entropy, from Lesson 01       τ    the temperature
+   KL   how far apart two distributions are
+
+   KL( p ‖ q )  =  Σ<sub>i</sub>  p<sub>i</sub> · ( log p<sub>i</sub> − log q<sub>i</sub> )
+
+   ‖    read "from". The distribution written <b>first</b> weights every term.
+   Σ<sub>i</sub>   add up over every class i</div>
+        <p>KL divergence is zero when two distributions are identical and grows as they separate.
+        Read the sum again. Every term is multiplied by <code>p</code>, the distribution written
+        <em>first</em>. Where <code>p</code> is large and <code>q</code> is small,
+        <code>log p − log q</code> blows up. Where <code>p</code> is near zero, the term contributes
+        almost nothing, whatever <code>q</code> does. Section 6 turns that into the difference
+        between a bland student and a sharp one.</p>
+        <p>Cross-entropy grades one number: the probability on the correct class. KL grades all of
+        them. And this <code>α</code> is a loss-mixing weight, not LoRA (low-rank adaptation)'s <code>α</code> from
+        Lesson 05, which scaled an adapter.</p>
+      </div>
+
+      <p>Now the part that is easy to skip and expensive to skip. Dividing the logits by
+      <code>τ</code> also divides that term's <span class="term" data-term="gradient">gradient</span>
+      by roughly <code>τ²</code>. Two effects cause it, and you can watch both. Take a teacher with
+      logits <code>[2.0, 0.0]</code> and a student saying nothing, logits <code>[0.0, 0.0]</code>.
+      The gradient reaching the student's first logit is
+      <code>(q_student − q_teacher) / τ</code>:</p>
+
+      <div class="eq">  τ     teacher q₁    student q₁    difference    gradient      vs above
+  ─────────────────────────────────────────────────────────────────────────────
+  1       0.881         0.500         −0.381       −0.381
+  2       0.731         0.500         −0.231       −0.116        3.3× smaller
+  4       0.622         0.500         −0.122       −0.031        3.8× smaller
+  8       0.562         0.500         −0.062       −0.008        3.9× smaller</div>
+
+      <p>Both effects are in that table. The <strong>difference</strong> column roughly halves each
+      time, because raising τ flattens the teacher toward the student. Dividing by τ halves it
+      again. Two factors of one-over-τ multiplied together: that is the <em>square</em>. The ratios
+      climb toward exactly 4 — 3.3, 3.8, 3.9 — because τ² is the limit for large τ, not an exact
+      identity.</p>
+
+      <p>Multiplying the KL term by <code>τ²</code> puts that gradient back. Here it is on three
+      classes. Teacher logits <code>[3.0, 1.0, 0.0]</code>, student logits
+      <code>[2.0, 1.5, 0.5]</code>, correct class first:</p>
+
+      <div class="eq">  τ = 2   teacher q = [0.629, 0.231, 0.140]   student q = [0.444, 0.346, 0.210]
+          KL = 0.0685     τ² · KL =  4 × 0.0685 = 0.274
+  τ = 4   teacher q = [0.481, 0.292, 0.227]   student q = [0.389, 0.343, 0.267]
+          KL = 0.0174     τ² · KL = 16 × 0.0174 = 0.278
+
+  CE against the label, untouched by τ                    = 0.604
+  <b>L</b> at α = 0.5, τ = 2   =  0.5 × 0.604 + 0.5 × 0.274   = 0.439
+  <b>L</b> at α = 0.5, τ = 4   =  0.5 × 0.604 + 0.5 × 0.278   = 0.441</div>
+
+      <p>There is the whole argument. Raw KL fell by a factor of 3.9, τ² multiplied it straight
+      back, and the total loss barely moved: 0.439 against 0.441.</p>
+
+      <div class="callout callout--pitfall">
+        <span class="callout__label">Common trap</span>
+        <p class="mt-0">A missing <code>τ²</code> does not crash and does not warn. It quietly
+        divides half your loss function by four. You raise <code>τ</code> hoping for more dark
+        knowledge, get a worse student, and conclude distillation does not work. Print both loss
+        terms every hundred steps. If KD sits an order of magnitude below CE, look here first.</p>
+      </div>
+
+      <h2 id="the-step"><span class="h-num">06 · 4</span>One training step, end to end</h2>
+
+      <p>The loop from Lesson 01 does not change. One extra forward pass goes in front of it.</p>
+
+      <figure class="scene" data-scene="kd-step">
+        <div class="scene__head">
+          <span class="scene__badge">animation</span>
+          <span class="scene__title">Two models forward, two losses, one number, one backward</span>
+        </div>
+        <div class="scene__stage">
+          <svg viewBox="0 0 900 340" role="img" aria-label="A batch entering a frozen teacher and a trainable student, producing a KL term and a cross-entropy term that combine into one loss, with the gradient returning only to the student">
+            <g id="st-plot"></g>
+          </svg>
+        </div>
+      </figure>
+
+      <p>The single number in that figure is the <code>0.439</code> you just computed. Three
+      preconditions produce it, and all three fail silently. The teacher must be in
+      <code>eval()</code> mode. Its parameters need <code>requires_grad_(False)</code> and its
+      forward pass must sit inside <code>torch.no_grad()</code>, or you build a tape for a model you
+      never update. And both models must share a tokenizer, because position 4,271 of the student's
+      logits has to mean the same token as the teacher's.</p>
+
+      <p>Three letters carry the shapes below, and in the figure above. <code>B</code> is the batch
+      size, <code>T</code> is the sequence length in tokens, and <code>V</code> is the vocabulary
+      size. So <code>(B, T, V)</code> is one probability distribution for every position in every
+      row of the batch.</p>
+
+      <div class="code">
+        <div class="code__head"><span>distill.py</span><span class="lang">python</span></div>
+        <pre><code>import torch
+import torch.nn.functional as F
+
+def distillation_step(student, teacher, batch, optimizer, temp=2.0, alpha=0.5):
+    input_ids, labels = batch["input_ids"], batch["labels"]   # (B, T)
+
+    with torch.no_grad():                                     # teacher: no tape
+        teacher_logits = teacher(input_ids=input_ids).logits   # (B, T, V)
+
+    out = student(input_ids=input_ids, labels=labels)
+    ce_loss, student_logits = out.loss, out.logits
+
+    s = student_logits[:, :-1, :]        # shift for next-token prediction
+    t = teacher_logits[:, :-1, :]
+    mask = (labels[:, 1:] != -100)       # ignore padding and prompt tokens
+
+    s_logp = F.log_softmax(s / temp, dim=-1)
+    t_logp = F.log_softmax(t / temp, dim=-1)
+
+    kd = F.kl_div(s_logp, t_logp, reduction="none", log_target=True).sum(-1)
+    kd_loss = (kd * mask).sum() / mask.sum().clamp(min=1) * (temp ** 2)
+
+    loss = alpha * ce_loss + (1.0 - alpha) * kd_loss
+    loss.backward()
+    torch.nn.utils.clip_grad_norm_(student.parameters(), 1.0)
+    optimizer.step()
+    optimizer.zero_grad(set_to_none=True)
+    return {"ce": ce_loss.item(), "kd": kd_loss.item()}</code></pre>
+      </div>
+
+      <p>Read the argument order of <code>F.kl_div</code> carefully, because it is backwards from
+      the name. <code>kl_div(input=student, target=teacher)</code> computes
+      <code>KL(teacher ‖ student)</code> — the <strong>forward</strong> direction. Swap the
+      arguments and you get reverse KL. That swap changes the character of the student, and section
+      6 shows exactly how, on numbers.</p>
+
+      <div class="callout callout--note">
+        <span class="callout__label">Worth knowing</span>
+        <p class="mt-0">The teacher's forward pass is pure cost, and you can pay it once instead of
+        once per epoch. Run the teacher over your dataset ahead of time and cache the
+        <strong>top-k</strong> <span class="term" data-term="logits">logits</span> per position.
+        k = 64 keeps almost all the useful mass, at a few hundred megabytes instead of a few hundred
+        gigabytes. Renormalise the cache into a distribution and treat it as the teacher. On a
+        laptop this decides whether you finish the run.</p>
+      </div>
+
+      <h2 id="what-to-match"><span class="h-num">06 · 5</span>What exactly gets matched</h2>
+
+      <p>Logits are not the only thing a student can copy. There are three levels, costing
+      different amounts of freedom.</p>
+
+      <div class="compare">
+        <div class="compare__col compare__col--a">
+          <h4>Logit distillation</h4>
+          <ul>
+            <li>Match the output distribution, nothing else.</li>
+            <li>The student's architecture is free — any depth, any width, even a different family.</li>
+            <li>One requirement: the same vocabulary.</li>
+            <li><strong>Start here. Always.</strong></li>
+          </ul>
+        </div>
+        <div class="compare__col compare__col--b">
+          <h4>Feature and attention matching</h4>
+          <ul>
+            <li>Also match hidden states, with a mean-squared-error (MSE) loss from Lesson 01, plus a learned projection if the widths differ.</li>
+            <li>Or match attention maps, called <strong>attention transfer</strong>.</li>
+            <li>Denser signal, faster convergence.</li>
+            <li>Costs freedom: attention transfer locks the student's head count and shape to the teacher's.</li>
+            <li>Every extra term adds a weight to tune.</li>
+          </ul>
+        </div>
+      </div>
+
+      <p>DistilBERT sits between the two, adding a <strong>cosine</strong> loss that aligns the
+      <em>direction</em> of the student's final hidden states with the teacher's. TinyBERT goes
+      further and distils embeddings, hidden states, attention maps and logits together.</p>
+
+      <p>The most useful architectural lesson here comes from speech. Distil-Whisper copied the
+      teacher's <strong>entire encoder and froze it</strong>, then kept only <strong>two decoder
+      layers</strong>. In an encoder-decoder speech model the encoder holds the knowledge and the
+      decoder is the latency. OpenAI shipped the same idea in <code>whisper-large-v3-turbo</code>.</p>
+
+      <p>Two benchmark names appear below. <strong>GLUE</strong> is a nine-task English
+      understanding benchmark scored 0 to 100, higher better. <strong>Word error rate</strong>
+      (<span class="term" data-term="wer">WER</span>) is the share of spoken words the model got
+      wrong, so <em>lower</em> is better — the one place here where a smaller number wins.</p>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>Model</th><th>How it was built</th><th>Size</th><th>Speed</th><th>Quality</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>DistilBERT</td>
+              <td>Kept 6 of BERT-base's 12 layers, one out of every two, as the initialisation</td>
+              <td class="num">66M vs 110M</td>
+              <td>410 s vs 668 s on CPU</td>
+              <td>GLUE macro 77.0 vs 79.5 (higher better)</td>
+            </tr>
+            <tr>
+              <td>distil-large-v3</td>
+              <td>Encoder copied and frozen; decoder cut to the first and last layer only</td>
+              <td class="num">756M vs 1550M</td>
+              <td class="num">6.3× faster</td>
+              <td>WER 9.7 vs 8.4 short-form; 10.8 vs 11.0 long-form (lower better)</td>
+            </tr>
+            <tr>
+              <td>whisper-large-v3-turbo</td>
+              <td>All 32 encoder layers kept; decoder 32 layers → 4</td>
+              <td class="num">809M vs 1550M</td>
+              <td>~8× faster than <code>large</code></td>
+              <td>99 languages</td>
+            </tr>
+            <tr>
+              <td>Nemotron-3-Nano-4B</td>
+              <td>Cut from a 9B parent: a small learned network scored each block, the weakest were removed, then distilled from the frozen parent</td>
+              <td>depth 56 → 42 layers</td>
+              <td>18 tok/s on a Jetson Orin Nano 8GB, about 2× the 9B</td>
+              <td>Claimed 100% median accuracy recovery</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>Two rows deserve a second look. Distil-large-v3 beats <em>its own teacher</em> on
+      long-form audio, because a shallow decoder repeats itself less: 10.8 against 11.0, lower wins.
+      And the Nemotron row is this lesson's recipe: prune first, distil second.</p>
+
+      <h2 id="generative"><span class="h-num">06 · 6</span>Generative models change the problem</h2>
+
+      <p>For a classifier, one input gives one distribution and you are done. For a model that
+      writes, one input gives a <em>sequence</em> of distributions, and each token the student
+      produces changes what it sees next. That difference creates three regimes.</p>
+
+      <p><strong>Sequence-level KD</strong> is the simplest, and most engineers have done it without
+      calling it distillation. Let the teacher generate the outputs, then run ordinary supervised
+      <span class="term" data-term="fine-tuning">fine-tuning</span> of the student on that text.
+      This is synthetic data. It is cheap and it works.</p>
+
+      <p><strong>Off-policy token-level KD</strong> is denser: feed the student the teacher's text
+      and match the full distribution at every position. A <em>policy</em> is a model's own
+      distribution over the next token, so off-policy means the training text came from someone
+      else's. More signal per token — but the student only learns in states the <em>teacher</em>
+      would visit. At inference it makes its first mistake, lands somewhere the teacher never went,
+      and has no idea what to do. That is <strong>exposure error</strong>, and it compounds.</p>
+
+      <p><strong>On-policy distillation</strong> removes the problem by construction. The
+      <em>student</em> generates, and the teacher grades every token of its own output. The student
+      trains in exactly the states it will meet.</p>
+
+      <div class="eq">loss<sub>t</sub>  =  KL( student(· | x<sub>1..t</sub>)  ‖  teacher(· | x<sub>1..t</sub>) )
+
+   sampled at states the <b>student</b> produced, not states the teacher produced</div>
+
+      <p>What one such step does:</p>
+
+      <div class="code">
+        <div class="code__head"><span>one on-policy step</span><span class="lang">text</span></div>
+        <pre><code>1. student samples its own completion from the prompt          -- no gradient
+2. re-run the student on prompt + completion, WITH gradient   -- student logits
+3. one teacher forward pass over that same fixed token sequence
+4. per-token reverse KL, summed over the completion, then backward()</code></pre>
+      </div>
+
+      <figure class="scene" data-scene="kd-onpolicy">
+        <div class="scene__head">
+          <span class="scene__badge">animation</span>
+          <span class="scene__title">The student writes, the teacher grades</span>
+        </div>
+        <div class="scene__stage">
+          <svg viewBox="0 0 900 300" role="img" aria-label="A prompt entering the student, which samples a completion; the frozen tokens then go through both the student with gradient and the teacher once, producing a per-token reverse KL whose gradient returns only to the student">
+            <g id="op-plot"></g>
+          </svg>
+        </div>
+      </figure>
+
+      <p>Step 1 answers the question every careful reader asks. Sampling is not differentiable, so
+      nothing differentiates through it. By step 2 the tokens are frozen data, like a batch read
+      from disk. That is why an on-policy step costs one training step plus one teacher forward
+      pass, and no more.</p>
+
+      <p>Note the direction: student first. That is <strong>reverse</strong> KL, and for a small
+      generative student it is the right choice. The reason is the weighting from section 3, so let
+      us cash it in on numbers.</p>
+
+      <p>A teacher likes two answers equally and dislikes a third:
+      <code>p = [0.495, 0.01, 0.495]</code>. A small student cannot commit to both. Compare a
+      <em>narrow</em> student <code>[0.98, 0.01, 0.01]</code> with a <em>hedging</em> one that splits
+      itself in three, <code>[1/3, 1/3, 1/3]</code>. Use the exact thirds, not 0.33, or your last
+      digit will not match:</p>
+
+      <div class="eq">                                        narrow student    hedging student
+  ────────────────────────────────────────────────────────────────────────
+  forward   KL( teacher ‖ student )           1.59              <b>0.36</b>
+  reverse   KL( student ‖ teacher )           <b>0.63</b>              0.91
+
+  each loss prefers the smaller number, shown in <b>bold</b></div>
+
+      <p>Forward KL is weighted by the teacher, so it charges the narrow student 1.59 for the mode
+      it abandoned. It would rather the student smear probability everywhere. That is
+      <em>mass-covering</em>, and it is why a much smaller student trained this way writes bland,
+      hedging text. Reverse KL is weighted by the student, so it only charges for probability the
+      student spends. The hedging student pays 0.91, charged for the third it spent on an answer the
+      teacher dislikes. That is <em>mode-seeking</em>: pick one mode, and be sure the teacher would
+      say it too.</p>
+
+      <p>The clearest evidence compares it against reinforcement learning, so here is what that
+      means. Let the model write a whole answer, check whether the final answer was right, and push
+      every token of it up or down together. One attempt is an <strong>episode</strong>, or a
+      <strong>rollout</strong>. It gives one bit of feedback — right or wrong — for hundreds of
+      tokens of work. AIME below is a US olympiad maths exam, scored as the percentage solved.</p>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>Qwen3-8B, same starting checkpoint</th><th>AIME'24</th><th>AIME'25</th><th>GPU hours</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>Off-policy distillation</td><td class="num">55.0</td><td class="num">42.8</td><td class="num">—</td></tr>
+            <tr><td>+ Reinforcement learning</td><td class="num">67.6</td><td class="num">55.5</td><td class="num">17,920</td></tr>
+            <tr><td>+ On-policy distillation</td><td class="num">74.4</td><td class="num">65.5</td><td class="num">1,800</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>A better result for roughly one tenth of the compute. The reason is not subtle. One bit per
+      episode is a very thin signal, and on-policy distillation gives one graded distribution per
+      <em>token</em> instead. The teacher also only runs a forward pass over text the student
+      already wrote, which is far cheaper than a rollout loop.</p>
+
+      <div class="code">
+        <div class="code__head"><span>on_policy.py</span><span class="lang">python</span></div>
+        <pre><code>from datasets import load_dataset
+from trl import DistillationTrainer          # stable since TRL v1.10.0
+
+dataset = load_dataset("trl-lib/ultrafeedback-prompt", split="train")
+
+trainer = DistillationTrainer(
+    model="Qwen/Qwen2.5-0.5B-Instruct",
+    teacher_model="Qwen/Qwen2.5-1.5B-Instruct",
+    train_dataset=dataset,
+)
+trainer.train()</code></pre>
+      </div>
+
+      <div class="callout callout--pitfall">
+        <span class="callout__label">The API moved</span>
+        <p class="mt-0">Tutorials older than 2026 import <code>GKDTrainer</code> from the top level
+        of <code>trl</code>. In v1.10.0 it lives in <code>trl.experimental.gkd</code>, and
+        <code>DistillationTrainer</code> is the stable on-policy path. In <code>GKDConfig</code>, two
+        knobs matter: <code>lmbda</code> (0 = off-policy, 1 = on-policy) and <code>beta</code>
+        (0 = forward KL, 1 = reverse KL). That <code>beta</code> picks a KL direction — it is not
+        DPO (direct preference optimization)'s <code>β</code> from Lesson 05, which set how far you drift from a reference model.</p>
+      </div>
+
+      <h3 id="when-not">When distillation is the wrong tool</h3>
+
+      <p>Be honest about this or you will waste a week. Apple and Oxford published distillation
+      scaling laws in 2025, and the findings are inconvenient in three ways.</p>
+
+      <p>First, the <strong>capacity gap</strong>: a <em>stronger</em> teacher can produce a
+      <em>worse</em> student. The student cannot represent the teacher's function, and cannot
+      optimise toward it either. Bigger teacher is not automatically better.</p>
+
+      <p>Second, distillation beats plain supervised training only up to a compute level that scales
+      with student size. Past that point, more data wins. Third, if you would have to <em>train the
+      teacher too</em> for one student, plain supervised learning is the better deal.</p>
+
+      <p>So distillation pays in two cases. One: the teacher already exists — after Lesson 05 you
+      have open-weights models that qualify. Two: you plan to make many students from one parent.</p>
+
+      <h2 id="pruning"><span class="h-num">06 · 7</span>Pruning: what actually gets faster</h2>
+
+      <p>Now the other family. <span class="term" data-term="pruning">Pruning</span> deletes weights
+      and repairs the damage. The most important distinction is <em>what shape</em> you delete
+      in.</p>
+
+      <p><strong>Unstructured pruning</strong> zeroes individual weights, anywhere in the tensor. It
+      gives the best accuracy per weight removed, because you remove exactly the least useful ones.
+      It also, on ordinary hardware, gives no speed-up at all.</p>
+
+      <figure class="scene" data-scene="kd-unstruct">
+        <div class="scene__head">
+          <span class="scene__badge">animation</span>
+          <span class="scene__title">Half the weights are zero, and nothing got faster</span>
+        </div>
+        <div class="scene__stage">
+          <svg viewBox="0 0 900 320" role="img" aria-label="A weight matrix with half its cells set to zero, beside four meters: weights zeroed climbs to 50 per cent, while bytes read per token, time per token and file size on disk all stay at 1.00 times">
+            <g id="up-plot"></g>
+          </svg>
+        </div>
+      </figure>
+
+      <p>The reason is the last step of that animation. The tensor still has the same shape. A dense
+      matrix multiply still multiplies by every zero, and the memory system still reads every zero.
+      You get a smaller <em>file</em> only in a sparse storage format. Then you need a kernel for
+      that format, which on a phone CPU or a browser usually does not exist. Say it plainly:
+      <strong>unstructured sparsity is a research metric; structured sparsity is a product
+      decision.</strong></p>
+
+      <div class="code">
+        <div class="code__head"><span>prune_demo.py</span><span class="lang">python</span></div>
+        <pre><code>import torch.nn.utils.prune as prune
+
+prune.l1_unstructured(layer, name="weight", amount=0.3)   # 30% smallest |w| -> 0
+prune.ln_structured(layer, name="weight", amount=0.5, n=2, dim=0)  # drop half the rows
+
+prune.global_unstructured(                                # one threshold across layers
+    parameters_to_prune, pruning_method=prune.L1Unstructured, amount=0.2
+)
+
+prune.remove(layer, "weight")   # bake the mask in, delete weight_orig / weight_mask</code></pre>
+      </div>
+
+      <div class="callout callout--pitfall">
+        <span class="callout__label">Common trap</span>
+        <p class="mt-0">Between <code>prune.l1_unstructured</code> and <code>prune.remove</code>,
+        the module holds <code>weight_orig</code>, <code>weight_mask</code> and a forward pre-hook
+        multiplying them on every call. Your model is now <strong>bigger and slower</strong> than
+        before you pruned it. And <code>prune.remove</code> only makes the zeros permanent. It never
+        changes the shape, so it never makes anything faster.</p>
+      </div>
+
+      <p>Magnitude — rank by <code>|w|</code>, zero the smallest — is the baseline, and for language
+      models it is the wrong score. Transformer activations contain enormous outlier features, so a
+      small weight meeting a huge activation still matters. Wanda scores each weight as
+      <code>|w| × ‖x‖</code>: weight magnitude times the norm of the input reaching it. The strong
+      baseline it is measured against, SparseGPT, instead solves for the second-derivative matrix of
+      the loss — the <strong>Hessian</strong> — and then adjusts the surviving weights to compensate.
+      Accurate, but expensive. Wanda does neither. It only ranks, never solves and never updates a
+      weight, which is why it runs 5–10× faster on 70B models while scoring about the same. This is
+      the same outlier problem that makes activation
+      <span class="term" data-term="quantization">quantization</span> difficult in Lesson 07.</p>
+
+      <p><strong>Structured pruning</strong> removes whole units instead: attention heads,
+      feed-forward network (FFN) channels — the block Lesson 03 calls the
+      <span class="term" data-term="mlp">multi-layer perceptron (MLP)</span> — or entire transformer
+      blocks. The tensors get
+      physically smaller, so every runtime gets faster with no special kernel and no sparse
+      format.</p>
+
+      <figure class="scene" data-scene="kd-struct">
+        <div class="scene__head">
+          <span class="scene__badge">animation</span>
+          <span class="scene__title">Remove whole rows, and the shape itself changes</span>
+        </div>
+        <div class="scene__stage">
+          <svg viewBox="0 0 900 300" role="img" aria-label="Rows scored by importance, the three weakest deleted, the matrix shrinking, and a task score that drops and then recovers after healing">
+            <g id="sp-plot"></g>
+          </svg>
+        </div>
+      </figure>
+
+      <p>Two directions exist. <strong>Width pruning</strong> shrinks hidden size, head count and FFN
+      size: Llama-3.1-Minitron-4B-Width cut hidden 4096 → 3072 and the FFN 14336 → 9216.
+      <strong>Depth pruning</strong> deletes whole blocks. Depth is easier to implement and gives
+      the best latency per parameter, because there are fewer sequential steps to wait for.
+      Llama-3.1-Minitron-4B-Depth reached <strong>2.7× the throughput</strong> of Llama 3.1 8B. At
+      equal size it is usually worse than width pruning. Minitron's practical finding is worth
+      copying: choose the layers to drop by measuring <em>downstream task accuracy</em>, not
+      validation loss.</p>
+
+      <p>Nobody prunes in one shot. The real recipe iterates:</p>
+
+      <div class="code">
+        <div class="code__head"><span>the recipe</span><span class="lang">text</span></div>
+        <pre><code>for round in 1..K:
+    estimate importance on a small calibration set   (activations, not just |w|)
+    remove a small slice                             (5-10% of width, or 2 layers)
+    heal: keep training the child, with the UNPRUNED parent as the teacher</code></pre>
+      </div>
+
+      <p>A <strong>calibration set</strong> is a few hundred unlabelled examples from your own
+      domain, run through the model once with hooks recording the input size <code>‖x‖</code> at
+      each layer. It never trains anything. It only tells you which rows see large inputs, which is
+      what turns <code>|w|</code> into <code>|w| × ‖x‖</code>. Lesson 07 uses the same trick for
+      quantization.</p>
+
+      <p>The last line is where the accuracy comes back. Minitron's healing phase uses forward KL on
+      logits <em>only</em>: the cross-entropy term against ground-truth labels is dropped. In the
+      notation of section 3 that is <code>alpha = 0</code>.</p>
+
+      <h2 id="sparsity"><span class="h-num">06 · 8</span>2:4 sparsity, where hardware meets pruning</h2>
+
+      <p>There is a middle ground, and it exists because silicon designers made it exist.
+      <strong>2:4 sparsity</strong> says: in every group of four weights, exactly two must be zero.
+      Fifty percent sparsity, in a completely predictable layout.</p>
+
+      <figure class="scene" data-scene="kd-24">
+        <div class="scene__head">
+          <span class="scene__badge">animation</span>
+          <span class="scene__title">Two kept out of every four, and what that really buys</span>
+        </div>
+        <div class="scene__stage">
+          <svg viewBox="0 0 900 280" role="img" aria-label="Groups of four weights with two kept in each, stored as values plus a two-bit index, beside bars comparing theoretical and measured speed-ups">
+            <g id="nm-plot"></g>
+          </svg>
+        </div>
+      </figure>
+
+      <p>Predictability is the whole point. NVIDIA Ampere and later chips have sparse tensor cores
+      that read a 2-bit index per kept element and skip the rest, doubling peak arithmetic
+      throughput. What you measure is smaller than the datasheet promises. The last row below comes
+      from sparse-GEMM papers — GEMM is general matrix multiply, the operation that dominates a
+      transformer's arithmetic.</p>
+
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Measurement</th><th>Speed-up</th><th>Where it comes from</th></tr></thead>
+          <tbody>
+            <tr><td>Theoretical peak</td><td class="num">2.00×</td><td>Ampere sparse tensor cores</td></tr>
+            <tr><td>BERT-Large SQuAD, batch 16, A100</td><td class="num">1.23×</td><td>PyTorch's own 2:4 tutorial</td></tr>
+            <tr><td>Llama-2-7B end to end, TensorRT-LLM, H800</td><td class="num">1.40–1.44×</td><td>2026 sparse-GEMM papers</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>So 1.2× to 1.45× is the honest range, and only when the batch or prompt is long enough to
+      pay for the sparse kernel launch. That means prefill and batch serving. Single-user generation
+      on a device is <span class="term" data-term="memory bound">memory-bound</span>, as Lesson 08
+      measures. 2:4 does cut the bytes moved, but quantization is the better trade: it saves more
+      bytes for the same accuracy you put at risk.</p>
+
+      <p>Accuracy holds up if you fine-tune afterwards. PyTorch's tutorial measures its 2:4
+      BERT-Large on SQuAD, a reading-comprehension set. F1 grades partial overlap with the right
+      answer span; exact match demands the identical string. Both run 0–100, higher better. F1 goes
+      86.93 → 86.49 and exact match 78.53 → 78.44: a real loss, but a small one.</p>
+
+      <p>Know the constraints before planning around it: CUDA only, 2-D tensors only, dtype fp32,
+      fp16, bf16 or int8. There is nothing here for an Apple Silicon laptop.</p>
+
+      <div class="code">
+        <div class="code__head"><span>semi_structured.py</span><span class="lang">python</span></div>
+        <pre><code>from torch.sparse import to_sparse_semi_structured, SparseSemiStructuredTensor
+from torch.ao.pruning import WeightNormSparsifier
+
+SparseSemiStructuredTensor._FORCE_CUTLASS = True
+
+sparsifier = WeightNormSparsifier(
+    sparsity_level=1.0,          # apply to every block
+    sparse_block_shape=(1, 4),   # groups of 4 along the row
+    zeros_per_block=2,           # -> 2:4
+)
+sparsifier.prepare(model, config=[{"tensor_fqn": f"{fqn}.weight"} for fqn in linear_fqns])
+sparsifier.step()          # compute the masks
+sparsifier.squash_mask()   # bake them in
+# ... fine-tune here to recover accuracy ...
+layer.weight = torch.nn.Parameter(to_sparse_semi_structured(layer.weight))</code></pre>
+      </div>
+
+      <div class="project">
+        <span class="project__label">Project 06</span>
+        <h3>Shrink a model 5x and keep its skill</h3>
+        <p>Distil <code>HuggingFaceTB/SmolLM2-360M-Instruct</code> — the model you fine-tuned in
+        Lesson 05 — into <code>HuggingFaceTB/SmolLM2-135M</code>, on the same task and dataset. Then
+        measure honestly what you gained. The headline is not the training run. It is the
+        measurement table at the end, and one uncomfortable number in it.</p>
+        <ol class="steps">
+          <li>Load both models with <code>dtype="auto"</code>. Put the teacher in <code>eval()</code>
+              and call <code>teacher.requires_grad_(False)</code>.</li>
+          <li><strong>Assert the tokenizers match</strong> first:
+              <code>assert teacher_tok.get_vocab() == student_tok.get_vocab()</code>. A failed
+              assertion here is much cheaper than a meaningless loss curve.</li>
+          <li>Run the teacher once over your dataset and cache its <strong>top-64 logits</strong> per
+              position to disk. Training now reads the cache, not the teacher.</li>
+          <li>Write <code>distillation_step</code> from section 4. Start at <code>temp = 2</code>,
+              <code>alpha = 0.5</code>. Log <code>ce</code> and <code>kd</code> separately.</li>
+          <li>Train about 500 steps as a <strong>full fine-tune, no adapters</strong>: AdamW at
+              <code>1e-5</code>, effective batch 16, bf16. That is the full fine-tune row of Lesson
+              05's table, ten times below the <code>1e-4</code> you used for LoRA. Every weight
+              moves here, so every weight needs a smaller step. Train a second student on
+              cross-entropy alone as the control, with identical settings.</li>
+          <li>Measure four things for teacher, student and control: parameter count, file size,
+              tokens per second, and score on your held-out set.</li>
+        </ol>
+        <p><strong>Then look for the uncomfortable number.</strong> 360M to 135M is 2.7× fewer
+        parameters, not 5×. Print the embedding table's parameter count separately from the
+        transformer blocks. For a small model with a large vocabulary that table is a large share of
+        everything, and it does not shrink when you cut layers. The rest of the factor comes from
+        Lesson 07: 360M in bf16 (two bytes a number) is about 720 MB, and 135M in int8 (one byte)
+        is about 135 MB. 720 ÷ 135 is a little over 5.</p>
+        <p><strong>Then break it on purpose.</strong> Each of these fails quietly, which is the point:</p>
+        <ul>
+          <li>Delete the <code>* (temp ** 2)</code> and set <code>temp = 4</code>. Predict the new
+              <code>kd</code> value before you look. Does the student get worse?</li>
+          <li>Set <code>alpha = 1.0</code> (labels only), then <code>alpha = 0.0</code> (teacher
+              only, Minitron's setting). Which is better on your task?</li>
+          <li>Swap the two arguments to <code>F.kl_div</code> for reverse KL. Read twenty samples
+              from each. Is one blander and one sharper?</li>
+          <li>Apply <code>prune.l1_unstructured(amount=0.5)</code> to every <code>nn.Linear</code> in
+              the student, then measure tokens per second. Predict the result first.</li>
+        </ul>
+        <dl class="project__grid">
+          <div class="project__stat"><dt>Data</dt><dd>Your Lesson 05 set, or a <code>smoltalk</code> subset</dd></div>
+          <div class="project__stat"><dt>Size</dt><dd>360M teacher → 135M student</dd></div>
+          <div class="project__stat"><dt>Time</dt><dd>≈ 30–45 min on a free T4, longer on a Mac</dd></div>
+          <div class="project__stat"><dt>Target</dt><dd>Beat the control student, and explain every row of your table</dd></div>
+        </dl>
+      </div>
+
+      <h2 id="check">Check yourself</h2>
+
+      <div class="check">
+        <p class="check__q">Your log shows <code>ce = 2.10</code> and <code>kd = 0.04</code> at
+        <code>temp = 4</code>. What is broken, and what should <code>kd</code> become?</p>
+        <div class="check__opts">
+          <button class="check__opt">The CE term; it should fall to about 0.13</button>
+          <button class="check__opt" data-right>The KD term is missing its <code>τ²</code> factor; it should become about 0.64</button>
+          <button class="check__opt">The KD term is missing its <code>τ²</code> factor; it should become about 0.16</button>
+          <button class="check__opt">Nothing is broken; a small KD term means the student already matches the teacher</button>
+        </div>
+        <p class="check__why">At <code>τ = 4</code> the factor is <code>τ² = 16</code>, and
+        0.04 × 16 = 0.64. The two terms are then within a factor of about three, which is what you
+        want. A KD term an order of magnitude below CE is the signature of the missing factor.</p>
+      </div>
+
+      <div class="check">
+        <p class="check__q">You need a real speed-up from your model on a <strong>phone CPU</strong>.
+        Which of these delivers one?</p>
+        <div class="check__opts">
+          <button class="check__opt"><code>prune.l1_unstructured</code> at 50%, then <code>prune.remove</code></button>
+          <button class="check__opt">2:4 semi-structured sparsity, then fine-tune to recover</button>
+          <button class="check__opt" data-right>Drop 30% of the feed-forward channels, then heal against the unpruned parent</button>
+          <button class="check__opt"><code>prune.global_unstructured</code> at 30% across every layer</button>
+        </div>
+        <p class="check__why">Only structured pruning changes tensor shapes, which is the one thing
+        every runtime feels. Both unstructured options change values, not shapes. 2:4 needs sparse
+        tensor cores and is CUDA only, so on a phone it buys nothing at all.</p>
+      </div>
+
+      <div class="check">
+        <p class="check__q">A teacher's distribution over three answers is
+        <code>[0.495, 0.01, 0.495]</code>. Your 0.5B student can only commit to one. Trained with
+        <strong>forward</strong> KL, which student does the loss reward, and what does its text
+        look like?</p>
+        <div class="check__opts">
+          <button class="check__opt">The narrow student <code>[0.98, 0.01, 0.01]</code>: sharp, confident text</button>
+          <button class="check__opt" data-right>The hedging student <code>[1/3, 1/3, 1/3]</code>: fluent but vague text</button>
+          <button class="check__opt">Neither; both score identically because KL is symmetric</button>
+          <button class="check__opt">The narrow student, but only above temperature 2</button>
+        </div>
+        <p class="check__why">Forward KL weights every term by the <em>teacher</em>. The narrow
+        student scores 1.59 for the mode it abandoned; the hedging one scores 0.36. Reverse KL flips
+        it — 0.63 against 0.91 — which is why small generative students are trained student-first.</p>
+      </div>
+
+      <div class="check">
+        <p class="check__q">You distil a 70B teacher into a 0.5B student, and it scores
+        <em>below</em> the same student trained on plain labels. What do you change first?</p>
+        <div class="check__opts">
+          <button class="check__opt">Exposure error; switch to sequence-level KD</button>
+          <button class="check__opt">The tokenizers disagree; re-run the vocabulary assertion</button>
+          <button class="check__opt" data-right>The capacity gap; distil from a mid-size teacher instead</button>
+          <button class="check__opt">The learning rate is too low; raise it and train longer</button>
+        </div>
+        <p class="check__why">A student that cannot represent the teacher's function cannot optimise
+        toward it either, so a stronger teacher can make it worse. The scaling-laws fix is an
+        intermediate teacher between the two sizes.</p>
+      </div>
+
+      <div class="terms">
+        <span class="terms__label">Key words from this lesson</span>
+        <dl>
+          <dt>Teacher and student</dt>
+          <dd>The large model that supervises, and the small one being trained. The teacher never learns anything.</dd>
+
+          <dt>Soft target <span class="en">also: soft label</span></dt>
+          <dd>The teacher's full probability vector for one input, used beside or instead of the one-hot label.</dd>
+
+          <dt>Dark knowledge</dt>
+          <dd>The ordering the teacher gives the wrong answers: which mistakes are near-misses, and which are absurd.</dd>
+
+          <dt>Temperature <span class="en">written τ, tau</span></dt>
+          <dd>A number you divide the logits by before softmax. Larger values flatten the distribution and make the tail visible.</dd>
+
+          <dt>KL divergence</dt>
+          <dd>How far one distribution is from another. Zero when identical. The distribution written first weights the sum.</dd>
+
+          <dt>Reverse KL <span class="en">also: mode-seeking</span></dt>
+          <dd>The student written first, so only probability the student spends is charged for. It lets a small student be narrow but sharp.</dd>
+
+          <dt>Exposure error</dt>
+          <dd>A model trained only on somebody else's text has never seen the states its own mistakes lead to.</dd>
+
+          <dt>On-policy distillation</dt>
+          <dd>The student generates the text and the teacher grades every token of it. Removes exposure error by construction.</dd>
+
+          <dt>Capacity gap</dt>
+          <dd>A teacher too strong for the student to imitate. Past a point, a bigger teacher makes a worse student.</dd>
+
+          <dt>Structured pruning</dt>
+          <dd>Deleting whole rows, heads, channels or layers, so the shapes shrink and every runtime gets faster.</dd>
+
+          <dt>Healing <span class="en">also: recovery training</span></dt>
+          <dd>Training a pruned model further with the unpruned parent as its teacher. Most of the lost accuracy returns here.</dd>
+        </dl>
+      </div>
+
+      <h2 id="resources">Go deeper</h2>
+
+      <div class="resources">
+        <a class="res" href="https://arxiv.org/abs/1503.02531" target="_blank" rel="noopener">
+          <span class="res__kind" data-kind="paper">paper</span>
+          <span class="res__body">
+            <span class="res__title">Hinton, Vinyals, Dean — Distilling the Knowledge in a Neural Network</span>
+            <span class="res__why">Nine pages, and every idea in sections 2 to 4 is in them. Read it once you have written the training step.</span>
+          </span>
+        </a>
+        <a class="res" href="https://arxiv.org/abs/2502.08606" target="_blank" rel="noopener">
+          <span class="res__kind" data-kind="paper">paper</span>
+          <span class="res__body">
+            <span class="res__title">Distillation Scaling Laws</span>
+            <span class="res__why">The honest counterweight, especially the capacity-gap result. Read it before you commit a week of compute.</span>
+          </span>
+        </a>
+        <a class="res" href="https://github.com/huggingface/distil-whisper" target="_blank" rel="noopener">
+          <span class="res__kind" data-kind="code">code</span>
+          <span class="res__body">
+            <span class="res__title">distil-whisper</span>
+            <span class="res__why">A complete, readable distillation codebase, pseudo-labels included.</span>
+          </span>
+        </a>
+        <a class="res" href="https://hanlab.mit.edu/courses/2024-fall-65940" target="_blank" rel="noopener">
+          <span class="res__kind" data-kind="course">course</span>
+          <span class="res__body">
+            <span class="res__title">MIT 6.5940 — TinyML and Efficient Deep Learning</span>
+            <span class="res__why">Slides and videos on pruning and sparsity, with the derivations this lesson skipped.</span>
+          </span>
+        </a>
+        <a class="res" href="https://huggingface.co/learn/smol-course" target="_blank" rel="noopener">
+          <span class="res__kind" data-kind="course">course</span>
+          <span class="res__body">
+            <span class="res__title">Hugging Face smol-course</span>
+            <span class="res__why">The practical companion to the project: current TRL APIs, models that fit on your machine.</span>
+          </span>
+        </a>
+      </div>
+
+      <div class="callout callout--try">
+        <span class="callout__label">Next</span>
+        <p class="mt-0">Your student has fewer numbers, and the project showed that fewer numbers
+        alone reached only 2.7×. The rest came from the other axis: one byte a weight instead of two.
+        Halving the bytes doubles the 2.7×, and 720 MB ÷ 135 MB lands a little over 5.
+        <strong>Lesson 07</strong> owns that axis properly and
+        pushes it much further, taking the same count of weights from 32 bits down to 4. It is also
+        the step that turns your Lesson 05 model into the roughly 200 MB brain the offline voice
+        assistant of Lesson 13 must fit.</p>
+      </div>
+
+    </article>
+  </main>
+
+  <aside class="toc-rail"></aside>
+</div>
+
+<script src="../assets/js/vendor/gsap.min.js"></script>
+<script src="../assets/js/scene.js"></script>
+<script src="../assets/js/svgkit.js"></script>
+<script src="../data/lessons.js"></script>
+<script src="../data/glossary.js"></script>
+<script src="../assets/js/course.js"></script>
+<script src="../data/narration/06.js"></script>
+<script src="../data/narration/06.timing.js" onerror="void 0"></script>
+<script src="../assets/js/scenes/06.js"></script>
+<script src="../assets/js/film.js"></script>
+</body>
+</html>
