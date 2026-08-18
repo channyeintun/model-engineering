@@ -273,18 +273,36 @@
       clearTimeout(timer);
     }
 
+    function seekableCovers(x) {
+      if (!audio.seekable || audio.seekable.length === 0) return true;  /* unknown: let it try */
+      for (var i = 0; i < audio.seekable.length; i++) {
+        if (x >= audio.seekable.start(i) - 0.01 && x <= audio.seekable.end(i) + 0.01) return true;
+      }
+      return false;
+    }
+
+    /* Some hosts do not answer HTTP range requests — Cloudflare Pages is one —
+       so the whole file must arrive before an arbitrary position is reachable.
+       Rather than give up, wait until the target is genuinely seekable and then
+       apply it once. Guarded by the token, so a newer seek always wins and a
+       stale target can never drag playback backwards. */
+    function waitForData() {
+      var evs = ['progress', 'canplay', 'canplaythrough', 'loadeddata', 'durationchange'];
+      function stop() { evs.forEach(function (e) { audio.removeEventListener(e, look); }); }
+      function look() {
+        if (token !== seekToken) { stop(); return; }
+        if (!seekableCovers(t)) return;
+        stop();
+        try { audio.currentTime = t; } catch (e) { done(); }
+      }
+      evs.forEach(function (e) { audio.addEventListener(e, look); });
+      setTimeout(stop, 60000);
+      look();
+    }
+
     function onSeeked() {
       if (token !== seekToken) return;
-      /* Landed far away? That means the range was not seekable yet. Try once
-         more when there is more data, then accept wherever we are. */
-      if (Math.abs(audio.currentTime - t) > TOL && retries > 0) {
-        retries--;
-        audio.addEventListener('canplay', function once() {
-          audio.removeEventListener('canplay', once);
-          if (token === seekToken) { try { audio.currentTime = t; } catch (e) { done(); } }
-        });
-        return;
-      }
+      if (Math.abs(audio.currentTime - t) > TOL && retries > 0) { retries--; waitForData(); return; }
       done();
     }
 
@@ -297,15 +315,16 @@
       return;
     }
 
-    var retries = 2;
+    var retries = 3;
     audio.addEventListener('seeked', onSeeked);
     audio.addEventListener('error', done);
     /* If no 'seeked' ever arrives, stop reporting the requested position;
        a pending seek must never outlive its attempt or the captions freeze. */
-    var timer = setTimeout(done, 8000);
+    var timer = setTimeout(done, 60000);
 
     function apply() {
       if (token !== seekToken) return;
+      if (!seekableCovers(t)) { waitForData(); return; }
       try { audio.currentTime = t; } catch (e) { done(); }
     }
 
