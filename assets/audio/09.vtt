@@ -1,138 +1,138 @@
 WEBVTT
 
 a01
-00:00:00.000 --> 00:00:20.170
+00:00:00.000 --> 00:00:21.596
 So. You have trained a model — and right now it is a Python object. One operator runs, then Python decides what happens next. That mode has a name: eager. This lesson is about the file you hand over at the border. How it is made, which four borders exist, and how to prove the model still works on the other side.
 
 a02
-00:00:21.120 --> 00:00:32.490
+00:00:22.546 --> 00:00:35.058
 On the left, ordinary Python. Look at two lines in particular. There is a branch that depends on the data. And a loop whose length arrives as an argument. Hold on to both of those.
 
 a03
-00:00:32.840 --> 00:00:45.570
+00:00:35.408 --> 00:00:49.201
 Now — here is what torch.export actually does. It runs your code once. Once. With the example input you gave it, writing down every tensor operation it sees. It does not write down the Python around them.
 
 a04
-00:00:45.920 --> 00:00:56.890
+00:00:49.551 --> 00:01:01.223
 Watch the red lines. That branch? Decided once, by that single example. The path not taken simply is not in the graph — and nothing will ever remind you it is missing.
 
 a05
-00:00:57.240 --> 00:01:07.240
+00:01:01.573 --> 00:01:11.996
 And the loop gets unrolled. It ran three times at capture, so the graph holds three blocks. For ever. Call it later asking for five, and nothing changes.
 
 a06
-00:01:07.590 --> 00:01:25.840
+00:01:12.346 --> 00:01:33.124
 So what comes out? Four things. A flat graph of ATen operators — PyTorch's small, fixed vocabulary. The weights, kept separately. A signature saying who owns each input. And a note of which dimensions may vary. That bundle is the ExportedProgram.
 
 a07
-00:01:26.490 --> 00:01:37.050
+00:01:33.774 --> 00:01:45.953
 Right. Capture happens once. Everything you do after capture decides the file — and the file decides which runtime can read it. Four destinations. They are not equal.
 
 a08
-00:01:37.400 --> 00:01:50.060
+00:01:46.303 --> 00:02:01.156
 ExecuTorch keeps you inside PyTorch. Partitioners hand pieces of the graph to backends, and out comes a .pte file — a flatbuffer the runtime reads straight off disk, with no parsing step first.
 
 a09
-00:01:50.410 --> 00:02:05.700
+00:02:01.506 --> 00:02:18.906
 ONNX is defined by a committee, not by one framework. Your graph gets rewritten into a numbered operator vocabulary — an opset. One file, and a runtime that exists almost everywhere. Including inside a web page.
 
 a10
-00:02:06.050 --> 00:02:19.500
+00:02:19.256 --> 00:02:32.810
 Core ML is the Apple path, and the only supported way to reach the Neural Engine. But notice the cost. That package is compiled on the device the first time it loads. That compilation is your cold start.
 
 a11
-00:02:19.850 --> 00:02:37.220
+00:02:33.160 --> 00:02:55.433
 Now look at the grey path underneath. GGUF is not on this road at all. Its own converter reads your checkpoint directly. No capture, no opset, no lowering. The catch? llama.cpp has to already know your architecture in C++.
 
 a12
-00:02:37.870 --> 00:02:49.640
+00:02:56.083 --> 00:03:08.451
 So. Drop the dynamic_shapes argument for a moment, and capture again. It runs once, with an example one hundred and twenty-eight tokens long. Every shape it saw became a constant in the graph.
 
 a13
-00:02:49.990 --> 00:02:59.750
+00:03:08.801 --> 00:03:19.639
 Feed it that same length again, and it runs. Green. Fine. And this is the test that gives you false confidence — because it is the only length anybody ever tried.
 
 a14
-00:03:00.100 --> 00:03:10.100
+00:03:19.989 --> 00:03:29.692
 Now watch the bar grow to two hundred. Refused. And nothing is wrong with your model. You told the graph this dimension was one hundred and twenty-eight, and it believed you.
 
 a15
-00:03:10.450 --> 00:03:20.290
+00:03:30.042 --> 00:03:40.691
 So mark that dimension dynamic. Export writes down a symbol and a range where the constant used to sit. Now two hundred runs. And seven. And a thousand.
 
 a16
-00:03:20.640 --> 00:03:32.650
+00:03:41.041 --> 00:03:54.673
 But do not mark everything dynamic — that is not the safe option. Every symbol is one more thing the compiler is no longer allowed to assume. It cannot fold constants, and on some backends it cannot plan memory at all.
 
 a17
-00:03:33.300 --> 00:03:42.100
+00:03:55.323 --> 00:04:04.782
 Right. After capture, your graph is a flat chain of operators. Nine of them here. And nothing on this screen knows anything about hardware yet.
 
 a18
-00:03:42.450 --> 00:03:52.050
+00:04:05.132 --> 00:04:14.781
 So the partitioner walks that chain and asks the backend one question per node. Can you run this one? Watch the rings turn green as the answers come back.
 
 a19
-00:03:52.400 --> 00:04:01.930
+00:04:15.131 --> 00:04:25.564
 The accepted nodes get grouped into islands. An island is a run of neighbours one backend agreed to take — and the whole run is replaced by a single opaque call into that backend.
 
 a20
-00:04:02.280 --> 00:04:13.810
+00:04:25.914 --> 00:04:37.986
 Two operators were refused. They just stay as portable CPU kernels, and the export succeeds anyway. That is partial delegation. It is also why an export never tells you it went badly.
 
 a21
-00:04:14.160 --> 00:04:26.170
+00:04:38.336 --> 00:04:51.489
 But here is the price. Every island border is a real copy — accelerator memory to CPU memory, and back again. Count the red diamonds. Four of them. On every call, on every token.
 
 a22
-00:04:26.520 --> 00:04:46.690
+00:04:51.839 --> 00:05:11.671
 So when someone tells you it runs on the NPU, that is a claim to check, not a claim to accept. And checking is one function call. Four numbers: nine nodes total, seven delegated, two left on the CPU, two islands. High fraction, few islands. That is what good looks like.
 
 a23
-00:04:47.340 --> 00:04:58.230
+00:05:12.321 --> 00:05:23.944
 Now the hardest part of exporting a language model. A decode step is not a pure function. It reads the keys and values of every earlier token, and then it adds one more.
 
 a24
-00:04:58.580 --> 00:05:10.670
+00:05:24.294 --> 00:05:37.686
 But a graph has no memory. So the straightforward fix keeps the graph pure. Pass the cache in as a tensor, take the new one back out, hand it in again next call. Every runtime supports this.
 
 a25
-00:05:11.020 --> 00:05:24.480
+00:05:38.036 --> 00:05:54.730
 It is correct. And it is slow. Watch that red bar. The whole cache moves on every token, and it grows with the context — eleven point seven mebibytes per token, at a thousand positions, on your Lesson Four model.
 
 a26
-00:05:24.830 --> 00:05:39.240
+00:05:55.080 --> 00:06:10.312
 The alternative gives the model a buffer it owns. Core ML calls it a state type; ExecuTorch calls it a mutable buffer. You write one slice per step. Twelve kibibytes. At any position. Look at the green bar.
 
 a27
-00:05:39.590 --> 00:05:59.850
+00:06:10.662 --> 00:06:32.233
 Either way, the position dimension is dynamic and it has a maximum. That maximum is your context limit, chosen at export time. Lesson Four trained this model at two hundred and fifty-six positions, where the cache is a tenth of the weights. At four thousand and ninety-six it is forty-eight mebibytes — larger than the weights.
 
 a28
-00:06:00.500 --> 00:06:10.180
+00:06:32.883 --> 00:06:44.986
 Right. Last piece — and the one everybody skips. Push the same input through both paths. Not a fresh random input for each. The same one.
 
 a29
-00:06:10.530 --> 00:06:20.450
+00:06:45.336 --> 00:06:55.278
 Then compare the outputs element by element. At four decimal places these two rows look identical — which is exactly why you measure, instead of looking.
 
 a30
-00:06:20.800 --> 00:06:31.930
+00:06:55.628 --> 00:07:07.188
 Different kernels add their numbers in a different order, so two correct implementations land about a millionth apart. That dashed red line is your tolerance. And you have to be able to defend where you drew it.
 
 a31
-00:06:32.280 --> 00:06:48.460
+00:07:07.538 --> 00:07:25.262
 One line of PyTorch turns that into a test. On a logit of twelve, with both tolerances at ten to the minus five, your budget is nought point zero zero zero one three — a shade above that dashed line. Put that line in CI — not in your terminal history.
 
 a32
-00:06:48.810 --> 00:07:02.020
+00:07:25.612 --> 00:07:39.005
 Now export the quantized model instead. Every bar jumps three orders of magnitude and sails straight over the line. Four thousandths, against a tolerance of one ten-thousandth. It looks like a disaster.
 
 a33
-00:07:02.370 --> 00:07:15.100
+00:07:39.355 --> 00:07:52.790
 But nothing broke. You compared against the wrong reference. Quantize in PyTorch first, then compare the export against that. Or better — stop comparing raw numbers, and compare the task metric you already have.
 
 a34
-00:07:16.050 --> 00:07:33.260
+00:07:53.740 --> 00:08:10.873
 So. In the project you take one model through all four paths, and you write down where each one stops. You probably will not get four working files — and that is the point. Then Lesson Ten runs these files for real. On a phone, in a browser tab, with no server at all.
 

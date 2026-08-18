@@ -1,138 +1,138 @@
 WEBVTT
 
 a01
-00:00:00.000 --> 00:00:11.690
+00:00:00.000 --> 00:00:13.728
 So. A model file is not a product. Somebody has to open it, put it in memory, pick a chip — while a person watches a spinner. And people want that on the device for one reason. Privacy.
 
 a02
-00:00:12.640 --> 00:00:28.650
+00:00:14.678 --> 00:00:33.267
 Right. What actually ships inside a phone app? Three things. Your code and interface — small. Then the runtime library, the C++ engine that opens the model file and runs the graph. Build that minimal and it stays small too.
 
 a03
-00:00:29.000 --> 00:00:43.020
+00:00:33.617 --> 00:00:49.674
 And the third thing. The model. 360 million parameters is 1.44 GB in FP32, and about 200 MB at 4 bits with group scales. Look at that block. It dwarfs everything else, many times over.
 
 a04
-00:00:43.370 --> 00:00:56.280
+00:00:50.024 --> 00:01:03.877
 But here is the problem. Apple will not send a download above 200 MB over a cellular connection, and Google Play caps an Android App Bundle's base module at roughly the same. You are over the line before you have written a feature.
 
 a05
-00:00:56.630 --> 00:01:11.120
+00:01:04.227 --> 00:01:20.219
 So the answer, on both platforms. Do not put the weights in the binary. Ship a small app. On first run, download the model, verify a hash so nothing substituted reaches your runtime, and cache it. Watch that bar collapse.
 
 a06
-00:01:11.470 --> 00:01:24.600
+00:01:20.569 --> 00:01:35.402
 But that directory is not storage you own. iOS empties it under pressure — silently, while your app is not even running. So "the model is gone" is not an error. It is a normal state, and it needs a normal way back.
 
 a07
-00:01:25.250 --> 00:01:40.780
+00:01:36.052 --> 00:01:54.401
 Next question — and this one decides your battery. Which chip runs which layer? A phone has three. The CPU, general. The GPU, wide. And the Neural Engine, an NPU: fixed-function, and far cheaper per operation.
 
 a08
-00:01:41.130 --> 00:01:54.340
+00:01:54.751 --> 00:02:09.333
 You do not choose per operator. You hand the runtime a priority list, and it asks each backend one question: can you take this node? A run of accepted nodes becomes a delegate. Watch most of the graph rise to the Neural Engine.
 
 a09
-00:01:54.690 --> 00:02:12.860
+00:02:09.683 --> 00:02:27.796
 But it has conditions. It is built around FP16, and it wants four-dimensional tensors, (B, C, 1, S). This operator demands FP32. Refused. It drops to the CPU — and your graph has just split in two.
 
 a10
-00:02:13.210 --> 00:02:28.510
+00:02:28.146 --> 00:02:43.483
 Count the red lines. Every lane change is a tensor copy. So a model that "runs on the Neural Engine" is really three to ten islands with CPU glue between them. Verify that — dump the partition report. And the prize is energy per token, not time.
 
 a11
-00:02:29.160 --> 00:02:45.090
+00:02:44.133 --> 00:03:02.002
 Now start-up. "Three seconds to the first answer" is not something you can fix, because it is three separate costs. One: open the file and map it into memory. 12 ms. Nothing is copied — pages arrive the first time a weight is touched.
 
 a12
-00:02:45.440 --> 00:03:01.690
+00:03:02.352 --> 00:03:21.024
 Two: compile the model for this exact device. On Apple a .mlpackage becomes an .mlmodelc; in a browser the backend compiles shaders. Keep watching that red block. 2 400 ms. This is the one that dominates.
 
 a13
-00:03:02.040 --> 00:03:18.690
+00:03:21.374 --> 00:03:38.999
 Three: prefill. Run the prompt through once to fill the KV cache. 380 ms. And notice — prefill is compute-bound, so an accelerator helps here. Decoding one token at a time is memory-bound, and gains nothing.
 
 a14
-00:03:19.040 --> 00:03:39.370
+00:03:39.349 --> 00:03:59.629
 So compile once, and write the artifact to disk. 2 792 ms becomes 432. Two details decide it. Move the result out of the temporary directory. And store it in Application Support — not caches. Caches is what iOS reclaims.
 
 a15
-00:03:39.720 --> 00:03:52.850
+00:03:59.979 --> 00:04:13.066
 And measure this properly. Time it twice in a row and you have measured a warm cache — a number no first-time user ever sees. Reboot the device. Then report both numbers, and label which is which.
 
 a16
-00:03:53.500 --> 00:04:08.310
+00:04:13.716 --> 00:04:29.178
 Now the second target. A browser tab has no bundle — nothing to install, nothing to review. A URL is the whole distribution. The price? The weights arrive over the network the first time somebody opens your page.
 
 a17
-00:04:08.660 --> 00:04:23.070
+00:04:29.528 --> 00:04:44.597
 Watch that meter crawl. 200 MB is about 160 seconds on a 10 Mbit/s mobile connection, 32 seconds on 50 Mbit/s Wi-Fi. So build a real download screen. Show the bytes, show the progress, let the user start it.
 
 a18
-00:04:23.420 --> 00:04:35.030
+00:04:44.947 --> 00:04:58.260
 The files land in Cache Storage, keyed by URL. And here is the bit people miss — that happens once per origin, not once per visit. This is the single most important thing to get right in a browser deployment.
 
 a19
-00:04:35.380 --> 00:04:47.550
+00:04:58.610 --> 00:05:11.694
 Second visit. The same URLs resolve from disk, and zero bytes travel over the network. Which is also why your own testing lies to you. After that first run, your machine sits permanently in the good case.
 
 a20
-00:04:47.900 --> 00:05:05.110
+00:05:12.044 --> 00:05:29.032
 Two catches. Browsers evict Cache Storage under pressure, exactly as iOS empties a caches directory — a cache miss is normal. And note what is not promised. Your code caches the weights. Whether the shaders stay compiled is the browser's business.
 
 a21
-00:05:05.760 --> 00:05:23.050
+00:05:29.682 --> 00:05:47.955
 In the page there are two ways to multiply matrices, and they are not close. Both grids compute the same tile. WebAssembly does it on the CPU with SIMD — eight numbers per instruction. Four threads, four rows at a time.
 
 a22
-00:05:23.400 --> 00:05:41.660
+00:05:48.305 --> 00:06:07.868
 But those threads need SharedArrayBuffer, which needs a cross-origin-isolated page, which needs two response headers: COOP and COEP. Your dev server sets them. Your CDN does not. Nothing errors — you quietly drop to one thread.
 
 a23
-00:05:42.010 --> 00:05:55.300
+00:06:08.218 --> 00:06:23.767
 WebGPU hands the same work to the GPU as one dispatch of thousands of parallel invocations. Watch the whole grid fill at once. This — not clever kernels — is what made transformer inference in a browser practical at all.
 
 a24
-00:05:55.650 --> 00:06:11.420
+00:06:24.117 --> 00:06:40.470
 And as of January 2026 it is Baseline — the label for a feature that works in the current version of every major browser. Chrome, Edge, Firefox 141, Safari 26. So plan for WebGPU. WebAssembly is the fallback, not the plan.
 
 a25
-00:06:12.070 --> 00:06:27.120
+00:06:41.120 --> 00:06:57.549
 One limit left, and it is the harshest. Memory. Your app gets a budget, and an app that exceeds it is not slowed, not swapped. It is killed. iOS calls that Jetsam. On a 6 GB phone, hold 2 to 3 GB.
 
 a26
-00:06:27.470 --> 00:06:42.840
+00:06:57.899 --> 00:07:14.252
 And we change model on purpose — the largest that could plausibly fit. 3 billion parameters at 4 bits with group scales. The 1.83 GB file from Lesson 08. Those are clean pages, mapped from a file, so the system can drop them and read them back.
 
 a27
-00:06:43.190 --> 00:06:57.840
+00:07:14.602 --> 00:07:30.074
 The KV cache is the exact opposite. Dirty anonymous memory that exists nowhere else — so it cannot be dropped. Only kept, or lost with your process. And look at it grow. Every token you generate.
 
 a28
-00:06:58.190 --> 00:07:09.960
+00:07:30.424 --> 00:07:42.785
 Cross the budget and the phone does not slow you down, and it does not swap. It terminates your app. Mid-conversation. No warning — just a jetsam event in the crash logs afterwards.
 
 a29
-00:07:10.310 --> 00:07:29.760
+00:07:43.135 --> 00:08:03.004
 So do the sum. 2.50 GB of budget, minus 1.83 for the weights, minus 0.25 for your app. That leaves 0.42 GB. At 131 kB per token, about 3 200 tokens — where the app dies. So ship 2 048.
 
 a30
-00:07:30.410 --> 00:07:44.660
+00:08:03.654 --> 00:08:19.847
 Now the question that should have come first. Does the operating system already ship a model good enough? Because look what you are about to ask for. 200 MB. From every new user. Before your app does anything at all.
 
 a31
-00:07:45.010 --> 00:08:02.060
+00:08:20.197 --> 00:08:43.430
 The system model costs zero bytes. On Apple that is Foundation Models: about 3 billion parameters, free and offline. On Android, ML Kit over AICore. One warning though. Apple's larger option runs in Private Cloud Compute — that request leaves the phone.
 
 a32
-00:08:02.410 --> 00:08:16.740
+00:08:43.780 --> 00:08:58.412
 So the system model is the default. You pay the 200 MB for one of four things. A specific fine-tune. A modality the platform skips. Old devices. Or identical behaviour on iOS, Android and the web.
 
 a33
-00:08:17.690 --> 00:08:34.260
+00:08:59.362 --> 00:09:19.151
 And run the licence check first. Apache-2.0 and MIT are safe in a closed app. Copyleft is not. Piper is GPL-3.0 — a decision your legal team makes, not you. Kokoro is Apache-2.0, and it is 60 to 80 MB.
 
 a34
-00:08:35.210 --> 00:08:51.620
+00:09:20.101 --> 00:09:37.038
 Project 10 has no training in it — it is measurement, and honesty. Load a model into a browser tab, time the first visit and the second, then break it on purpose. And in Lesson 11 the input changes: sound becomes a picture, and that picture becomes letters.
 

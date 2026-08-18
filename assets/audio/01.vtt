@@ -1,138 +1,138 @@
 WEBVTT
 
 a01
-00:00:00.000 --> 00:00:15.450
+00:00:00.000 --> 00:00:17.272
 So. By the end of this walkthrough you can explain how any model learns — a digit classifier, a language model, a speech recogniser. Three moving parts. A pile of numbers, one number that says how wrong they are, and a small step downhill.
 
 a02
-00:00:16.400 --> 00:00:28.170
+00:00:18.222 --> 00:00:31.455
 Let us start as small as we possibly can. One number. Just one — we will call it a weight. For every value that weight could take, the model makes some error. Plot the error, and we get this curve.
 
 a03
-00:00:28.520 --> 00:00:41.490
+00:00:31.805 --> 00:00:45.594
 But here is the problem. We can never actually see this curve. A real model has millions of these numbers, and we only ever get to stand at one point — right here, where the loss is high and nothing tells us which way is down.
 
 a04
-00:00:41.840 --> 00:00:52.890
+00:00:45.944 --> 00:00:57.612
 So we ask the one question we can afford. How steep is the ground, right here? That is the gradient. Nudge this weight up a little — does the loss go up or down, and how fast?
 
 a05
-00:00:53.240 --> 00:01:03.650
+00:00:57.962 --> 00:01:09.195
 Then we step the opposite way. Not all the way down. Just a small fraction of that slope — and that fraction is the learning rate. It is the most important number you will ever choose by hand.
 
 a06
-00:01:04.000 --> 00:01:18.490
+00:01:09.545 --> 00:01:25.647
 Now repeat, and notice what happens without anyone asking. The curve flattens, so the slope shrinks, so the step shrinks too. The model slows down as it arrives. Nobody programmed that. It is a consequence of the rule itself.
 
 a07
-00:01:18.840 --> 00:01:31.570
+00:01:25.997 --> 00:01:42.110
 Right. Now make the learning rate too large. Every step jumps clean over the valley, and the loss climbs instead of falling. A few more steps and it becomes nan — not a number — and that poisons every parameter it touches.
 
 a08
-00:01:32.220 --> 00:01:46.150
+00:01:42.760 --> 00:01:57.316
 So much for the rule. Now the data. Everything you pass around is a tensor — an array of numbers with a shape. Here is a batch of thirty-two grey images. Four numbers: batch, channels, height, width.
 
 a09
-00:01:46.500 --> 00:02:02.590
+00:01:57.666 --> 00:02:14.029
 Channels is the one that trips people up. It is one full grid of numbers per image. Grey needs one. Colour needs three. Now flatten each image into one long row: 1 × 28 × 28 = 784 numbers.
 
 a10
-00:02:02.940 --> 00:02:20.950
+00:02:14.379 --> 00:02:33.291
 A linear layer takes those 784 numbers down to 128. Then a second one takes 128 down to 10 — one score per digit. One thing this picture leaves out: between the two you need a bend, a ReLU, or they collapse into a single layer.
 
 a11
-00:02:21.300 --> 00:02:32.270
+00:02:33.641 --> 00:02:46.314
 Now look at the first number in every shape. It never changed. Those thirty-two examples travelled side by side and never mixed — that is all a batch is. It is there for speed.
 
 a12
-00:02:32.920 --> 00:02:53.890
+00:02:46.964 --> 00:03:08.044
 So where do gradients actually come from? Here is the smallest real example. One weight, w = 3. One input, x = 2. Multiply, and the model says six. The target was ten, so the error is minus four, and squaring it gives a loss of sixteen.
 
 a13
-00:02:54.240 --> 00:03:05.930
+00:03:08.394 --> 00:03:22.107
 You write that as ordinary Python. Nothing special. But while it runs, PyTorch is quietly writing down every operation you performed, in order — a tape of the whole forward pass.
 
 a14
-00:03:06.280 --> 00:03:14.760
+00:03:22.457 --> 00:03:30.719
 Then you call loss.backward(), and it walks that tape backwards, right to left. Data went forward. Gradients come back.
 
 a15
-00:03:15.110 --> 00:03:31.840
+00:03:31.069 --> 00:03:49.422
 And at each stop it multiplies by one small local derivative. Squaring minus four gives minus eight. Subtracting ten changes nothing, so still minus eight. Multiplying by an input of two gives minus sixteen. That is the chain rule. All of it.
 
 a16
-00:03:32.190 --> 00:03:44.440
+00:03:49.772 --> 00:04:02.574
 So the answer is minus sixteen. And read what the sign is telling you: raising this weight would lower the loss. The update rule subtracts the gradient — so the weight goes up. That is where the minus sign comes from.
 
 a17
-00:03:45.390 --> 00:04:02.280
+00:04:03.524 --> 00:04:20.506
 Now turn the handle once. With lr = 0.1, the weight moves from 3.00 to 4.60. The output goes from 6.00 to 9.20. And the loss? 16.00, down to 0.64. One step. That is training.
 
 a18
-00:04:03.230 --> 00:04:17.320
+00:04:21.456 --> 00:04:37.034
 So what number are we minimising? For anything that picks a category, the model gives one raw score per class. They can be negative, and they add up to nothing in particular. Softmax fixes that: now they are probabilities, and they add to one.
 
 a19
-00:04:17.670 --> 00:04:31.040
+00:04:37.384 --> 00:04:51.417
 And this is the part that matters. Only one of these bars is ever graded — the one for the correct class. The loss is minus the natural logarithm of that probability. So as the bar grows, the loss falls toward zero.
 
 a20
-00:04:31.390 --> 00:04:49.320
+00:04:51.767 --> 00:05:12.429
 Now watch the asymmetry. That one bar climbed to 0.86, and the loss fell to 0.15. But suppose the model had been confidently wrong instead — 0.01 on the right answer. Then the loss is 4.6. Confident mistakes hurt most.
 
 a21
-00:04:49.970 --> 00:05:08.540
+00:05:13.079 --> 00:05:31.687
 Careful here — the picture just changed. Two parameters now, so the loss is a landscape seen from above, like a hiking map. Each ring joins points of equal loss. And plain SGD follows the steepest slope, which points across this valley. So it crosses. Again and again.
 
 a22
-00:05:08.890 --> 00:05:20.260
+00:05:32.037 --> 00:05:43.434
 Momentum fixes that. It keeps a running average of recent gradients, so the side-to-side parts cancel out and the forward part adds up. Like a heavy ball that does not react to every bump.
 
 a23
-00:05:20.610 --> 00:05:39.260
+00:05:43.784 --> 00:06:02.783
 Adam adds a second idea. It tracks how big each parameter's recent gradients have been, and divides the step by that — which is why it works with almost no tuning. But it stores two extra numbers per parameter. On a billion-parameter model, that alone is 8 GB. Use AdamW.
 
 a24
-00:05:39.910 --> 00:05:54.240
+00:06:03.433 --> 00:06:18.895
 Right. The loop itself — five lines, and you will write them hundreds of times. Line one: zero_grad(). Throw away last batch's gradients. PyTorch adds to the gradient instead of replacing it, so this line is not optional.
 
 a25
-00:05:54.590 --> 00:06:07.080
+00:06:19.245 --> 00:06:32.958
 Two: forward. Data flows through the model, and the tape gets recorded. Three: the loss. It compares the output with the target and hands back one single number — how wrong we are, right now.
 
 a26
-00:06:07.430 --> 00:06:15.110
+00:06:33.308 --> 00:06:40.810
 Four: backward. The tape is replayed in reverse, and every single parameter gets its own gradient written down beside it.
 
 a27
-00:06:15.460 --> 00:06:26.420
+00:06:41.160 --> 00:06:52.082
 Five: step. The optimizer moves every parameter a little way downhill. Then straight back to line one, for the next batch. That is it. That is the whole loop.
 
 a28
-00:06:26.770 --> 00:06:43.340
+00:06:52.432 --> 00:07:09.904
 Now delete line one, and watch. Nothing crashes. The gradients just pile up — batch three trained on the sum of one, two and three — so your real learning rate grows without limit. Training does not break. It quietly gets worse.
 
 a29
-00:06:43.690 --> 00:06:56.820
+00:07:10.254 --> 00:07:24.971
 But the same behaviour is a gift, when you ask for it. Run four small batches, go backward on each, then step once. You get the gradient of a batch four times bigger than your memory allows. That is gradient accumulation.
 
 a30
-00:06:57.470 --> 00:07:09.880
+00:07:25.621 --> 00:07:39.803
 One last skill, and it will save you days. Training loss falls, and keeps falling. On its own? That tells you almost nothing. It only means the model is memorising what it has already seen.
 
 a31
-00:07:10.230 --> 00:07:20.870
+00:07:40.153 --> 00:07:51.905
 So you hold back data the model never trains on. Your validation split. At first it improves too — good. The model is learning something real, not just the training set.
 
 a32
-00:07:21.220 --> 00:07:30.260
+00:07:52.255 --> 00:08:01.638
 And then it turns upward. From this moment on, the model is memorising instead of learning, and that growing gap is what overfitting looks like on a chart.
 
 a33
-00:07:30.610 --> 00:07:41.570
+00:08:01.988 --> 00:08:12.850
 So the model you want is the one from just before the turn. Keep that checkpoint, throw the later ones away. That is early stopping, and it is the cheapest fix in machine learning.
 
 a34
-00:07:42.520 --> 00:08:01.410
+00:08:13.800 --> 00:08:32.472
 That is the whole mechanism. Now go and use it: train a small network on MNIST, past 97% on the held-out split — then break it on purpose and watch each failure. Lesson 02 opens the linear layer itself, and builds a network with no ready-made layers at all.
 

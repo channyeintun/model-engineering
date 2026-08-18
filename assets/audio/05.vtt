@@ -1,138 +1,138 @@
 WEBVTT
 
 a01
-00:00:00.000 --> 00:00:12.570
+00:00:00.000 --> 00:00:15.469
 Right. Somebody else already spent a month of expensive compute teaching a model to read and write. You are not repeating that. In the next few minutes you will change what that model does — by training less than one percent of its numbers.
 
 a02
-00:00:13.520 --> 00:00:27.610
+00:00:16.419 --> 00:00:31.627
 So. Start with the bill. This is where people get caught. A 3.08 billion parameter model loads in bf16 for 6.2 GB. But training keeps a float32 copy — so the first bar is 12.3.
 
 a03
-00:00:27.960 --> 00:00:35.480
+00:00:31.977 --> 00:00:40.476
 Now. Every single parameter needs its own gradient. That is the whole model again, stacked on top. Watch the bar double.
 
 a04
-00:00:35.830 --> 00:00:44.630
+00:00:40.826 --> 00:00:51.328
 And AdamW? It keeps two running averages of that gradient. For every parameter. So that is twice the model again — the tallest piece of the three.
 
 a05
-00:00:44.980 --> 00:00:56.750
+00:00:51.678 --> 00:01:03.793
 Forty nine point three gigabytes. And not one activation is stored yet. That dashed line is a sixteen gigabyte laptop. You are not close — and a free cloud card will not save you either.
 
 a06
-00:00:57.100 --> 00:01:11.430
+00:01:04.143 --> 00:01:18.416
 So here is LoRA. Freeze the base, and gradients and optimizer state exist only for the adapter. The tall part simply vanishes. 6.6 GB, with the frozen base sitting in bf16.
 
 a07
-00:01:11.780 --> 00:01:25.150
+00:01:18.766 --> 00:01:34.732
 QLoRA shrinks the last bar too — the frozen base stored in four bits. Two gigabytes for the whole run. One catch. The library that does the four-bit part is CUDA only, so it will not run on a Mac.
 
 a08
-00:01:25.800 --> 00:01:39.810
+00:01:35.382 --> 00:01:50.801
 So why does that middle bar collapse? Look inside one layer. One weight matrix — the query projection. 4,194,304 numbers. And full fine-tuning rewrites all of them.
 
 a09
-00:01:40.160 --> 00:01:51.200
+00:01:51.151 --> 00:02:02.843
 LoRA freezes it. Not one number in there moves. Not one, for the entire run — and that tag means exactly what it says. No gradient ever arrives here.
 
 a10
-00:01:51.550 --> 00:02:06.520
+00:02:03.193 --> 00:02:19.702
 Beside it we put two thin matrices. A squeezes 2048 inputs down to sixteen. B expands those sixteen back to full width. Sixteen — that is the rank.
 
 a11
-00:02:06.870 --> 00:02:17.190
+00:02:20.052 --> 00:02:31.915
 And the two paths get added. The frozen path, plus the adapter path scaled by alpha over r. Every shape still matches, so nothing else in the model has to change.
 
 a12
-00:02:17.540 --> 00:02:29.550
+00:02:32.265 --> 00:02:44.737
 Here is the elegant bit. B starts as all zeros. So at step zero the second path contributes exactly nothing, and the adapted model is the model you downloaded. There is no accuracy cliff.
 
 a13
-00:02:29.900 --> 00:02:44.230
+00:02:45.087 --> 00:03:01.280
 And only those two thin matrices receive gradients. 65,536 numbers instead of four million — 1.6% of this one matrix. Backward never touches the frozen block, and that is where the memory went.
 
 a14
-00:02:44.880 --> 00:02:55.770
+00:03:01.930 --> 00:03:12.867
 So what is rank, really? It is the width of the bottleneck where those two thin matrices meet. A capacity dial. At four, they are barely a line beside the frozen block.
 
 a15
-00:02:56.120 --> 00:03:08.850
+00:03:13.217 --> 00:03:27.807
 Double it to eight, and both strips double with it. Trainable parameters grow linearly with rank — 1,889,280 of them per unit of rank, across all thirty six layers.
 
 a16
-00:03:09.200 --> 00:03:18.000
+00:03:28.157 --> 00:03:36.580
 Sixteen is where you start. That is 30.2 million trainable numbers — and look at the meter. Still under one percent of the model.
 
 a17
-00:03:18.350 --> 00:03:32.520
+00:03:36.930 --> 00:03:50.724
 Sixty four is a genuinely new task, not a change of style. 120.9 million numbers, 3.9%. The strips are visibly thick now, and gradients and optimizer state grow right along with them.
 
 a18
-00:03:32.870 --> 00:03:48.160
+00:03:51.074 --> 00:04:09.336
 Now — alpha is not a second rank. It only scales the adapter output, as alpha over r. That division keeps the best learning rate roughly independent of rank. Use two r, and pitch that rate ten times higher than a full fine-tune.
 
 a19
-00:03:48.810 --> 00:04:01.220
+00:04:09.986 --> 00:04:24.579
 Right. Now the plumbing — and the plumbing is where fine-tunes actually fail. The chat template flattens your list of messages into one string of tokens. Those role markers are real tokens, not metadata.
 
 a20
-00:04:01.570 --> 00:04:09.890
+00:04:24.929 --> 00:04:33.139
 Train on that string as plain text, and every position gets graded. Read the little labels under the cells. Thirteen out of thirteen.
 
 a21
-00:04:10.240 --> 00:04:19.210
+00:04:33.489 --> 00:04:42.766
 But look what you just did. You taught it to write the user's half as well. That is the model that answers your question beautifully — and then cheerfully invents your next one.
 
 a22
-00:04:19.560 --> 00:04:33.250
+00:04:43.116 --> 00:04:58.429
 So switch assistant-only loss on. The prompt labels become -100, the ignore index, and cross-entropy skips those positions entirely. Watch the counter fall. Five graded tokens out of thirteen.
 
 a23
-00:04:33.600 --> 00:04:46.810
+00:04:58.779 --> 00:05:14.651
 And here is why it really matters. One long document, one short answer — 312 positions out of 1,024 carry a gradient. Without the mask you would spend all the rest on text the model never has to write.
 
 a24
-00:04:47.760 --> 00:05:04.340
+00:05:15.601 --> 00:05:33.074
 One more stage exists after this one. DPO — direct preference optimization. It learns from pairs of answers, one marked better than the other, and it pushes the gap between them. Worth recognising on a model card. Your project stops before it.
 
 a25
-00:05:05.290 --> 00:05:17.220
+00:05:34.024 --> 00:05:47.566
 Now the thing almost nobody measures. Two scores matter here, not one. How good the model is at your task, and how good it is at everything else. Record both before you train a single step.
 
 a26
-00:05:17.570 --> 00:05:26.370
+00:05:47.916 --> 00:05:57.939
 The task score climbs. Of course it does — that is what you trained for. And for most people, this is the only curve they ever write down.
 
 a27
-00:05:26.720 --> 00:05:40.250
+00:05:58.289 --> 00:06:12.802
 And the other one falls. The weights moved toward your narrow data, so ordinary conversation got worse. Those panel numbers are illustrative, but the shape is real. Nothing warns you, because your evaluation set never tests it.
 
 a28
-00:05:40.600 --> 00:05:50.930
+00:06:13.152 --> 00:06:24.944
 The cheap defence is replay. Mix one to ten percent of general instruction data back into your set. Same task score. And in the sketch on the right, the fall nearly flattens.
 
 a29
-00:05:51.280 --> 00:06:03.530
+00:06:25.294 --> 00:06:37.610
 But none of this is visible unless you look. Three general prompts, answered before and answered again after. Five minutes. That is the whole ritual, and it is the only way you will notice.
 
 a30
-00:06:04.180 --> 00:06:15.470
+00:06:38.260 --> 00:06:50.694
 Training is over. The base never moved, so what you actually have is an adapter file — 30.2 million numbers, about 60 MB, sitting beside a 6.2 GB base.
 
 a31
-00:06:15.820 --> 00:06:30.630
+00:06:51.044 --> 00:07:06.346
 You can serve it exactly like that. The price is two extra matrix multiplies per targeted layer, on every token. Or — you merge. Multiply B by A once, apply the scale, and the product has exactly the shape of the frozen matrix.
 
 a32
-00:06:30.980 --> 00:06:39.540
+00:07:06.696 --> 00:07:16.017
 Add it into the frozen weights, and out comes an ordinary weight matrix. Watch the adapter fade. There is nothing left to attach any more.
 
 a33
-00:06:39.890 --> 00:06:53.340
+00:07:16.367 --> 00:07:30.556
 One multiply again. The base model's shape, file size and speed. Keep this file — Lesson Nine exports it, and the export tools follow one graph of ordinary weights, not a base plus a separate adapter.
 
 a34
-00:06:54.290 --> 00:07:09.260
+00:07:31.506 --> 00:07:47.018
 So. Go and do the project. Build the evaluation set before you train, then measure what you gained and what you quietly lost. In Lesson Six the model gets genuinely smaller — distillation copies a big model's confidence into a small student.
 

@@ -1,138 +1,138 @@
 WEBVTT
 
 a01
-00:00:00.000 --> 00:00:14.010
+00:00:00.000 --> 00:00:14.379
 So. Last lesson. By the end of this walkthrough you will have a voice assistant that runs with the network switched off — and, just as important, an honest account of what it cannot do. It starts with one measurement about people.
 
 a02
-00:00:14.960 --> 00:00:25.360
+00:00:15.329 --> 00:00:26.087
 Two people, one conversation. Time runs to the right, and that bar along the bottom is one second. Speaker A is asking a question. Watch the gap that comes next.
 
 a03
-00:00:25.710 --> 00:00:41.320
+00:00:26.437 --> 00:00:43.681
 Speaker B answers. And here is the number: the gap between them peaks at about 200 ms. Between 51% and 55% of all transitions are shorter than that. Ten languages, the same peak — so this is not an English habit.
 
 a04
-00:00:41.670 --> 00:00:56.320
+00:00:44.031 --> 00:00:59.584
 Now the awkward fact. Naming one word takes a person about 600 ms. Two words, seven hundred and forty. A whole sentence, around 1500 ms. So ask yourself — where does all that planning fit?
 
 a05
-00:00:56.670 --> 00:01:08.600
+00:00:59.934 --> 00:01:14.463
 Only backwards. It has to. Four hundred milliseconds of that plan happened while Speaker A was still talking. People do not detect the end of a turn. They predict it, and they start work early.
 
 a06
-00:01:08.950 --> 00:01:22.400
+00:01:14.813 --> 00:01:28.925
 A machine that waits for silence starts here instead. The same six hundred milliseconds of work, begun four hundred milliseconds later, so it answers four hundred milliseconds late. It can be made fast. It can never be on time.
 
 a07
-00:01:23.350 --> 00:01:40.320
+00:01:29.875 --> 00:01:48.617
 Right. Everything from here is checked against one real program you can install tonight — huggingface/speech-to-speech. But read its defaults, not its tagline. Its shipped language backend is a network call, so follow the quickstart and you are timing somebody else's data centre.
 
 a08
-00:01:41.270 --> 00:01:54.800
+00:01:49.567 --> 00:02:03.040
 So. Audio arrives at sixteen thousand samples a second whether you are ready or not. A function call returns when it has finished — audio does not wait for that. So every stage becomes a thread, and between two threads sits a queue.
 
 a09
-00:01:55.150 --> 00:02:07.080
+00:02:03.390 --> 00:02:15.583
 Now count the boxes. Six, not four. And here is the first one nobody predicts: a notifier, whose whole job is telling the client what is happening before a single word has been transcribed.
 
 a10
-00:02:07.430 --> 00:02:20.080
+00:02:15.933 --> 00:02:29.341
 And the second. An output processor puts text, tool calls and speech inputs on one queue, so a later piece cannot overtake an earlier one. Skip it, and your user hears the sentence in the wrong order.
 
 a11
-00:02:20.430 --> 00:02:34.200
+00:02:29.691 --> 00:02:44.914
 One dashed path is left. Protocol events bypass the audio path entirely — that is how the client is told you started speaking before recognition has produced anything at all. Six threads. Eight queues. One side channel.
 
 a12
-00:02:34.850 --> 00:02:43.730
+00:02:45.564 --> 00:02:54.547
 Now, interruption. The model is halfway through an answer, and its audio is leaving the speaker right now. So what happens when you talk over it?
 
 a13
-00:02:44.080 --> 00:02:58.410
+00:02:54.897 --> 00:03:09.104
 Fifty milliseconds later the system decides to stop. But stopping generation is not stopping sound. With a four hundred millisecond playback buffer, your user still hears four hundred and fifty milliseconds of an answer you already cancelled.
 
 a14
-00:02:58.760 --> 00:03:14.930
+00:03:09.454 --> 00:03:25.807
 So look inside the graph. Every item of work carries the generation it belongs to — right now, seven. Interrupt, and that counter simply goes to eight. Everything stamped seven is stale, and each thread drops it wherever it happens to be sitting.
 
 a15
-00:03:15.280 --> 00:03:28.730
+00:03:26.157 --> 00:03:41.870
 And that is the whole cancellation mechanism. One integer. No timers, no races, no half-cancelled state. Then flush the buffer, and truncate the history to what your user actually heard — not to what the model generated.
 
 a16
-00:03:29.380 --> 00:03:42.270
+00:03:42.520 --> 00:03:55.391
 So where does the time actually go? Here is an honest phone budget. The clock starts at your last audio sample. Two lines first: the architectural floor for this design, and the target this course asks you to hit.
 
 a17
-00:03:42.620 --> 00:03:54.230
+00:03:55.741 --> 00:04:08.174
 And look what the first three rows are. Not computation. Policy. Framing, then sixty-four milliseconds to be sure the silence is real, then a small classifier asking whether you actually finished.
 
 a18
-00:03:54.580 --> 00:04:05.070
+00:04:08.524 --> 00:04:20.077
 Only now does anything expensive happen. The recogniser finalises its transcript in a hundred and fifty milliseconds, and the language model takes three hundred more to produce its very first token.
 
 a19
-00:04:05.420 --> 00:04:23.590
+00:04:20.427 --> 00:04:40.539
 Then decode to a whole clause, four hundred. First audio chunk out, two hundred. Playback buffer, sixty. Total: 1246 ms. Past the floor, inside the target. And notice — not one of those rows is the model being slow.
 
 a20
-00:04:23.940 --> 00:04:40.430
+00:04:40.889 --> 00:05:00.042
 And the eight hundred millisecond commit hold? It starts when silence is detected and runs alongside everything else, finishing at 896. On this phone it is free. On a server whose pipeline finishes in three hundred milliseconds, that same hold is the entire latency.
 
 a21
-00:04:41.080 --> 00:04:54.130
+00:05:00.692 --> 00:05:15.365
 Now the hardest decision in the whole system. Somebody is reading out a phone number, and they stop in the middle to remember the rest. A pause of five hundred and fifty milliseconds. Is that turn finished? A silence timer cannot tell you.
 
 a22
-00:04:54.480 --> 00:05:14.020
+00:05:15.715 --> 00:05:37.087
 The detector knows nothing about words. It sees quiet, waits sixty-four milliseconds, closes the segment. Then Smart Turn — a Whisper-Tiny encoder, 8.7 MB — reads the waveform and says: not finished. So the system deliberately stalls six hundred milliseconds before spending any compute.
 
 a23
-00:05:14.370 --> 00:05:26.700
+00:05:37.437 --> 00:05:50.670
 And speech resumes inside that window. So the turn reopens as a newer revision. The work already in flight is thrown away before anyone hears it, and the whole accumulated audio is re-emitted as one turn.
 
 a24
-00:05:27.050 --> 00:05:44.100
+00:05:51.020 --> 00:06:09.561
 Here is why that matters. The classifier is right 92.63% of the time — one turn in thirteen wrong. On Vietnamese, 79.38%. One in five. So the reopen window is not defensive coding. It is load-bearing.
 
 a25
-00:05:44.750 --> 00:05:56.360
+00:06:10.211 --> 00:06:22.554
 Now — benchmarks, and how not to be lied to by one. Seven speech synthesis builds, ranked by the number you can read straight off a download page. File size, smallest at the top.
 
 a26
-00:05:56.710 --> 00:06:09.840
+00:06:22.904 --> 00:06:36.537
 And here they are again, ranked by real-time factor — compute time divided by audio duration, one CPU thread, lower is better. Now join them up. The order does not survive. Not even close.
 
 a27
-00:06:10.190 --> 00:06:30.450
+00:06:36.887 --> 00:06:57.889
 Draw the line at exactly real time and both Kokoro rows fall through it. Kokoro is the largest model in the table, 82 million parameters. And its int8 build is 2.6 times smaller on disk and 1.75 times slower. Quantization buys bytes. Milliseconds only when the kernels exist.
 
 a28
-00:06:31.100 --> 00:06:41.260
+00:06:58.539 --> 00:07:10.078
 Right. One question sorts every voice agent you will ever meet. Where does the duplex decision live? There are four possible answers. And only three of them exist.
 
 a29
-00:06:41.610 --> 00:06:57.620
+00:07:10.428 --> 00:07:27.337
 Inside the token sequence there is no scheduler at all — taking a turn is just another thing the model predicts. That is Moshi, at 12.5 frames a second. But it never idles. On a phone, that difference is thermal, not arithmetic.
 
 a30
-00:06:57.970 --> 00:07:14.620
+00:07:27.687 --> 00:07:44.848
 Yours is the first column — the decision outside the model. And it has a floor: roughly five hundred milliseconds, and even that assumes a server-class forward pass. A phone lands at 0.9 to 2.0 s. So do not chase the milliseconds. Chase the manners.
 
 a31
-00:07:15.270 --> 00:07:25.520
+00:07:45.498 --> 00:07:56.171
 Which brings us to the capstone. Everything from Part Five, inside one box. Audio in on the left, audio out on the right, and nothing in between touches a network.
 
 a32
-00:07:25.870 --> 00:07:39.810
+00:07:56.521 --> 00:08:12.527
 The recogniser streams partial text while you speak. And the brain? It is the checkpoint you fine-tuned in Lesson 05, quantized in Lesson 07, exported in Lesson 09. You are not training anything today. You are connecting things.
 
 a33
-00:07:40.160 --> 00:07:55.780
+00:08:12.877 --> 00:08:30.440
 And the arrow to the server is gone. 345 MB on disk, about 2 GB resident, median voice-to-voice under 1.5 s. It answers about a second later than the cloud — and it never talks over you. That is the trade. Say it out loud.
 
 a34
-00:07:56.730 --> 00:08:13.140
+00:08:31.390 --> 00:08:50.825
 So go and build it. Six steps, then one honest measurement: median and ninetieth percentile, from your last speech sample to the first sample your speaker plays. There is no Lesson Fourteen. The next thing is evaluation — go and find the first conversation your assistant cannot handle.
 

@@ -10,7 +10,7 @@
    Needs, per lesson NN:
      data/narration/NN.js         the script   (authored)
      data/narration/NN.timing.js  the timings  (generated with the audio)
-     assets/audio/NN.mp3          the narration (generated)
+     assets/audio/NN.m4a          the narration (generated)
      assets/audio/NN.vtt          the captions  (generated)
 
    With no audio it still runs: segments advance on a reading-speed estimate
@@ -181,7 +181,7 @@
     if (HAS_AUDIO) {
       audio = document.createElement('audio');
       audio.preload = 'auto';
-      audio.src = '../assets/audio/' + lesson + '.mp3';
+      audio.src = '../assets/audio/' + lesson + '.m4a';
       var track = document.createElement('track');
       track.kind = 'captions';
       track.srclang = 'en';

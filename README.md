@@ -45,7 +45,7 @@ assets/js/film.js       the narrated-walkthrough player
 assets/js/vendor/       GSAP 3.15.0, vendored so the site works offline
 data/narration/NN.js    the walkthrough script for lesson NN (authored)
 data/narration/*.timing.js  cue times (generated with the audio)
-assets/audio/NN.mp3     the narration track (generated)
+assets/audio/NN.m4a     the narration track (generated)
 assets/audio/NN.vtt     WebVTT captions (generated)
 tools/narrate.py        generates the audio, captions and timings
 tools/check.mjs         static consistency checker
@@ -87,14 +87,31 @@ Built-in voices: `alba`, `cosette`, `marius`, `javert`, `jean`, `fantine`,
 Put a clean recording in `voice/` and re-render:
 
 ```bash
-ffmpeg -i myvoice.m4a -ar 24000 -ac 1 voice/myvoice.wav
+ffmpeg -i myvoice.m4a -af "highpass=f=80,loudnorm=I=-18:TP=-2:LRA=11" -ar 24000 -ac 1 voice/myvoice.wav
 python3 tools/narrate.py all --force
 ```
 
-Ten to twenty seconds of clear speech is enough. The reference is peak-normalised
-before it is encoded, because pocket-tts clones loudness along with timbre and a
-quiet recording otherwise yields a quiet narrator; `--raw-reference` on
+Ten to twenty seconds of clear speech is enough — and **stay under twenty**,
+because pocket-tts silently discards anything past that and never says so.
+
+The high-pass removes room rumble; `loudnorm` sets a predictable level, which
+matters because pocket-tts clones loudness along with timbre and a quiet
+recording otherwise yields a quiet narrator. Resist the urge to add denoising
+unless the recording actually needs it: `afftdn` smears consonants, and that
+costs more than the hiss it removes.
+
+What dominates the result is not the model. It is **how the reference was
+spoken** and **how the script is written**. Read the reference the way you would
+teach, not the way you would read a paragraph aloud: the same voice sample gave a
+34 Hz pitch spread reading written prose and 59 Hz reading like a lecturer, and
+the second one is the one that sounds human.
+
+The reference is peak-normalised before it is encoded; `--raw-reference` on
 `tools/synth.mjs` turns that off.
+
+**Cache invalidation, one trap.** Clips are keyed on the voice *path* plus the
+spoken line, so replacing the file at `voice/myvoice.wav` does not invalidate
+anything. Re-render with `--force`, or delete `.narration-cache/*.wav`.
 
 **Why this does not use the `pocket-tts` pip package.** That package can only clone
 using weights in the gated `kyutai/pocket-tts` repo, which needs you to accept its
@@ -118,6 +135,20 @@ npx wrangler pages deploy . --project-name=model-engineering
 
 Roughly 120 files and 60 MB, most of it the narration audio. The largest single
 file is about 4 MB, well inside Cloudflare Pages' 25 MB per-file limit.
+
+Deploy from a staging copy, not the working tree: `wrangler` ignores `.gitignore`,
+and `.assetsignore` is a Workers feature that Pages does not read. So the 189 MB
+ONNX bundle under `.narration-cache/` would otherwise be uploaded.
+
+```bash
+rsync -a --delete --exclude .git --exclude .narration-cache --exclude node_modules \
+      --exclude voice --exclude .deploy --exclude 'myvoice.*' ./ .deploy/
+npx wrangler pages deploy .deploy --project-name=model-engineering
+```
+
+One thing to know about Pages and this player: it answers audio requests with
+`200`, not `206`, so range requests do not work. `film.js` waits for
+`audio.seekable` to actually cover the target before it trusts a seek.
 
 Two things are worth excluding from a deploy, and `.gitignore` already covers
 them: `voice/` (your reference recording) and `.narration-cache/` (the per-line

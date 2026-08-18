@@ -1,138 +1,138 @@
 WEBVTT
 
 a01
-00:00:00.000 --> 00:00:15.770
+00:00:00.000 --> 00:00:18.113
 Lesson One left you with one honest gap. You called backward, the gradients appeared, and nobody told you how. Today we open it — with a calculator, on numbers small enough to hold in your head. Then the two shapes every model here is built from.
 
 a02
-00:00:16.720 --> 00:00:26.730
+00:00:19.063 --> 00:00:29.031
 So. A neural network is one small part, repeated. That's the whole architecture. Here's the part — three numbers arrive, each one on its own wire.
 
 a03
-00:00:27.080 --> 00:00:36.200
+00:00:29.381 --> 00:00:40.159
 Every wire has its own weight. And that word is doing real work: a weight is a number the training loop is allowed to change. Almost nothing else in a layer is.
 
 a04
-00:00:36.550 --> 00:00:54.080
+00:00:40.509 --> 00:00:59.658
 Multiply each input by its weight, then add. 0.8 + 1.0 + 0.7 = 2.5. That single sum is a dot product — and a layer does 128 of them at once. That's why a layer is a matrix multiply, and not a loop.
 
 a05
-00:00:54.430 --> 00:01:11.480
+00:01:00.008 --> 00:01:18.441
 Then one more number goes on top. The bias. 2.5 − 0.3 = 2.2. And here's what it buys you. Without a bias, every neuron is forced to decide around zero. The layer can rotate the input, and stretch it. Never shift it.
 
 a06
-00:01:11.830 --> 00:01:26.960
+00:01:18.791 --> 00:01:35.073
 Last move — the bend. ReLU keeps a positive number and replaces anything else with zero, so 2.2 goes straight through. Now watch. Flip the signs of the inputs, the sum falls to −2.8, and the neuron says nothing at all.
 
 a07
-00:01:27.610 --> 00:01:41.780
+00:01:35.723 --> 00:01:50.072
 Right. The numbers. One input, one hidden unit, one output, a squared error against the target. Four parameters — the smallest network that still has everything in it. Every value here is real. Check them.
 
 a08
-00:01:42.130 --> 00:01:59.660
+00:01:50.422 --> 00:02:07.982
 Forward, left to right. 0.5 × 2.0 + 0.1 = 1.1. ReLU leaves a positive number alone. Then −1.5 × 1.1 + 0.4 = −1.25.
 
 a09
-00:02:00.010 --> 00:02:12.100
+00:02:08.332 --> 00:02:21.781
 The target was 1.0. So we're off by −2.25, and squaring that gives a loss of 5.0625. One number. That's the whole thing the backward pass exists to shrink.
 
 a10
-00:02:12.450 --> 00:02:25.580
+00:02:22.131 --> 00:02:37.606
 Backward. And we start at the end, where it's easiest. The derivative of a square is two times the inside: 2 × (−2.25) = −4.50. That's the first link in the chain.
 
 a11
-00:02:25.930 --> 00:02:41.620
+00:02:37.956 --> 00:02:54.796
 Every step to the left is the same move — multiply by one local derivative. Past the second weight: −4.50 × −1.5 = 6.75. Through ReLU: × 1, because the sum was positive.
 
 a12
-00:02:41.970 --> 00:03:01.660
+00:02:55.146 --> 00:03:15.938
 So where do the weight gradients come from? That same chain. For w₁ the local derivative is the input, so 6.75 × 2.0 = 13.50. For w₂ it's a₁, giving −4.95. A bias is added, never multiplied, so its derivative is always 1.
 
 a13
-00:03:02.010 --> 00:03:15.460
+00:03:16.288 --> 00:03:29.751
 Now the trap. Take one plain gradient step with lr = 0.1, and the loss falls from 5.0625 to 0.0225. Excellent, surely? No.
 
 a14
-00:03:15.810 --> 00:03:31.830
+00:03:30.101 --> 00:03:47.131
 That step drove z₁ to −2.275. ReLU outputs 0, the answer is now just b₂, and the network hit that loss by ignoring its input. The gradient there is zero from here on. The unit is dead. After one step.
 
 a15
-00:03:32.480 --> 00:03:42.480
+00:03:47.781 --> 00:03:57.923
 So why isn't the bend optional? Here are two weight matrices, one after the other, with nothing in between. One row of data goes in. One answer comes out.
 
 a16
-00:03:42.830 --> 00:03:52.520
+00:03:58.273 --> 00:04:08.785
 And matrix multiplication is associative. So multiply the two weight matrices together first, before any data arrives at all. What you get back is a single matrix.
 
 a17
-00:03:52.870 --> 00:04:07.040
+00:04:09.135 --> 00:04:23.165
 That single matrix gives the same answer. Not just for this input — for every input. So fifty stacked linear layers are still one matrix. Depth on its own costs memory and time, and returns nothing.
 
 a18
-00:04:07.390 --> 00:04:16.830
+00:04:23.515 --> 00:04:32.818
 Now drop a ReLU in the middle. It clips the −4 to 0. And look what that does downstream — (−6, 8) becomes (2, 8).
 
 a19
-00:04:17.180 --> 00:04:28.070
+00:04:33.168 --> 00:04:46.957
 No fixed matrix can copy that, because the clipping depends on which input arrived. And that's the whole argument. Linear layers give a network its size. The bends give it depth.
 
 a20
-00:04:28.720 --> 00:04:43.210
+00:04:47.607 --> 00:05:04.196
 Right — so which bend? ReLU is the cheapest one that works: keep the positives, zero everything else. But look at the left half of that line. Perfectly flat. Slope exactly 0. That's the dead unit from a moment ago, drawn as a picture.
 
 a21
-00:04:43.560 --> 00:05:04.290
+00:05:04.546 --> 00:05:27.786
 GELU is that same shape with the corner rounded off, and SiLU, x·σ(x), has the same character. Put a number on it. At x = −2, ReLU's slope is exactly 0, while GELU and SiLU hand back about −0.09. Small. But never nothing.
 
 a22
-00:05:04.640 --> 00:05:18.730
+00:05:28.136 --> 00:05:42.416
 SwiGLU is different in kind. It isn't a curve at all — it's a gate. Two projections of the same input, one of them bent by SiLU, then multiplied element by element. One half decides how much of the other half gets through.
 
 a23
-00:05:19.380 --> 00:05:37.950
+00:05:43.066 --> 00:06:02.859
 Now — before training starts, every weight is a random number, and that scale is not a detail. Eight layers here, 256 units each. Draw the weights with a standard deviation of 0.02, and watch. By layer eight the signal is 150 000 times smaller.
 
 a24
-00:05:38.300 --> 00:05:54.070
+00:06:03.209 --> 00:06:20.922
 And nothing crashes. Gradients come back through that same chain, so the early layers barely move. Now go the other way — standard deviation 0.20 — and the signal is 690 times larger after eight layers. That one ends in nan.
 
 a25
-00:05:54.420 --> 00:06:09.070
+00:06:21.272 --> 00:06:36.501
 Between them sits one value that holds the signal exactly steady. Two, divided by the number of inputs — then the square root of that. The 2 pays for the half of the signal ReLU throws away. That's He initialisation.
 
 a26
-00:06:10.020 --> 00:06:25.870
+00:06:37.451 --> 00:06:53.963
 Then you write the layer yourself. And here's the part that matters: any tensor you wrap in nn.Parameter inside a module is registered. It reaches the optimizer, it moves to the device, it's saved with the model. Forget that wrapper and the tensor never learns.
 
 a27
-00:06:26.820 --> 00:06:41.950
+00:06:54.913 --> 00:07:11.022
 One shape left. An MLP flattens a picture into a list of 784 numbers, and throws away the most useful fact about an image — that nearby pixels belong together. A convolution keeps it. Here's a picture with one edge in it.
 
 a28
-00:06:42.300 --> 00:06:54.230
+00:07:11.372 --> 00:07:24.207
 Lay the kernel — nine weights — over the top-left 3 × 3 patch. Multiply the nine pairs, add them up, write down one number. Everything under it here is 0, so the answer is 0.
 
 a29
-00:06:54.580 --> 00:07:04.580
+00:07:24.557 --> 00:07:35.689
 Now slide one column right. The patch straddles the edge — zeros on one side, ones on the other — and the answer jumps to +3. The detector has fired.
 
 a30
-00:07:04.930 --> 00:07:16.380
+00:07:36.039 --> 00:07:50.952
 Then down a row, and across again. And notice what isn't happening: those nine weights never change. A detector learned in the top-left corner works in the bottom-right for free. That's weight sharing.
 
 a31
-00:07:16.730 --> 00:07:30.660
+00:07:51.302 --> 00:08:05.373
 So what does that buy you? A dense layer doing the same job needs 529 984 weights. This kernel needs 10 — nine weights and a bias — and it works on an image of any size.
 
 a32
-00:07:31.610 --> 00:07:50.100
+00:08:06.323 --> 00:08:25.280
 Two parts finish the classifier. Pooling takes each 2 × 2 block and keeps the largest value: half the width, half the height, and no parameters at all. Normalisation resets the signal size on every forward pass — subtract the mean, divide by the standard deviation, then a learned gain and shift.
 
 a33
-00:07:51.050 --> 00:08:08.340
+00:08:26.230 --> 00:08:44.342
 And the two kinds differ in exactly one thing. Which group they average over. Batch norm averages a feature across the other examples in the batch. Layer norm averages one example across its own features, so it never looks at its neighbours — which is why every transformer uses it.
 
 a34
-00:08:09.290 --> 00:08:27.320
+00:08:45.292 --> 00:09:04.225
 So — go and build it. The project rebuilds the Lesson One model with no nn.Linear anywhere, makes you write the backward pass by hand and check it against autograd, then moves to images, where convolutions earn their keep. And Lesson Three adds the piece that made language models possible. Attention.
 

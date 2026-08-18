@@ -1,146 +1,146 @@
 WEBVTT
 
 a01
-00:00:00.000 --> 00:00:15.530
+00:00:00.000 --> 00:00:16.355
 So. A transformer is one function. Integers in — a probability for every possible next token out. That is all. In the next few minutes we will open it up and follow the shapes through, until nothing is left you could not write yourself.
 
 a02
-00:00:16.480 --> 00:00:31.130
+00:00:17.305 --> 00:00:35.737
 But a network cannot read a string. It only takes numbers. So something has to stand in between — the tokenizer. And here is the thing about it. It is not trained. It is a fixed dictionary, built once, before training even starts.
 
 a03
-00:00:31.480 --> 00:00:44.530
+00:00:36.087 --> 00:00:50.395
 So how did it learn where to cut? By counting. Find the most frequent pair of neighbours, merge them into one symbol, write the rule down, repeat. Do that fifty thousand times, and low is one token while lower takes three.
 
 a04
-00:00:44.880 --> 00:00:59.690
+00:00:50.745 --> 00:01:06.127
 Now each piece gets one fixed id. And the alphabet underneath is not letters — it is the two hundred and fifty six byte values. So nothing is ever unknown. Not emoji, not Chinese, not broken text.
 
 a05
-00:01:00.040 --> 00:01:14.130
+00:01:06.477 --> 00:01:20.510
 And that id? It is a row number. Nothing cleverer. The embedding table hands back that row: a vector of learned numbers describing this token. Integers went in. Floats come out.
 
 a06
-00:01:14.480 --> 00:01:26.650
+00:01:20.860 --> 00:01:34.332
 Look at the size of that table, though. Vocabulary times model width. For Llama 3.2 1B that is two hundred and sixty three million numbers — about a fifth of the whole model, spent on a lookup.
 
 a07
-00:01:27.300 --> 00:01:47.230
+00:01:34.982 --> 00:01:56.135
 Right. Here is what attention fixes. After the embedding, the vector for it is the same in any sentence — no trace of the cat. So each token makes three vectors, through three learned matrices. A query: what I want. A key: what I offer. A value: what I hand over.
 
 a08
-00:01:47.580 --> 00:02:05.990
+00:01:56.485 --> 00:02:14.828
 One thing has to happen first, though. Attention has no idea what order the tokens are in — shuffle them and the same vectors come straight back. So we rotate each pair of numbers inside the query and the key, by an angle set by position. That is RoPE.
 
 a09
-00:02:06.340 --> 00:02:20.030
+00:02:15.178 --> 00:02:31.280
 Now the comparison. One dot product between this query and every key. Large when two vectors point the same way, near zero when they do not. And this is what the rotation bought us: only the gap between the two positions changes the score.
 
 a10
-00:02:20.380 --> 00:02:37.270
+00:02:31.630 --> 00:02:48.943
 Now watch every score shrink. We divide by the square root of the head dimension — the head is sixty four wide, so we divide by eight. Why bother? Because otherwise the scores spread so far that the softmax saturates, and a saturated softmax passes almost no gradient.
 
 a11
-00:02:37.620 --> 00:02:49.950
+00:02:49.293 --> 00:03:02.692
 Softmax turns that row into weights. All positive. All adding to exactly one. The same function you met in Lesson One — only now it is working in the middle of the network, on every row of every head.
 
 a12
-00:02:50.300 --> 00:03:02.470
+00:03:03.042 --> 00:03:15.864
 Now the mixing. And notice what gets mixed — not the keys, the values. Each value is scaled by its own weight. Here, the word it pulls in sixty two per cent of the value of cat.
 
 a13
-00:03:02.820 --> 00:03:13.380
+00:03:16.214 --> 00:03:27.357
 Then you add them up. That sum is the output at this position. And that is attention. A weighted average. Everything else in this lesson is packaging around that one line.
 
 a14
-00:03:14.030 --> 00:03:26.600
+00:03:28.007 --> 00:03:41.229
 One query gave us one row. Every query gives the whole grid. Eight tokens, an eight by eight matrix. And this is the expensive part of the model, because it grows with the square of the sequence length.
 
 a14b
-00:03:26.950 --> 00:03:35.670
+00:03:41.579 --> 00:03:52.082
 Look at row 5. That is token 5, asking about the sequence. Columns 6 and 7 are its future. If it could read them, it would be reading the answer.
 
 a15
-00:03:36.020 --> 00:03:46.180
+00:03:52.432 --> 00:04:03.160
 So here is the rule that makes this a language model. Before the softmax, every cell above the diagonal becomes negative infinity. That is the whole causal mask.
 
 a16
-00:03:46.530 --> 00:04:00.300
+00:04:03.510 --> 00:04:19.382
 The exponential of negative infinity is zero, so those weights vanish. The row on the right still adds to one, over only the part it may see. And do it in that order. Mask first. Softmax second. Always.
 
 a17
-00:04:00.650 --> 00:04:13.220
+00:04:19.732 --> 00:04:34.245
 And here is the payoff. The first row predicts from one token. The last predicts from eight. One forward pass gives one training signal per position, at no extra cost. That is why next token prediction scales.
 
 a18
-00:04:13.870 --> 00:04:24.030
+00:04:34.895 --> 00:04:46.267
 One softmax row is one weighted average. So one head expresses exactly one relation per position, and no more. For real language? Nowhere near enough.
 
 a19
-00:04:24.380 --> 00:04:38.950
+00:04:46.617 --> 00:05:01.970
 So we split it. And this is the bit people get wrong — a head is not a copy of the layer. Three hundred and eighty four numbers, cut into six slices of sixty four. Same total width. Six heads cost the arithmetic of one.
 
 a20
-00:04:39.300 --> 00:04:49.150
+00:05:02.320 --> 00:05:12.843
 Each slice gets its own query, key and value matrices, and runs its own attention over the very same tokens. Six independent score matrices, side by side.
 
 a21
-00:04:49.500 --> 00:05:03.750
+00:05:13.193 --> 00:05:28.340
 And look what turns up. One head tracks the previous token. One stares back at the very first. One completes a pattern it has seen — show it A then B, and when A returns, it pushes B. Nobody programmed that.
 
 a22
-00:05:04.100 --> 00:05:12.900
+00:05:28.690 --> 00:05:37.433
 Then the six outputs are laid end to end, back to the full width — and one more learned matrix mixes the slices before the result rejoins the stream.
 
 a23
-00:05:13.550 --> 00:05:32.680
+00:05:38.083 --> 00:05:59.385
 Right. Now the part that decides whether your model fits on a phone. Training runs one pass over the sentence. Generation does not. You make a token, append it, run again. So the model keeps a key and a value for every token seen, in every layer. That is the KV cache.
 
 a24
-00:05:33.030 --> 00:05:47.200
+00:05:59.735 --> 00:06:14.488
 With plain multi-head attention, every query head keeps its own key and value head. Thirty two of each. Watch the number on the right. At eight thousand tokens, 1 GiB of cache — on top of the weights.
 
 a25
-00:05:47.550 --> 00:06:06.210
+00:06:14.838 --> 00:06:35.603
 So group them. Four query heads share one key and value head. Queries stay at thirty two; stored heads drop to eight. Two, times sixteen layers, times eight heads, times sixty four, times two bytes. 32 KiB a token. 256 MiB at eight thousand.
 
 a25b
-00:06:06.560 --> 00:06:14.960
+00:06:35.953 --> 00:06:45.816
 A quarter of the memory, and quality stays close to full multi-head. That is why grouped-query attention is in almost every model shipped this year.
 
 a26
-00:06:15.310 --> 00:06:26.760
+00:06:46.166 --> 00:06:57.824
 Push further, to one shared key and value head, and you get multi-query attention. 32 MiB — thirty two times smaller than multi-head. But the quality drop is audible.
 
 a27
-00:06:27.110 --> 00:06:37.270
+00:06:58.174 --> 00:07:09.013
 So remember which number moved. The query head count never entered that formula at all. And on a phone it is usually the cache, not the weights, that runs out of memory first.
 
 a28
-00:06:37.920 --> 00:06:51.450
+00:07:09.663 --> 00:07:23.932
 One piece left. The block that repeats. It starts and ends on the same wire — same shape in, same shape out. That wire has a name. The residual stream. And no matrix ever sits on it.
 
 a29
-00:06:51.800 --> 00:07:05.090
+00:07:24.282 --> 00:07:40.155
 Attention never consumes the stream. It reads a normalised copy. RMSNorm divides the vector by the root mean square of its own entries, then scales it. No mean, no bias. Half the parameters of LayerNorm.
 
 a30
-00:07:05.440 --> 00:07:14.970
+00:07:40.505 --> 00:07:51.352
 And its output is added back. Added. The stream is edited, never replaced — which is why something written near the embedding is still readable thirty six layers later.
 
 a31
-00:07:15.320 --> 00:07:30.450
+00:07:51.702 --> 00:08:08.695
 The lower branch repeats the pattern. Normalise, transform, add. That is the MLP, and modern models gate it — SwiGLU: two matrices up, one of them a gate, one back down. Most of the parameters live right here.
 
 a32
-00:07:30.800 --> 00:07:43.850
+00:08:09.045 --> 00:08:22.998
 Now notice where the norms sit. Inside each branch. Not on the stream. That is pre-norm. Put them on the stream instead and the model needs a slow warmup just to start, and turns unstable as it gets deeper.
 
 a33
-00:07:44.200 --> 00:07:57.490
+00:08:23.348 --> 00:08:36.900
 And now run it backwards. The gradient travels the whole stream with nothing multiplying it. In Lesson Two you watched gradients shrink through a chain of matrices. This unbroken path is the only reason thirty six layers train at all.
 
 a34
-00:07:58.440 --> 00:08:19.510
+00:08:37.850 --> 00:09:00.223
 And that is the whole architecture. Now go and build it. Write attention yourself, check it against PyTorch, stack six blocks into a ten point six five million parameter model, and train it on Shakespeare — so you have something to break. Lesson Four trains it properly, adds the cache you can already size, and picks how your model sounds.
 

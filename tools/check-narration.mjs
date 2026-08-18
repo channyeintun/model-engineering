@@ -129,7 +129,7 @@ for (const id of ids) {
   if (secs > 540) warn(id, `about ${Math.round(secs / 60)} minutes — long for a walkthrough`);
 
   const timed = existsSync(join(narrDir, `${id}.timing.js`));
-  const audio = existsSync(join(ROOT, 'assets', 'audio', `${id}.mp3`));
+  const audio = existsSync(join(ROOT, 'assets', 'audio', `${id}.m4a`));
   ok(`${blocks.length} segments, ${withScene} on figures, ~${Math.floor(secs / 60)}:${String(secs % 60).padStart(2, '0')} spoken` +
      `, ${usedScenes.size}/${Object.keys(steps).length} scenes used` +
      `, audio ${audio && timed ? 'generated' : 'NOT generated'}`);

@@ -1,138 +1,138 @@
 WEBVTT
 
 a01
-00:00:00.000 --> 00:00:14.570
+00:00:00.000 --> 00:00:15.953
 Welcome to Lesson Seven. By the end of this you can take a model, put it in a container four to eight times smaller, and say exactly what that cost. In megabytes. In perplexity. And in the one ability that always breaks first.
 
 a02
-00:00:15.520 --> 00:00:27.690
+00:00:16.903 --> 00:00:30.430
 So. One weight. One real number, sitting somewhere on a line. In FP32 that line is chopped so finely we can just call it continuous — whatever value you want, you can have it.
 
 a03
-00:00:28.040 --> 00:00:44.530
+00:00:30.780 --> 00:00:48.013
 Now squeeze that same range into eight bits. 256 levels. The steps are so small the weight hardly has to move. It lands on 0.6314, and the error is 0.0014. Nothing to worry about.
 
 a04
-00:00:44.880 --> 00:00:57.930
+00:00:48.363 --> 00:01:03.211
 Four bits gives you 16. Watch it jump. The weight has to leave 0.63 and land on 0.60 — an error of 0.03. More than fifteen times worse, from four bits fewer.
 
 a05
-00:00:58.280 --> 00:01:05.640
+00:01:03.561 --> 00:01:11.984
 And there is the whole trade. Take away one bit, and you halve the levels, double the step, and double the worst error you can make.
 
 a06
-00:01:06.290 --> 00:01:18.540
+00:01:12.634 --> 00:01:27.616
 Right. So what does that buy you? Take the 360-million-parameter model you fine-tuned in Lesson 05. Four bytes a weight, and it is 1440 MB. Nothing about the model has changed yet.
 
 a07
-00:01:18.890 --> 00:01:31.300
+00:01:27.966 --> 00:01:41.126
 BF16 halves it. 720 MB. And here is the neat part. It keeps the same exponent as FP32, so the range is identical. Only the precision drops.
 
 a08
-00:01:31.650 --> 00:01:45.820
+00:01:41.476 --> 00:01:57.437
 Eight-bit integers give 360 MB, and for weight-only quantization that one is close to free. And INT4 gives 191 MB. But look at the label. 4.25 bits. Not 4.
 
 a09
-00:01:46.170 --> 00:02:00.580
+00:01:57.787 --> 00:02:14.370
 Why 4.25? Because every group of 128 weights carries a scale and a zero point. Four-bit is never four bits. And this is the number that matters on a phone, because generating one token reads every one of these bytes.
 
 a10
-00:02:01.230 --> 00:02:13.070
+00:02:15.020 --> 00:02:26.361
 So how does a weight actually get into four bits? Here is one. 0.55. That is the only real number in this picture. Everything else you are about to see is bookkeeping.
 
 a11
-00:02:13.420 --> 00:02:28.230
+00:02:26.711 --> 00:02:43.576
 Pick a scale — the size of one step. Here s = 0.25, and the values you can store are its multiples. Our weight is not on one of them. So divide: 0.55 over 0.25 is 2.2 steps up from zero.
 
 a12
-00:02:28.580 --> 00:02:37.860
+00:02:43.926 --> 00:02:54.425
 Now round. 2. And this is the part that matters. That one rounding is the only lossy step in the entire method. Everything either side of it is exact.
 
 a13
-00:02:38.210 --> 00:02:52.950
+00:02:54.775 --> 00:03:11.550
 Store the 2. Four bits hold 16 codes. But symmetric quantization uses only 15 of them, −7 to 7, so that zero lands exactly in the middle. Write a kernel that uses all 16 and it will be quietly, slightly wrong.
 
 a14
-00:02:53.300 --> 00:03:12.350
+00:03:11.900 --> 00:03:33.972
 To read it back, multiply by the scale. 0.25 × 2 = 0.50. In went 0.55, out came 0.50. That missing 0.05 is the quantization error, and it can never be worse than half a step. 0.125.
 
 a15
-00:03:13.000 --> 00:03:27.170
+00:03:34.622 --> 00:03:50.091
 Now. How many scales do you keep? Per-tensor is one scale for the whole matrix. Free in memory, and the most fragile thing you can do. One large weight, anywhere, sets the step size for all 16.7 million of them.
 
 a16
-00:03:27.520 --> 00:03:45.710
+00:03:50.441 --> 00:04:10.602
 Per-row: one scale for every output row. In a 4096 × 4096 layer that is 4096 extra numbers, 16 bits each, spread over 16.8 million weights. 0.004 extra bits per weight. And now no row can damage another.
 
 a17
-00:03:46.060 --> 00:04:00.390
+00:04:10.952 --> 00:04:26.852
 Per-group: split each row again. One scale per 128 weights costs a quarter of a bit. That is 131,072 scales in that one layer, and it is the standard choice for INT4.
 
 a18
-00:04:00.740 --> 00:04:17.870
+00:04:27.202 --> 00:04:44.301
 Group 32 is more accurate still. But now the metadata costs a whole extra bit per weight, and the kernel reloads a scale four times as often, which may put you on a slower path. Accuracy and speed do not always move together. So measure both.
 
 a19
-00:04:18.520 --> 00:04:27.160
+00:04:44.951 --> 00:04:55.454
 Right. Now the thing that ruins all of it. Eight weights from one group. Those dashed lines are the 15 values symmetric INT4 can store.
 
 a20
-00:04:27.510 --> 00:04:40.960
+00:04:55.804 --> 00:05:12.637
 The scale comes from the largest magnitude. 1.75 over 7 is 0.25. Every weight lands on a line close to where it started, and the worst error is 0.12. Comfortably inside half a step.
 
 a21
-00:04:41.310 --> 00:04:52.350
+00:05:12.987 --> 00:05:23.639
 Now change one weight. 1.75 becomes 17.50. One value. Nothing else in the group moves at all. Now watch the other seven.
 
 a22
-00:04:52.700 --> 00:05:04.380
+00:05:23.989 --> 00:05:38.732
 The ruler is ten times coarser. The scale went from 0.25 to 2.50, and seven of the eight weights round to exactly zero. One outlier destroyed the group.
 
 a23
-00:05:04.730 --> 00:05:17.380
+00:05:39.082 --> 00:05:52.117
 So what is the fix? Granularity. Give each group of four its own scale. The outlier is trapped in group 1. Group 2 gets a scale of 0.17. And its weights come straight back.
 
 a24
-00:05:17.730 --> 00:05:38.060
+00:05:52.467 --> 00:06:14.096
 Weights rarely look like this. Activations do. Past about 6.7 billion parameters, roughly 6 feature dimensions carry values twenty times larger than everything else. In every layer. In the same dimensions. Set that 0.1% to zero and perplexity degrades by 600%.
 
 a25
-00:05:38.710 --> 00:05:53.520
+00:06:14.746 --> 00:06:31.188
 Usually you quantize a finished model and accept the rounding. When you cannot, one move remains. Let the model keep training while it can feel that rounding. In QAT the forward pass rounds on purpose, and the weights stay in floating point.
 
 a26
-00:05:53.870 --> 00:06:09.160
+00:06:31.538 --> 00:06:47.888
 But here is the obstacle. round() is flat between its steps, so its derivative is exactly zero almost everywhere. Differentiate that node honestly and every gradient gets multiplied by zero. Nothing trains. Nothing moves at all.
 
 a27
-00:06:09.510 --> 00:06:19.760
+00:06:48.238 --> 00:06:58.780
 The straight-through estimator is the fix, and it is a deliberate lie about the backward pass. You pretend the rounding was the identity function. A straight line. Slope 1.
 
 a28
-00:06:20.110 --> 00:06:32.840
+00:06:59.130 --> 00:07:12.403
 So the gradient reaches w unchanged inside the clipping range, and the weight learns to sit where rounding hurts least. One line of PyTorch. And expect it to win back a third to two thirds of what four bits cost you.
 
 a29
-00:06:33.490 --> 00:06:51.660
+00:07:13.053 --> 00:07:35.955
 Now the part most tutorials skip. Quantization fails silently. The model loads, it writes fluent text, and it is quietly a little worse. So. Five formats of one model. Perplexity on the left. On the right, how far each score moved. Right is worse.
 
 a30
-00:06:52.010 --> 00:07:07.230
+00:07:36.305 --> 00:07:53.238
 Eight-bit, weight-only. Perplexity moves by 0.01. GSM8K moves a tenth of a point, and HellaSwag does not move at all. This is what free looks like, and it is why 8-bit is always your first step.
 
 a31
-00:07:07.580 --> 00:07:22.310
+00:07:53.588 --> 00:08:09.610
 Now look at this row. Q5_0 scores 1.5 points higher on GSM8K than the FP16 model did. A quantized model cannot really be better. So that bar is not a win. It is the size of your measurement noise.
 
 a32
-00:07:22.660 --> 00:07:30.580
+00:08:09.960 --> 00:08:18.943
 Now three bits. Perplexity climbs from 7.32 up to 8.96. And watch those two bars come apart.
 
 a33
-00:07:30.930 --> 00:07:46.620
+00:08:19.293 --> 00:08:35.966
 GSM8K loses 9.3 points. HellaSwag loses 0.6. Reasoning degrades first. Recall and common sense degrade last. And perplexity on its own would never have told you which ability you just spent.
 
 a34
-00:07:47.570 --> 00:08:10.550
+00:08:36.916 --> 00:09:00.922
 So. Your project. Take that Lesson 05 model from 1440 MB down to about 191 MB, and produce one table: bits per weight, megabytes, perplexity, one task score, tokens per second. Then Lesson 08, because smaller is not faster. So far you have assumed that speed-up. Lesson 08 makes you measure it.
 
